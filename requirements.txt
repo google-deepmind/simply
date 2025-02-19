@@ -1,0 +1,7 @@
+jax
+orbax
+seqio
+einops
+absl-py
+clu
+t5
