@@ -1,4 +1,4 @@
-# Copyright 2024 The Simply Authors
+# Copyright 2024 Chen Liang
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -253,11 +253,11 @@ class Flops2e17TFM41MC4L2048BS128(BaseExperimentConfig):
   seq_len: int = 2048
 
   # 40645632 * 16.69 / 2048 / 128 = 2588 steps
-  dataset_name: str = 'simply_det:c4.vb100864_openmix_v1.l2048'
+  dataset_name: str = 'c4.vb100864_openmix_v1'
   batch_size: int = 128
   num_train_steps: int = 2588
   lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 3e-4
+  weight_decay: float = 1e-1
   lr_schedule_config: Tuple[Tuple[str, Any], ...] = (
       ('lr', 3e-3), ('steps_after_decay', 0),
       ('end_decay', 0.1))
@@ -294,7 +294,7 @@ class Flops1e18TFM111MC4L2048BS256(Flops2e17TFM41MC4L2048BS128):
   batch_size: int = 256
   num_train_steps: int = 3626
   lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 3e-4
+  weight_decay: float = 1e-1
   lr_schedule_config: Tuple[Tuple[str, Any], ...] = (
       ('lr', 3e-3), ('steps_after_decay', 0),
       ('end_decay', 0.1))
@@ -329,7 +329,7 @@ class Flops1e19TFM338MC4L2048BS512(Flops2e17TFM41MC4L2048BS128):
   batch_size: int = 512
   num_train_steps: int = 5800
   lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 3e-4
+  weight_decay: float = 1e-1
   lr_schedule_config: Tuple[Tuple[str, Any], ...] = (
       ('lr', 3e-3),
       ('steps_after_decay', 0),
@@ -366,7 +366,7 @@ class TransformerLMTest(BaseExperimentConfig):
 
   vocab_size: int = 32_000
   seq_len: int = 64
-  dataset_name: str = 'lm1b.vb32000_t5_cc'
+  dataset_name: str = 'imdb_reviews.vb32000_t5_cc'
   lr_schedule_name: str = 'cosine_decay'
   lr_schedule_config: Tuple[Tuple[str, Any], ...] = (
       ('lr', 1e-3),

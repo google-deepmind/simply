@@ -1,4 +1,4 @@
-# Copyright 2024 The Simply Authors
+# Copyright 2024 Chen Liang
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +35,11 @@ Processor = Callable[[Batch], Batch]
 ################################################################################
 # Tokenizers / vocabularies.
 
-T5_CC_VOCAB = 'gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model'
+T5_CC_VOCAB = 'vocabs/vb32000_t5_cc.model'
+OPENMIX_V1_VOCAB = 'vocabs/vb100864_openmix_v1.model'
+
+ALL_VOCABS = [('vb32000_t5_cc', T5_CC_VOCAB),
+              ('vb100864_openmix_v1', OPENMIX_V1_VOCAB)]
 
 ################################################################################
 # PT datasets.
@@ -90,11 +94,9 @@ def add_lm1b_task():
           'train': 'train[:500]',
           'validation': 'train[500:1000]',
           'test': 'test'})
-  vocabs = []
-  vocabs += [('vb32000_t5_cc', T5_CC_VOCAB)]
   for name, source in [('lm1b', lm1b_source),
                        ('minilm1b', minilm1b_source)]:
-    for vocab_name, vocab in vocabs:
+    for vocab_name, vocab in ALL_VOCABS:
       task_name = f'{name}.{vocab_name}'
       add_pt_task_v1(task_name, source, vocab,
                      use_reduce_concat_split=False)
@@ -105,14 +107,29 @@ add_lm1b_task()
 def add_c4_task():
   """Adds C4 tasks."""
   source = seqio.TfdsDataSource(tfds_name='c4:3.1.0')
-  vocabs = []
-  vocabs += [('vb32000_t5_cc', T5_CC_VOCAB)]
-  for vocab_name, vocab in vocabs:
+  for vocab_name, vocab in ALL_VOCABS:
     task_name = f'c4.{vocab_name}'
     add_pt_task_v1(task_name, source, vocab,
                    use_reduce_concat_split=True)
 
 add_c4_task()
+
+
+def add_imdb_reviews_task():
+  """Adds imdb_reviews tasks."""
+  source = seqio.TfdsDataSource(
+      tfds_name='imdb_reviews:1.0.0',
+      splits={
+          'train': 'train[:90%]',
+          'validation': 'train[90%:]',
+          'test': 'test'})
+  name = 'imdb_reviews'
+  for vocab_name, vocab in ALL_VOCABS:
+    task_name = f'{name}.{vocab_name}'
+    add_pt_task_v1(task_name, source, vocab,
+                   use_reduce_concat_split=False)
+
+add_imdb_reviews_task()
 
 
 # ###############################################################################
