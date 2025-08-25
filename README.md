@@ -1,25 +1,23 @@
 <!-- mdlint off(LINE_OVER_80) -->
 # Simply
 
-*Simply* is a minimal and scalable research codebase for quickly iterating ideas on autoregressive models. 
+*Simply* is a minimal and scalable research codebase for quickly iterating ideas on autoregressive models.
 
 - *Quick to [fork and hack](#getting-started)* for fast iteration. You should be able to implement your research ideas (e.g., new architecture, optimizer, training loss, etc) in a few hours.
 - *Minimal abstractions and dependencies* for a simple and self-contained codebase. Learn [Jax](https://jax.readthedocs.io/en/latest/index.html) (if you haven't), and you are ready to read and hack the code.
 - That's it, *simply* [get started](#getting-started) with hacking now :)
-
-This is an initial release and under active development. More updates on the way, stay tuned! Contributions, suggestions, and feedback are very welcome!
 
 ## Getting started
 ### Example commands
 
 #### Local test for debug
 ```shell
-EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python main.py --experiment_config TransformerLMTest --experiment_dir /tmp/${EXP} --alsologtostderr
+EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config TransformerLMTest --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 Or if you want to debug by printing arrays like normal python code, you can disable `jit` and `use_scan` using the command below.
 
 ```shell
-export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python main.py --experiment_config TransformerLMTestNoScan --experiment_dir /tmp/${EXP} --alsologtostderr
+export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config TransformerLMTestNoScan --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 
 ## Dependencies
@@ -34,12 +32,14 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Disclaimer
-
-This is not an official Google Product.
-
 ## License
 
-Unless explicitly noted otherwise, everything is released under the Apache2 license.
+Copyright 2025 Google LLC
 
-See the LICENSE file for the full license text.
+All software is licensed under the Apache License, Version 2.0 (Apache 2.0); you may not use this file except in compliance with the Apache 2.0 license. You may obtain a copy of the Apache 2.0 license at: https://www.apache.org/licenses/LICENSE-2.0
+
+All other materials are licensed under the Creative Commons Attribution 4.0 International License (CC-BY). You may obtain a copy of the CC-BY license at: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Unless required by applicable law or agreed to in writing, all software and materials distributed here under the Apache 2.0 or CC-BY licenses are distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the licenses for the specific language governing permissions and limitations under those licenses.
+
+This is not an official Google product.

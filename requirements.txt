@@ -5,3 +5,6 @@ einops
 absl-py
 clu
 t5
+# Following packages are only required for running simply/utils/math_eval.py
+sympy
+pylatexenc

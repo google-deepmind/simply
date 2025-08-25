@@ -11,7 +11,7 @@ pip install -r requirements.txt
 # Example command for local run. 
 # Add "export JAX_DISABLE_JIT=True;" to disable `jit` for easier debugging.
 # Change "TransformerLMTest" to other experiment config names in `config_lib.py` to run other experiments.
-EXP=local_test_1; rm -rf /tmp/${EXP}; python main.py --experiment_config TransformerLMTest --experiment_dir /tmp/${EXP} --verbosity=-1
+EXP=local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config TransformerLMTest --experiment_dir /tmp/${EXP} --alsologtostderr
 
 # Example command for checking learning curves with tensorboard.
 tensorboard --logdir /tmp/${EXP}
