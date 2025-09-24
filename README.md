@@ -32,6 +32,20 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+## Citation
+
+If you find *Simply* helpful, please cite the following BibTeX:
+
+```
+@misc{Liang2025Simply,
+  author       = {Chen Liang and Da Huang and Chengrun Yang and Xiaomeng Yang and Andrew Li and Xinchen Yan and {Simply Contributors}},
+  title        = {{Simply: an experiment to accelerate and automate AI research}},
+  year         = {2025},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/google-deepmind/simply}
+}
+```
+
 ## License
 
 Copyright 2025 Google LLC
