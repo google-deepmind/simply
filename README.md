@@ -1,7 +1,7 @@
 <!-- mdlint off(LINE_OVER_80) -->
-# Simply: Minimal Code for Frontier Research in JAX 
+# Simply: Minimal Code for Frontier LLM Research in JAX 
 
-*Simply* is a minimal and scalable research codebase in JAX, designed for rapid iteration on frontier research in autoregressive models.
+*Simply* is a minimal and scalable research codebase in JAX, designed for rapid iteration on frontier research in LLM and other autoregressive models.
 
 - *Quick to [fork and hack](#getting-started)* for fast iteration. You should be able to implement your research ideas (e.g., new architecture, optimizer, training loss, etc) in a few hours.
 - *Minimal abstractions and dependencies* for a simple and self-contained codebase. Learn [Jax](https://jax.readthedocs.io/en/latest/index.html) (if you haven't), and you are ready to read and hack the code.
