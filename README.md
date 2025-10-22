@@ -28,7 +28,16 @@ The main dependencies are:
 [SeqIO](https://github.com/google/seqio) for data pipeline.
 
 Install dependencies:
-```
+
+```bash
+# JAX installation is environment-specific. See https://docs.jax.dev/en/latest/installation.html
+# CPU:
+pip install -U jax
+# GPU:
+pip install -U "jax[cuda13]"
+# TPU:
+pip install -U "jax[tpu]"
+# Other dependencies:
 pip install -r requirements.txt
 ```
 
