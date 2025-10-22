@@ -23,7 +23,7 @@ from typing import Any, ClassVar
 import jax
 
 from simply.utils import evaluation_lib
-from simply.utils import optimizer as opt_lib
+from simply.utils import optimizers as opt_lib
 from simply.utils import registry
 
 
@@ -40,6 +40,7 @@ GEMMA2_2B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-2B-IT-ORBAX')
 GEMMA2_9B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-9B-IT-ORBAX')
 GEMMA2_27B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-27B-IT-ORBAX')
 
+GEMMA3_270M_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-270M-PT-ORBAX')
 GEMMA3_1B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-1B-PT-ORBAX')
 GEMMA3_4B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-4B-PT-ORBAX')
 GEMMA3_12B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-12B-PT-ORBAX')
@@ -248,6 +249,13 @@ class TFM1p7BLM1B(ExperimentConfig):
   local_rope_scale_factor: float = 1.0
   global_rope_scale_factor: float = 1.0
   query_scale: float = -1.0
+  # MoE related.
+  use_moe: bool = False
+  num_experts: int = 32
+  num_experts_per_token: int = 2
+  expert_capacity_factor: float | None = None
+  lbl_loss_weight: float = 0.01
+  router_z_loss_weight: float = 0.0
 
   # Data config
   batch_size: int = 64 * 16
@@ -293,6 +301,10 @@ class TFM1p7BLM1B(ExperimentConfig):
   grad_accum_steps: int = -1
 
   # Checkpoint and tensorboard config
+  # should_save_ckpt refers to whether to save any checkpoint. If False,
+  # overrides all the other checkpoint configs. If True, the other checkpoint
+  # configs come into effect.
+  should_save_ckpt: bool = True
   ckpt_interval: int = 1000
   ckpt_max_to_keep: int = 3
   ckpt_keep_period: int | None = None
@@ -559,7 +571,7 @@ class Flops2e16TFM15MC4L2048(Flops6e20TFM2BC4L2048):
 
 ##########################
 ## Gemma models.
-## https://github.com/google-deepmind/gemma/blob/main/gemma/transformer.py
+## https://github.com/google-deepmind/gemma/blob/main/gemma/gm/nn/_gemma.py
 
 
 @ExperimentConfigRegistry.register
@@ -712,6 +724,15 @@ class Gemma1BV3(TFM1p7BLM1B):
   init_ckpt_opt_state: bool = False
   init_ckpt_format: str = 'Gemma3pFormat'
   reset_steps: bool = True
+
+
+@ExperimentConfigRegistry.register
+@dataclasses.dataclass(frozen=True)
+class Gemma270MV3(Gemma1BV3):
+  model_dim: int = 640
+  ffn_expand_dim: int | None = 2048
+  n_layers: int = 18
+  init_ckpt_dir: str = GEMMA3_270M_PT_CKPT_DIR
 
 
 @ExperimentConfigRegistry.register
@@ -983,6 +1004,86 @@ class Gemma2BV2ITDSR40KCoT0ShotRL(Gemma2BV2ITDSR40K0ShotRL):
   evaluation: evaluation_lib.Evaluation = (
       evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation()
   )
+
+
+@ExperimentConfigRegistry.register
+@dataclasses.dataclass(frozen=True)
+class Gemma4BV3ITSimpleQANumberOnlyToolUseRL(Gemma4BV3):
+  # Model config.
+  init_ckpt_dir: str = GEMMA3_4B_IT_CKPT_DIR
+  lm_format_name: str = 'GemmaV2Chat'
+
+  # Dataset & evaluation config.
+  dataset_name: str = 'simply_json:simple_qa_num'
+  evaluation: evaluation_lib.Evaluation = evaluation_lib.QAToolUseEvaluation()
+
+  # Tool config.
+  tool_manager_name: str = 'GoogleSearchToolExecutor'
+  max_turns: int = 3
+  filter_throttled: bool = True
+
+  # Sampling configs.
+  sampling_max_decode_steps: int = 512
+  train_max_seq_len: int = 2048
+  sampling_prefill_size: int = 512
+  sampling_max_input_len: int = 512
+  sampling_temperature: float = 1.0
+  sampling_intermediate_decode_steps: int = 512
+  sampling_max_tool_response_len: int = 1024
+  # TODO: Change the extra_eos_tokens when the prompt is improved.
+  extra_eos_tokens: tuple[str, ...] = newlines_from_counts(range(3, 6))
+
+  # RL algorithm configs.
+  train_loop_name: str = 'rl'
+  num_train_steps: int = 500
+  num_train_steps_per_batch: int = 4
+  max_num_samples_per_train_batch: int | None = None
+  use_validation_set: bool = False
+  train_batch_size: int = 16 * 32
+  batch_size: int = 32
+  grad_accum_steps: int = 8
+  num_samples_per_example: int = 4
+
+  gamma: float = 1.0
+  kl_coeff: float = 0.001
+  use_grpo: bool = True
+  ppo_clip_eps: float = 0.2
+  ppo_clip_eps_high: float | None = None
+  ppo_clip_eps_low: float | None = None
+  policy_ratio_cap: float | None = 10.0
+  normalize_reward_method: str = 'ByGroup'
+  normalize_advantage: bool = False
+  max_abs_advantage: float | None = 10.0
+  use_kl_correction: bool = True
+  filter_zero_variance: bool = True
+  filter_truncated: bool = False
+  use_policy_logp_as_sampler_logp: bool = False
+  soft_ppo_forward_kl_coeff: float = 0.0
+  soft_ppo_reverse_kl_coeff: float = 0.0
+  # Optimizer configs.
+  optimizer: opt_lib.Optimizer = opt_lib.Adam(
+      beta1=0.9, beta2=0.95, epsilon=1e-8
+  )
+  weight_decay: float = 0.0
+  lr_schedule_name: str = 'constant'
+  lr_schedule_config: tuple[tuple[str, Any], ...] = (
+      ('lr', 1e-6),
+      ('warmup_steps', 100),
+  )
+
+  # bf16 config from Gemma2BV2.
+  activation_dtype_name: str = 'bfloat16'
+  decoding_quant_scheme: str = 'bfloat16'
+  ref_params_dtype: str = 'bfloat16'
+
+  # Checkpoint and tensorboard configs.
+  init_ckpt_opt_state: bool = False
+  ckpt_max_to_keep: int = 1
+  tb_log_interval: int = 10
+  ckpt_interval: int = 100
+
+  # Sharding config.
+  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
 
 
 #################################################################################

@@ -17,20 +17,20 @@ import dataclasses
 import functools
 from typing import Any, cast
 
+from absl.testing import absltest
+from absl.testing import parameterized
 import einops
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-from absl.testing import absltest
-from absl.testing import parameterized
 from simply import config_lib
 from simply import model_lib
 from simply.utils import common
 from simply.utils import masked
-from simply.utils import optimizer as opt_lib
+from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 from simply.utils import tokenization
+
 
 jax.config.update('jax_threefry_partitionable', False)
 
@@ -767,6 +767,36 @@ class ModelLibTest(parameterized.TestCase):
       self.assertLen(so.input_token_ids, 4)
       self.assertLen(so.input_token_scores, 3)
 
+  def test_lm_interface_batch(self):
+    vocab = tokenization.TestVocab([str(i) for i in range(20)])
+    prng_key = jax.random.key(0)
+    params = self.tfm_lm.init(prng_key)
+    max_decode_steps = 4
+    sampling_params = model_lib.SamplingParams(
+        top_k=-1,
+        top_p=1.0,
+        temperature=0.0,
+        max_decode_steps=max_decode_steps,
+        prefill_size=10,
+    )
+    lm_interface = model_lib.LMInterface(self.tfm_lm, params, vocab)
+    outputs1 = lm_interface.generate(
+        input_text='1 2 3',
+        prng_key=jax.random.key(seed=25),
+        sampling_params=sampling_params,
+    )
+    outputs2 = lm_interface.generate(
+        input_text='1 2 3',
+        prng_key=jax.random.key(seed=25),
+        sampling_params=sampling_params,
+        batch_size=2,
+    )
+    for so1, so2 in zip(outputs1, outputs2):
+      self.assertEqual(so1.input_token_ids, so2.input_token_ids)
+      self.assertEqual(so1.output_token_ids, so2.output_token_ids)
+      self.assertEqual(so1.input_token_scores, so2.input_token_scores)
+      self.assertEqual(so1.output_token_scores, so2.output_token_scores)
+
   def test_lm_interface_generate_without_scoring(self):
     vocab = tokenization.TestVocab([str(i) for i in range(10)])
     prng_key = jax.random.key(0)
@@ -790,29 +820,6 @@ class ModelLibTest(parameterized.TestCase):
       np.testing.assert_allclose(
           so.output_token_scores, scores[-len(so.output_token_ids) :], rtol=1e-5
       )
-
-  def test_lm_interface_generate_with_microbatch(self):
-    vocab = tokenization.TestVocab([str(i) for i in range(60)])
-    prng_key = jax.random.key(0)
-    params = self.tfm_lm.init(prng_key)
-    max_decode_steps = 10
-    sampling_params = model_lib.SamplingParams(
-        top_k=-1, top_p=1.0, temperature=1.0,
-        max_decode_steps=max_decode_steps,
-        num_samples=2)
-    lm_interface = model_lib.LMInterface(self.tfm_lm, params, vocab)
-    outputs = lm_interface.generate(
-        input_text=['1 2 3', '3 4 5'],
-        prng_key=jax.random.key(seed=25),
-        sampling_params=sampling_params,
-        microbatch_size=2,
-    )
-    outputs = cast(list[list[model_lib.SamplingOutput]], outputs)
-    for outputs_per_prompt in outputs:
-      for so in outputs_per_prompt:
-        self.assertLen(so.output_token_ids, max_decode_steps)
-        self.assertLen(so.input_token_ids, 4)
-        self.assertLen(so.input_token_scores, 3)
 
   @parameterized.named_parameters(
       dict(testcase_name='scan_prefill_3', use_scan=True, prefill_size=3),
@@ -1190,6 +1197,7 @@ class ModelLibTest(parameterized.TestCase):
     batch_size = 3
     base_input_len = 2
     input_texts = []
+    max_input_len = 3
     for i in range(batch_size):
       # input_len = 2, 3, 4
       # output_len = 6, 7, 7
@@ -1201,9 +1209,14 @@ class ModelLibTest(parameterized.TestCase):
     sampling_params = model_lib.SamplingParams(
         max_decode_steps=max_decode_steps,
         max_seq_len=max_seq_len,
+        max_input_len=max_input_len,
         sort_by='avg_output_logprob',
     )
     lm_interface = model_lib.LMInterface(self.tfm_lm, params, vocab)
+    input_as_chunks = lm_interface.input_processor.input_as_chunks
+    input_tokens_no_truncation = [
+        lm_interface.input_processor.encode(
+            input_as_chunks(text)).tokens for text in input_texts]
 
     outputs = lm_interface.generate(
         input_text=input_texts,
@@ -1214,7 +1227,12 @@ class ModelLibTest(parameterized.TestCase):
 
     for i, batch in enumerate(outputs):
       for so in batch:
-        self.assertLen(so.input_token_ids, base_input_len + i + 1)
+        # Check whether input tokens are truncated correctly.
+        self.assertLen(
+            so.input_token_ids, min(max_input_len, base_input_len + i + 1))
+        self.assertEqual(
+            so.input_token_ids,
+            input_tokens_no_truncation[i][-max_input_len:])
         self.assertLen(
             so.output_token_ids,
             min(max_decode_steps, max_seq_len - len(so.input_token_ids)),
@@ -1348,37 +1366,6 @@ class TestNpArrayQuantizer(tokenization.SimplyVocab[np.ndarray]):
     output_raw = np.array(output_raw, dtype=np.int32)[None, :]
     output_raw = np.repeat(output_raw, self.feature_dim, axis=1)
     return output_raw
-
-
-class GenericVocabSamplingTest(parameterized.TestCase):
-
-  def setUp(self):
-    super().setUp()
-    self.vocab_size = 64
-    self.config = TFMTest(vocab_size=self.vocab_size)
-    self.tfm_lm = model_lib.TransformerLM(self.config)
-
-  def test_lm_interface_generate_with_np_array(self):
-    vocab = TestNpArrayQuantizer(list(range(60)), vocab_size=self.vocab_size)
-    prng_key = jax.random.key(0)
-    params = self.tfm_lm.init(prng_key)
-    max_decode_steps = 10
-    sampling_params = model_lib.SamplingParams(
-        top_k=-1, top_p=1.0, temperature=1.0, max_decode_steps=max_decode_steps
-    )
-    lm_interface = model_lib.GenericInterface[np.ndarray](
-        self.tfm_lm, params, vocab
-    )
-    outputs = lm_interface.generate(
-        input_text=np.array([[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]]),
-        prng_key=jax.random.key(seed=25),
-        sampling_params=sampling_params,
-    )
-    outputs = cast(list[model_lib.GenericSamplingOutput[np.ndarray]], outputs)
-    for so in outputs:
-      self.assertLen(so.output_token_ids, max_decode_steps)
-      self.assertLen(so.input_token_ids, 4)
-      self.assertLen(so.input_token_scores, 3)
 
 
 if __name__ == '__main__':

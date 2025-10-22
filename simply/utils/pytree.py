@@ -13,7 +13,7 @@
 # limitations under the License.
 """Utils that process pytree."""
 
-from collections.abc import MutableMapping, MutableSequence, Sequence, Set
+from collections.abc import Sequence, Set
 import dataclasses
 import json
 import re
@@ -21,74 +21,109 @@ from typing import Any, Callable, cast
 import warnings
 
 from etils import epath
+import jax
 import numpy as np
 from simply.utils import registry
 from simply.utils.common import PyTree  # pylint: disable=g-importing-member
 
 
-def tree_value(tree: PyTree, path: str) -> PyTree:
-  """Gets tree value by path."""
-  if not path:
-    return tree
-  if path.startswith('/'):
-    return tree_value(tree, path[1:])
-  if path.startswith('['):
-    right_index = path.find(']')
-    assert right_index != -1
-    index = int(path[1:right_index])
-    return tree_value(tree[index], path[right_index + 1 :])
+def convert_string_path_to_key_path(path: str) -> jax.tree_util.KeyPath:
+  """Converts a string path to a KeyPath."""
+  keypath = []
+  while path:
+    if path.startswith('/'):
+      path = path[1:]
+    if path.startswith('['):
+      right_index = path.find(']')
+      assert right_index != -1
+      index = int(path[1:right_index])
+      keypath.append(jax.tree_util.SequenceKey(index))
+      path = path[right_index + 1 :]
+    else:
+      delimiter = re.search(r'/|\[', path)
+      if delimiter is None:
+        keypath.append(jax.tree_util.DictKey(path))
+        path = ''
+      else:
+        keypath.append(jax.tree_util.DictKey(path[: delimiter.start()]))
+        path = path[delimiter.start() :]
+  return jax.tree_util.KeyPath(keypath)
 
-  delimiter = re.search(r'/|\[', path)
-  if not delimiter:
-    return tree[path]
-  return tree_value(tree[path[: delimiter.start()]], path[delimiter.start() :])
+
+def tree_value(tree: PyTree, path: jax.tree_util.KeyPath | str) -> PyTree:
+  """Gets tree value by path."""
+  if isinstance(path, str):
+    path = convert_string_path_to_key_path(path)
+
+  value = tree
+  for item in path:
+    if isinstance(item, jax.tree_util.DictKey):
+      if item.key not in value:
+        raise KeyError(f'{path} does not exist in tree at {item}.')
+      value = value[item.key]
+    elif isinstance(item, jax.tree_util.SequenceKey):
+      if item.idx >= len(value):
+        raise KeyError(f'{path} does not exist in tree at {item}.')
+      value = value[item.idx]
+    else:
+      raise KeyError(f'Unsupported key type: {type(item)}:{item}')
+  return value
+
+
+def construct_tree_with_path_value(
+    path: jax.tree_util.KeyPath, value: PyTree
+) -> PyTree:
+  """Constructs a tree with path and value."""
+  tree = value
+  for item in reversed(path):
+    if isinstance(item, jax.tree_util.DictKey):
+      tree = {item.key: tree}
+    elif isinstance(item, jax.tree_util.SequenceKey):
+      next_tree = [None] * (item.idx + 1)
+      next_tree[item.idx] = tree
+      tree = next_tree
+    else:
+      raise ValueError(f'Unsupported key type: {type(item)}:{item}')
+  return tree
 
 
 def set_tree_value(
     tree: PyTree,
-    path: str,
+    path: jax.tree_util.KeyPath | str,
     value: PyTree,
 ) -> None:
   """Sets value at path in tree."""
+  if isinstance(path, str):
+    path = convert_string_path_to_key_path(path)
+
   if not path:
     raise ValueError('path must be non-empty.')
-  delimiter = re.search(r'/|\[(\d+)\]', path)
-  if not delimiter:
-    cast(MutableMapping[str, PyTree], tree)[path] = value
-    return
-  name = path[: delimiter.start()]
-  path_remain = path[delimiter.end() :]
 
-  if delimiter.group(0) == '/':
-    tree = cast(MutableMapping[str, PyTree], tree)
-    if not name:
-      set_tree_value(tree, path_remain, value)
-      return
-    if name not in tree:
-      tree[name] = {}
-    set_tree_value(tree[name], path_remain, value)
-    return
-
-  index = int(delimiter.group(1))
-  if name:
-    tree = cast(MutableMapping[str, PyTree], tree)
-    if name not in tree:
-      tree[name] = []
-    set_tree_value(tree[name], path[delimiter.start() :], value)
-    return
-
-  tree = cast(MutableSequence[PyTree], tree)
-  if len(tree) <= index:
-    tree.extend([None] * (index + 1 - len(tree)))
-  if path_remain:
-    if tree[index] is None:
-      if path_remain.startswith('/'):
-        tree[index] = {}
-      elif path_remain.startswith('['):
-        tree[index] = []
-    set_tree_value(tree[index], path_remain, value)
-  else:
-    tree[index] = value
+  for i, item in enumerate(cast(jax.tree_util.KeyPath, path)):
+    if tree_is_mapping(tree):
+      if not isinstance(item, jax.tree_util.DictKey):
+        raise ValueError(f'Path item {item} does not match subtree: {tree}')
+      if i + 1 == len(path):
+        tree[item.key] = value
+      elif tree.get(item.key) is None:
+        tree[item.key] = construct_tree_with_path_value(path[i + 1 :], value)
+        break
+      else:
+        tree = tree[item.key]
+    elif tree_is_sequence(tree):
+      if not isinstance(item, jax.tree_util.SequenceKey):
+        raise ValueError(f'Path item {item} does not match subtree: {tree}')
+      if item.idx >= len(tree):
+        tree.extend([None] * (item.idx + 1 - len(tree)))
+      if i + 1 == len(path):
+        tree[item.idx] = value
+      elif tree[item.idx] is None:
+        tree[item.idx] = construct_tree_with_path_value(path[i + 1 :], value)
+        break
+      else:
+        tree = tree[item.idx]
+    else:
+      raise ValueError(f'Cannot access path {path[i:]} in tree {tree}')
 
 
 def tree_is_mapping(tree: PyTree):
@@ -167,6 +202,31 @@ def traverse_tree_with_path(
       )
     return res
   return fn(*trees, root_path)
+
+
+def tree_leaves_with_tag(tree, tag='loss'):
+  """Yields leaves and their paths from a pytree if the path contains a tag.
+
+  Args:
+    tree: The pytree to traverse.
+    tag: The string tag to search for in the raw path components.
+
+  Yields:
+    A tuple of (leaf, path) for each leaf where the tag is present in the path.
+  """
+  def _get_raw(path):
+    raw_path = []
+    for p in path:
+      if hasattr(p, 'key'):
+        raw_path.append(p.key)
+      elif hasattr(p, 'idx'):
+        raw_path.append(p.idx)
+      else:
+        raise ValueError(f'Unknown path type {type(p)}')
+    return raw_path
+  for path, leaf in jax.tree_util.tree_leaves_with_path(tree):
+    if tag in _get_raw(path):
+      yield leaf, path
 
 
 def load(jtree: PyTree) -> Any:

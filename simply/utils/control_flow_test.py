@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import jax
-import jax.numpy as jnp
 
 from absl.testing import absltest
+import jax
+import jax.numpy as jnp
 from simply.utils import control_flow
 
 

@@ -13,11 +13,10 @@
 # limitations under the License.
 """Unit test for masked."""
 
-import jax.numpy as jnp
-import numpy as np
-
 from absl.testing import absltest
 from absl.testing import parameterized
+import jax.numpy as jnp
+import numpy as np
 from simply.utils import masked
 
 

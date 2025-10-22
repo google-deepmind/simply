@@ -14,7 +14,8 @@
 """Sharding utilities."""
 
 import asyncio
-from collections.abc import Callable, Sequence
+import collections
+from collections.abc import Callable, MutableMapping, Sequence
 import contextlib
 import dataclasses
 import functools
@@ -34,6 +35,7 @@ from simply.utils import pytree
 
 PartitionAnnotation = common.PartitionAnnotation
 MESH_CONTEXT_KEY: str = 'mesh_context'
+NOT_ANNOTATED = 'NOT_ANNOTATED'
 
 
 @contextlib.contextmanager
@@ -132,6 +134,8 @@ def with_sharding_constraint(
   Returns:
     The array with sharding constraint.
   """
+  if partition is NOT_ANNOTATED:
+    return x
   if isinstance(partition, js.Sharding):
     return jax.lax.with_sharding_constraint(x, partition)
   if partition is not None and len(partition) != x.ndim:
@@ -198,6 +202,114 @@ def multihost_sharded(
   start_index = process_index * base_size + min(process_index, remainder)
   end_index = start_index + base_size + (1 if process_index < remainder else 0)
   return batch[start_index:end_index]
+
+
+def _inner_partition_with_minimum_redundancy(
+    shape: tuple[int, ...],
+    mesh_axis_sizes: tuple[int, ...],
+    cache: MutableMapping[
+        tuple[tuple[int, ...], tuple[int, ...]], Sequence[Sequence[int]]
+    ],
+) -> Sequence[Sequence[int]]:
+  """Fits partition to a shape."""
+  if (shape, mesh_axis_sizes) in cache:
+    return cache[(shape, mesh_axis_sizes)]
+
+  best_placement = [()] * len(shape)
+  if not mesh_axis_sizes:
+    return best_placement
+
+  placement_value_fn = lambda placement: np.prod(
+      [np.prod(p) for p in placement]
+  )
+  best_value = placement_value_fn(best_placement)
+
+  for i, dim in enumerate(shape):
+    for j, axis_size in enumerate(mesh_axis_sizes):
+      if dim % axis_size == 0:
+        next_mesh_axis_sizes = (*mesh_axis_sizes[:j], *mesh_axis_sizes[j + 1 :])
+        next_shape = (*shape[:i], dim // axis_size, *shape[i + 1 :])
+        sorted_next_shape, shape_indices = common.sorted_with_indices(
+            next_shape
+        )
+        sorted_next_placement = _inner_partition_with_minimum_redundancy(
+            tuple(sorted_next_shape), next_mesh_axis_sizes, cache
+        )
+        unsorted_placement = list(
+            common.unsorted(sorted_next_placement, shape_indices)
+        )
+        unsorted_placement[i] = (axis_size, *unsorted_placement[i])
+
+        if not next_mesh_axis_sizes:
+          return unsorted_placement
+
+        value = placement_value_fn(unsorted_placement)
+        if value > best_value:
+          best_placement = unsorted_placement
+          best_value = value
+
+  return best_placement
+
+
+def batch_partition_with_minimum_redundancy(
+    shapes: Sequence[Sequence[int]],
+    mesh_axis_names: Sequence[str],
+    mesh_axis_sizes: Sequence[int],
+) -> Sequence[common.PartitionAnnotation]:
+  """Finds partitions for a batch of shapes with minimum redundancy."""
+  mesh_axis_name_index_map = {
+      axis_name: index for index, axis_name in enumerate(mesh_axis_names)
+  }
+  cache = {}
+  partition_annotations = []
+  for shape in shapes:
+    if not shape:
+      partition_annotations.append(None)
+      continue
+    shape_index = [(shape, index) for index, shape in enumerate(shape)]
+    sorted_shape, sorted_indices = zip(*sorted(shape_index, reverse=True))
+    sorted_axis_sizes = sorted(mesh_axis_sizes, reverse=True)
+    sorted_best_placement = _inner_partition_with_minimum_redundancy(
+        tuple(sorted_shape), tuple(sorted_axis_sizes), cache=cache
+    )
+    unsorted_best_placement = [None] * len(shape)
+    for index, p in zip(sorted_indices, sorted_best_placement, strict=True):
+      unsorted_best_placement[index] = p
+
+    axis_name_map = collections.defaultdict(list)
+    for axis_name, axis_size in zip(
+        mesh_axis_names, mesh_axis_sizes, strict=True
+    ):
+      axis_name_map[axis_size].append(axis_name)
+
+    partition_annotation = []
+    for axis_placement in unsorted_best_placement:
+      assert axis_placement is not None
+      axis_partition = []
+      for axis_size in axis_placement:
+        axis_partition.append(axis_name_map[axis_size][-1])
+        axis_name_map[axis_size].pop(-1)
+      if not axis_partition:
+        axis_partition = None
+      elif len(axis_partition) == 1:
+        axis_partition = axis_partition[0]
+      else:
+        axis_partition = sorted(
+            axis_partition, key=lambda x: mesh_axis_name_index_map[x]
+        )
+      partition_annotation.append(axis_partition)
+    partition_annotations.append(partition_annotation)
+  return partition_annotations
+
+
+def partition_with_minimum_redundancy(
+    shape: Sequence[int],
+    mesh_axis_names: Sequence[str],
+    mesh_axis_sizes: Sequence[int],
+) -> common.PartitionAnnotation:
+  return batch_partition_with_minimum_redundancy(
+      [shape], mesh_axis_names, mesh_axis_sizes
+  )[0]
 
 
 @dataclasses.dataclass(frozen=True)

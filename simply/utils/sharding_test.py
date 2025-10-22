@@ -67,6 +67,26 @@ class ShardingTest(absltest.TestCase):
         [5],
     )
 
+  def test_partition_with_minimum_redundancy(self):
+    self.assertEqual(
+        sharding.partition_with_minimum_redundancy(
+            [1, 8, 2, 4], ['replica', 'data', 'model'], [2, 4, 8]
+        ),
+        [None, 'model', 'replica', 'data'],
+    )
+    self.assertEqual(
+        sharding.partition_with_minimum_redundancy(
+            [1, 3, 16], ['replica', 'data', 'model'], [2, 4, 8]
+        ),
+        [None, None, ['replica', 'model']],
+    )
+    self.assertEqual(
+        sharding.partition_with_minimum_redundancy(
+            [24, 16], ['replica', 'data', 'model'], [4, 4, 8]
+        ),
+        ['model', ['replica', 'data']],
+    )
+
   def test_multihost_data(self):
     testdir = os.path.join(self.create_tempdir(), 'test_multihost_data')
     global_data = {'a': 1, 'b': 2}

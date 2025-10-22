@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Unit test for config_lib.py."""
+
 from absl.testing import absltest
 from simply import config_lib
 from simply import model_lib

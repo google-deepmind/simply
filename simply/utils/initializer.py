@@ -71,7 +71,8 @@ class Initializer(abc.ABC):
       dim_annotation: str,
       dtype: jax.typing.DTypeLike,
   ) -> jax.Array:
-    return self.init(prng_key, shape, dim_annotation, dtype)
+    return self.init(
+        prng_key, shape=shape, dim_annotation=dim_annotation, dtype=dtype)
 
 
 class InitializerRegistry(registry.RootRegistry):
@@ -89,7 +90,7 @@ class InitializerRegistry(registry.RootRegistry):
 @InitializerRegistry.register
 @dataclasses.dataclass(frozen=True)
 class XavierUniformInit(Initializer):
-  """Xavier initializer."""
+  """Initializes with Xavier uniform distribution."""
 
   scale: float = math.sqrt(6.0)
 
@@ -100,8 +101,12 @@ class XavierUniformInit(Initializer):
       dim_annotation: str,
       dtype: jax.typing.DTypeLike,
   ) -> jax.Array:
-    """Xavier initializer."""
-    assert len(shape) == len(dim_annotation)
+    """Initializes with Xavier uniform distribution."""
+    if len(shape) != len(dim_annotation):
+      raise ValueError(
+          f'Shape {shape} and dim_annotation {dim_annotation} must have the'
+          ' same length.'
+      )
     i_dim = math.prod(
         float(d) for c, d in zip(dim_annotation, shape) if c in 'i'
     )
@@ -120,7 +125,7 @@ class XavierUniformInit(Initializer):
 @InitializerRegistry.register
 @dataclasses.dataclass(frozen=True)
 class HeNormalInit(Initializer):
-  """He normal initializer."""
+  """Initializes with He normal distribution."""
 
   scale: float = math.sqrt(2.0)
 
@@ -131,8 +136,12 @@ class HeNormalInit(Initializer):
       dim_annotation: str,
       dtype: jax.typing.DTypeLike,
   ) -> jax.Array:
-    """He normal initializer."""
-    assert len(shape) == len(dim_annotation)
+    """Initializes with He normal distribution."""
+    if len(shape) != len(dim_annotation):
+      raise ValueError(
+          f'Shape {shape} and dim_annotation {dim_annotation} must have the'
+          ' same length.'
+      )
     i_dim = math.prod(
         float(d) for c, d in zip(dim_annotation, shape) if c == 'i'
     )
@@ -143,7 +152,12 @@ class HeNormalInit(Initializer):
 @InitializerRegistry.register
 @dataclasses.dataclass(frozen=True)
 class IdentityInit(Initializer):
-  """Identity initializer."""
+  """Initializes 2D arrays as identity matrices.
+
+  This initializer only supports 2D shapes. For non-square shapes `(n, m)`,
+  it initializes an `n x m` matrix with ones on the main diagonal and
+  zeros elsewhere.
+  """
 
   def init(
       self,
@@ -152,8 +166,35 @@ class IdentityInit(Initializer):
       dim_annotation: str,
       dtype: jax.typing.DTypeLike,
   ) -> jax.Array:
-    """Identity initializer."""
+    """Initializes 2D arrays as identity matrices."""
     del prng_key
-    assert len(shape) == len(dim_annotation)
-    assert len(shape) == 2
-    return jnp.eye(shape[0], dtype=dtype)
+    if len(shape) != 2:
+      raise ValueError('IdentityInit only supports 2D shapes.')
+    if len(shape) != len(dim_annotation):
+      raise ValueError(
+          f'Shape {shape} and dim_annotation {dim_annotation} must have the'
+          ' same length.'
+      )
+    return jnp.eye(shape[0], shape[1], dtype=dtype)
+
+
+@InitializerRegistry.register
+@dataclasses.dataclass(frozen=True)
+class ZeroInit(Initializer):
+  """Initializes arrays with all zeros."""
+
+  def init(
+      self,
+      prng_key: jax.Array,
+      shape: Sequence[int],
+      dim_annotation: str,
+      dtype: jax.typing.DTypeLike,
+  ) -> jax.Array:
+    """Initializes arrays with all zeros."""
+    del prng_key
+    if len(shape) != len(dim_annotation):
+      raise ValueError(
+          f'Shape {shape} and dim_annotation {dim_annotation} must have the'
+          ' same length.'
+      )
+    return jnp.zeros(shape, dtype=dtype)

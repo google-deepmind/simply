@@ -35,14 +35,14 @@ from typing import Sequence
 from absl import app
 from absl import flags
 from absl import logging
-
-
+from etils import epath
 from simply import config_lib
 from simply import data_lib
 from simply import model_lib
 from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
 from simply.utils import pytree
+
 
 _EXPERIMENT_CONFIG = flags.DEFINE_string(
     'experiment_config', None, 'Name of the experiment config.')
@@ -92,7 +92,7 @@ def main(argv: Sequence[str]) -> None:
     assert (
         not _EXPERIMENT_CONFIG.value
     ), 'experiment_config and experiment_config_path cannot both be set.'
-    with open(experiment_config_path, 'r') as f:
+    with epath.Path(experiment_config_path).open('r') as f:
       config_dict = json.load(f)
     if 'code_patch' in config_dict:
       for code, code_context in config_dict['code_patch']:
@@ -106,7 +106,7 @@ def main(argv: Sequence[str]) -> None:
         _EXPERIMENT_CONFIG.value
     )
   if sharding_config_path := _SHARDING_CONFIG_PATH.value:
-    with open(sharding_config_path, 'r') as f:
+    with epath.Path(sharding_config_path).open('r') as f:
       sharding_config = pytree.load_dataclasses(json.load(f))
   else:
     sharding_config = config_lib.ShardingConfigRegistry.get_config(

@@ -13,15 +13,13 @@
 # limitations under the License.
 import dataclasses
 import json
-import os
 
 from absl import flags
+from absl.testing import absltest
+from etils import epath
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
-
-
-from absl.testing import absltest
 from simply import config_lib
 from simply import model_lib
 from simply.utils import checkpoint_lib as ckpt_lib
@@ -51,6 +49,8 @@ class CheckpointFormatTest(absltest.TestCase):
     n_layers: int = 2
     per_head_dim: int = 4
     vocab_size: int = 2
+    use_per_dim_scale: bool = False
+    output_layer_use_bias: bool = False
 
   def setUp(self):
     super().setUp()
@@ -70,25 +70,6 @@ class CheckpointFormatTest(absltest.TestCase):
     restored = ckpt_lib.load_checkpoint_from_dir(
         ckpt_dir.full_path,
         self.expected_abstract_state,
-    )
-    restored = common.get_raw_arrays(restored)
-    pytree.traverse_tree_with_path(
-        lambda actual, expected, path: self.assertAlmostEqual(
-            actual.tolist(), expected.tolist(), msg=f'Mismatch at {path}'
-        ),
-        restored,
-        self.expected_state,
-    )
-
-  def test_restore_v1_format(self):
-    v1_state = load_state('ckpt_v1_format.json')
-    ckpt_dir = self.create_tempdir()
-    mngr = ocp.CheckpointManager(ckpt_dir.full_path)
-    ckpt_lib.save_checkpoint(mngr, v1_state, 0, ckpt_format=ckpt_lib.V1Format())
-    mngr.wait_until_finished()
-
-    restored = ckpt_lib.load_checkpoint_from_dir(
-        ckpt_dir.full_path, self.expected_abstract_state
     )
     restored = common.get_raw_arrays(restored)
     pytree.traverse_tree_with_path(
@@ -209,7 +190,7 @@ class Qwen2FormatTest(absltest.TestCase):
 class CheckpointLibTest(absltest.TestCase):
 
   def test_dump_format(self):
-    js = pytree.dump_dataclasses(ckpt_lib.LegacyFormat())
+    js = pytree.dump(ckpt_lib.LegacyFormat())
     self.assertEqual(js, {'__dataclass__': 'CheckpointFormat:LegacyFormat'})
 
 

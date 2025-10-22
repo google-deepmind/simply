@@ -23,11 +23,11 @@ import textwrap
 import types
 from typing import Any, ClassVar
 
+from etils import epath
 import numpy as np
-
-
 from simply.utils import math_eval
 from simply.utils import registry
+
 
 maybe_remove_comma = math_eval.maybe_remove_comma
 find_number = math_eval.find_number
@@ -232,6 +232,23 @@ class ZeroShotCoTBoxedInQuestionEvaluation(ZeroShotBoxedInQuestionEvaluation):
   # TODO: Rename to names like CoTV1 because we may want to try
   # different CoT versions.
   answer_start: str = "Answer: Let's think step by step."
+
+
+@EvaluationRegistry.register
+@dataclasses.dataclass(frozen=True)
+class QAToolUseEvaluation(ZeroShotBoxedInQuestionEvaluation):
+  question_start: str = textwrap.dedent("""
+    You are a helpful agent with a search tool to answer questions. If you need search, use search tool in this exact format: `<query>your search query</query>`. Stop immediately after one search call and wait for the user to provide the result.
+    Example:
+    User: Question: What is the capital of France? Put your answer in \\boxed{<Your answer>}.
+    Model: I need to use google search to find the France capital. <query>France capital</query>
+    User: ```research_result
+    # 'Paris'
+    Paris, France's capital, is a major European city and a global center for art, fashion, gastronomy and culture. Its 19th-century cityscape is crisscrossed by wide boulevards and the River Seine.
+    ```
+    Model: The research result states that Paris is the France's capital. \\boxed{Paris}
+    
+    Question: """)
 
 
 @EvaluationRegistry.register

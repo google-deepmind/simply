@@ -22,17 +22,15 @@ import random
 from typing import Any, Callable, ClassVar, Mapping, MutableMapping, Optional, Protocol, Union
 
 import einops
+from etils import epath
 import jax
 import jax.numpy as jnp
 import numpy as np
 import seqio
-import t5.data.preprocessors
-
-import tensorflow as tf
-
-
 from simply.utils import registry
 from simply.utils import tokenization
+import t5.data.preprocessors
+import tensorflow as tf
 
 
 ################################################################################
@@ -428,7 +426,7 @@ class GSM8KJSONTrain(SimpleDataSource):
   split: str = 'train'
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       data = json.load(f)
     examples = data[self.split]
     for i, example in enumerate(examples):
@@ -468,13 +466,24 @@ class SimpleQATest(SimpleDataSource):
   split: str = 'test'
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       data = json.load(f)
     examples = data[self.split]
     for i, example in enumerate(examples):
       example['uid'] = f'simple_qa_{self.split}-{i}'
       example['id'] = i
     return examples
+
+
+@functools.partial(
+    DataSourceRegistry.register, name='simply_json:simple_qa_num'
+)
+@dataclasses.dataclass(frozen=True)
+class SimpleQATestNumberOnly(SimpleQATest):
+  """Simple QA dataset with only number-only answers."""
+
+  path: str = os.path.join(
+      DATASETS_DIR, 'simple_qa/simple_qa_test_set_number_only.json')
 
 
 @functools.partial(DataSourceRegistry.register, name='simply_json:mmlu_test')
@@ -487,7 +496,7 @@ class MMLUJSONTest(SimpleDataSource):
   split: str = 'test'
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       data = json.load(f)
     examples = data['data'][self.split]
     for i, example in enumerate(examples):
@@ -506,7 +515,7 @@ class DeepScaleRJSONTrain(SimpleDataSource):
   example_end_index: int | None = None
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
     for i, example in enumerate(examples):
@@ -531,7 +540,7 @@ class AIME24JSON(SimpleDataSource):
   example_end_index: int | None = None
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
     for i, example in enumerate(examples):
@@ -557,7 +566,7 @@ class AIME25JSON(SimpleDataSource):
   example_end_index: int | None = None
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
     for i, example in enumerate(examples):
@@ -584,7 +593,7 @@ class MATH500JSONTest(SimpleDataSource):
   example_end_index: int | None = None
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
     for i, example in enumerate(examples):
@@ -613,7 +622,7 @@ class GPQADiamondJSON(SimpleDataSource):
   example_end_index: int | None = None
 
   def load(self):
-    with open(self.path, 'r') as f:
+    with epath.Path(self.path).open('r') as f:
       examples = json.load(f)
     new_examples = []
     for i, example in enumerate(examples):

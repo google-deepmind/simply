@@ -13,12 +13,13 @@
 # limitations under the License.
 """All modeling components including architecture, training and inference."""
 
+import collections
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import copy
 import dataclasses
 import functools
 import time
-from typing import Any, ClassVar, Generic, Self, Tuple, cast
+from typing import Any, ClassVar, Self, Tuple, cast
 
 from absl import logging
 import einops
@@ -36,7 +37,7 @@ from simply.utils import distributions
 from simply.utils import experiment_helper as exp_helper
 from simply.utils import initializer
 from simply.utils import module
-from simply.utils import optimizer as opt_lib
+from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 from simply.utils import registry
 from simply.utils import sampling_lib
@@ -1087,6 +1088,7 @@ class TransformerBlock(module.SimplyModule):
   n_heads: int
   per_head_dim: int
   expand_factor: int
+  sharding_config: SimplyConfig
   use_rmsnorm: bool = False
   use_pre_ln: bool = True
   use_post_ln: bool = False
@@ -1096,14 +1098,6 @@ class TransformerBlock(module.SimplyModule):
   use_per_dim_scale: bool = False
   # Mixed precision related.
   activation_dtype: DTypeLike = 'bfloat16'
-  # Sharding related.
-  attn_qkv_partition: PartitionAnnotation = None
-  attn_o_partition: PartitionAnnotation = None
-  attn_activation_partition: PartitionAnnotation = None
-  ffn0_partition: PartitionAnnotation = None
-  ffn0_activation_partition: PartitionAnnotation = None
-  ffn1_partition: PartitionAnnotation = None
-  activation_partition: PartitionAnnotation = None
   # Below are for experimental usage.
   ffn_expand_dim: int | None = None
   use_flash_attention: bool = False
@@ -1195,10 +1189,10 @@ class TransformerBlock(module.SimplyModule):
         # Mixed precision related.
         activation_dtype=self.activation_dtype,
         # Sharding related.
-        qkv_partition=self.attn_qkv_partition,
-        o_partition=self.attn_o_partition,
-        attn_activation_partition=self.attn_activation_partition,
-        output_partition=self.activation_partition,
+        qkv_partition=self.sharding_config.attn_qkv_partition,
+        o_partition=self.sharding_config.attn_o_partition,
+        attn_activation_partition=self.sharding_config.attn_activation_partition,
+        output_partition=self.sharding_config.activation_partition,
         # Others.
         use_flash_attention=self.use_flash_attention,
         flash_attention_block_size=self.flash_attention_block_size,
@@ -1218,23 +1212,23 @@ class TransformerBlock(module.SimplyModule):
         # Mixed precision related.
         activation_dtype=self.activation_dtype,
         # Sharding related.
-        weight_partition=self.ffn0_partition,
-        output_partition=self.ffn0_activation_partition)
+        weight_partition=self.sharding_config.ffn0_partition,
+        output_partition=self.sharding_config.ffn0_activation_partition)
     self.ffn_1 = Linear(
         self.expand_dim, self.model_dim, use_bias=self.ffn_use_bias,
         # Mixed precision related.
         activation_dtype=self.activation_dtype,
         # Sharding related.
-        weight_partition=self.ffn1_partition,
-        output_partition=self.activation_partition)
+        weight_partition=self.sharding_config.ffn1_partition,
+        output_partition=self.sharding_config.activation_partition)
     if self.use_gated_activation_in_ffn:
       self.ffn_0_gate = Linear(
           self.model_dim, self.expand_dim, use_bias=self.ffn_use_bias,
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
           # Sharding related.
-          weight_partition=self.ffn0_partition,
-          output_partition=self.ffn0_activation_partition)
+          weight_partition=self.sharding_config.ffn0_partition,
+          output_partition=self.sharding_config.ffn0_activation_partition)
 
   def init(self, prng_key: PRNGKey) -> PyTree:
     params = {}
@@ -1279,7 +1273,8 @@ class TransformerBlock(module.SimplyModule):
     x += x_res
     if self.use_post_skip_ln:
       x = self.post_skip_ln_0.apply(params['post_skip_ln_0'], x)
-    x = sharding_lib.with_sharding_constraint(x, self.activation_partition)
+    x = sharding_lib.with_sharding_constraint(
+        x, self.sharding_config.activation_partition)
 
     x_res = x
     if self.use_pre_ln:
@@ -1302,7 +1297,8 @@ class TransformerBlock(module.SimplyModule):
     x += x_res
     if self.use_post_skip_ln:
       x = self.post_skip_ln_1.apply(params['post_skip_ln_1'], x)
-    x = sharding_lib.with_sharding_constraint(x, self.activation_partition)
+    x = sharding_lib.with_sharding_constraint(
+        x, self.sharding_config.activation_partition)
 
     if decode_state is not None:
       extra_output['decode_state'] = attn_extra_output['decode_state']
@@ -1393,14 +1389,7 @@ class TransformerLM(module.SimplyModule):
           ffn_expand_dim=getattr(config, 'ffn_expand_dim', None),
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
-          # Sharding related.
-          attn_qkv_partition=sharding_config.attn_qkv_partition,
-          attn_o_partition=sharding_config.attn_o_partition,
-          attn_activation_partition=sharding_config.attn_activation_partition,
-          ffn0_partition=sharding_config.ffn0_partition,
-          ffn0_activation_partition=sharding_config.ffn0_activation_partition,
-          ffn1_partition=sharding_config.ffn1_partition,
-          activation_partition=sharding_config.activation_partition,
+          sharding_config=sharding_config,
           # Others.
           use_flash_attention=config.use_flash_attention,
           flash_attention_block_size=config.flash_attention_block_size,
@@ -1503,7 +1492,7 @@ class TransformerLM(module.SimplyModule):
       *,
       segment_ids: Array | None = None,
       segment_positions: Array | None = None,
-      extra_inputs: Mapping[str, Array] | None = None,
+      extra_inputs: Mapping[str, PyTree] | None = None,
       decode_state: PyTree = None,
   ) -> tuple[Array, PyTree]:
     """Transformer forward pass.
@@ -1531,6 +1520,7 @@ class TransformerLM(module.SimplyModule):
       )
     if segment_ids is None:
       segment_ids = jnp.ones_like(segment_positions)
+    extra_inputs = extra_inputs or {}
 
     self.sharding_config = cast(SimplyConfig, self.sharding_config)
     # Add sharding constraints to the inputs.
@@ -1558,7 +1548,19 @@ class TransformerLM(module.SimplyModule):
         params)
 
     x = self.embed.apply(params['embed'], x)
+
     for input_encoder in self.input_encoders:
+      missing_keys = [
+          k not in extra_inputs for k in input_encoder.extra_input_keys
+      ]
+      if all(missing_keys):
+        continue
+      if any(missing_keys):
+        raise ValueError(
+            f'Incomplete extra_inputs keys, got {extra_inputs.keys()}, expected'
+            f' {input_encoder.extra_input_keys}'
+        )
+
       input_enc_params = params['input_encoders'][input_encoder.name]
       kwargs = {k: extra_inputs[k] for k in input_encoder.extra_input_keys}
       encoder_output = input_encoder.apply(
@@ -1772,13 +1774,15 @@ def compute_loss(model, params, batch):
   # targets: [batch_size, seq_len]
   targets = batch['decoder_target_tokens']
   # loss_weights: [batch_size, seq_len]
-  loss_weights = batch['decoder_loss_weights']
+  loss_weights = batch.get('decoder_loss_weights', None)
+  if loss_weights is None:
+    loss_weights = jnp.ones_like(targets, dtype='bool')
   # segment_ids: [batch_size, seq_len]
   segment_ids = batch.get('decoder_segment_ids', None)
   # segment_positions: [batch_size, seq_len]
   segment_positions = batch.get('decoder_positions', None)
   # logits: [batch_size, seq_len, vocab_size]
-  logits, _ = model.apply(
+  logits, model_extra_output = model.apply(
       params, inputs,
       segment_ids=segment_ids, segment_positions=segment_positions)
   # Always use float32 in softmax.
@@ -1796,7 +1800,40 @@ def compute_loss(model, params, batch):
   correct = (pred == targets).astype(jnp.float32) * loss_weights
   accuracy = jnp.sum(correct) / total_loss_weight
   accuracy = sharding_lib.with_sharding_constraint(accuracy, None)
-  return loss, {'accuracy': accuracy, 'loss_weight': total_loss_weight}
+  extra_output = {'accuracy': accuracy, 'loss_weight': total_loss_weight}
+  if model_extra_output:
+    extra_loss, extra_metric_dict = collect_loss_and_metric(model_extra_output)
+    extra_output.update(extra_metric_dict)
+    loss += extra_loss
+  return loss, extra_output
+
+
+def collect_tag(extra_outputs, tag):
+  tag_dict = collections.defaultdict(list)
+  for val, path in pytree.tree_leaves_with_tag(extra_outputs, tag):
+    name = path[-1].key
+    logging.info(
+        'Collected %s tag from %s with shape %s and name %s.',
+        tag,
+        path,
+        val.shape,
+        name,
+    )
+    tag_dict[name].append(val)
+  tag_val_dict = {}
+  for k, v in tag_dict.items():
+    if v[0].size != 1:
+      raise ValueError(
+          f'Tag {tag} has met a non-scalar values for key {k}: {v}')
+    tag_val_dict[k] = jnp.mean(jnp.stack(v))
+  return tag_val_dict
+
+
+def collect_loss_and_metric(extra_outputs):
+  metric_val_dict = collect_tag(extra_outputs, 'metric')
+  loss_dict = collect_tag(extra_outputs, 'loss')
+  total_loss = sum(loss_dict.values())
+  return total_loss, metric_val_dict
 
 
 def compute_train_loss(model, params, batch):
@@ -2405,7 +2442,11 @@ def compute_batch_stats_info(
   result['avg_ratio_nonpad_tokens_per_seq'] = ratio_of_nonpad_tokens.mean()
   result['std_ratio_nonpad_tokens_per_seq'] = ratio_of_nonpad_tokens.std()
 
-  loss_weights_per_seq = np.sum(batch['decoder_loss_weights'], axis=-1)
+  loss_weights = batch.get('decoder_loss_weights', None)
+  if loss_weights is None:
+    loss_weights = jnp.ones((batch_size, seq_len), dtype='bool')
+
+  loss_weights_per_seq = np.sum(loss_weights, axis=-1)
   result['total_weights'] = loss_weights_per_seq.sum()
   result['avg_weights_per_seq'] = loss_weights_per_seq.mean()
   result['std_weights_per_seq'] = loss_weights_per_seq.std()
@@ -2428,7 +2469,7 @@ class SamplingRegistry(registry.RootRegistry):
 
 
 @jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(kw_only=True, frozen=True)
 class SamplingState:
   """Sampling state.
 
@@ -2446,35 +2487,47 @@ class SamplingState:
   position: Array  # [], scale, must be > 0 and < decode_state_length
   # when position == decode_state_length, the sampling state is finished.
   input_lens: Array  # [batch, 1], bos counted
+  max_decode_steps: Array  # [batch, 1]
+  eos_ids: Array  # [n_eos]
 
   def __post_init__(self):
     assert not self.position.shape
     assert self.input_lens.shape == (self.batch_size, 1)
 
   @functools.cached_property
+  def is_pad_seq(self) -> Array:
+    """This sequence is a padding sequence, in [batch, 1]."""
+    return self.input_lens == 0
+
+  @functools.cached_property
   def input_tokens(self) -> Array:
     return jax.lax.dynamic_slice_in_dim(self.tokens, self.position, 1, axis=1)
 
-  def reached_eos(self, eos_ids: Array) -> Array:
+  @functools.cached_property
+  def reached_eos(self) -> Array:
     """This position is output and eos, in [batch, 1]."""
     # eos_ids: [n_eos]
     # input_tokens: [batch, 1]
     # output: [batch, n_eos] -> [batch, 1]
     return (self.position >= self.input_lens) & jnp.any(
-        self.input_tokens == eos_ids, axis=-1, keepdims=True
+        self.input_tokens == self.eos_ids, axis=-1, keepdims=True
     )
 
-  @jax.jit
-  def all_reached_eos(self, eos_ids: Array) -> Array:
-    """All positions are output and eos, in [batch, 1]."""
-    return jnp.all(self.reached_eos(eos_ids))
+  @functools.cached_property
+  def has_ended(self) -> Array:
+    """Returns whether each sequence in the batch is done with generation."""
+    return (
+        self.is_pad_seq
+        | (self.position + 1 - self.input_lens > self.max_decode_steps)
+        | self.reached_eos
+    )
 
   @functools.cached_property
   def next_position_is_output(self) -> Array:
     return self.position + 1 >= self.input_lens  # [batch, 1]
 
   @functools.cached_property
-  def output_tokens(self) -> Array:
+  def next_tokens(self) -> Array:
     return jax.lax.dynamic_slice_in_dim(
         self.tokens, self.position + 1, 1, axis=1
     )
@@ -2502,34 +2555,29 @@ class SamplingState:
   def batch_size(self) -> int:
     return self.tokens.shape[0]
 
-  def pad_to(self, length: int, pad_id: int) -> 'SamplingState':
+  def pad_to(self, length: int) -> 'SamplingState':
     if length <= self.decode_state_length:
       return self
-    tokens = pad_to_along_axis(
-        self.tokens, length + 1, axis=1, constant_values=pad_id
-    )
+    tokens = pad_to_along_axis(self.tokens, length + 1, axis=1)
     token_logprobs = pad_to_along_axis(self.token_logprobs, length + 1, axis=1)
     token_scores = pad_to_along_axis(self.token_scores, length + 1, axis=1)
     decode_state = pad_decode_state_to(self.decode_state, length)
-    return SamplingState(
-        prng_key=self.prng_key,
+    return dataclasses.replace(
+        self,
         decode_state=decode_state,
         tokens=tokens,
         token_logprobs=token_logprobs,
         token_scores=token_scores,
-        position=self.position,
-        input_lens=self.input_lens,
     )
 
 
 @SamplingRegistry.register
 @dataclasses.dataclass(frozen=True)
-class GenericSamplingOutput(Generic[RawT]):
-  # Input text can be a string type (text) or np.ndarray (multi-modal).
-  input_text: RawT
+class SamplingOutput:
+  input_chunks: sampling_lib.ChunkSequence
   input_token_ids: list[int]
 
-  output_text: RawT
+  output_chunks: sampling_lib.ChunkSequence
   output_token_ids: list[int]
 
   # Sampling logprobs of the output tokens.
@@ -2541,6 +2589,14 @@ class GenericSamplingOutput(Generic[RawT]):
   # Log probs of the output tokens computed by log_softmax.
   # The score values are not affected by the sampling params.
   output_token_scores: list[float]
+
+  @functools.cached_property
+  def input_text(self) -> str:
+    return sampling_lib.chunks_as_text(self.input_chunks)
+
+  @functools.cached_property
+  def output_text(self) -> str:
+    return sampling_lib.chunks_as_text(self.output_chunks)
 
   @functools.cached_property
   def sum_output_logprob(self) -> float:
@@ -2573,9 +2629,6 @@ class GenericSamplingOutput(Generic[RawT]):
     return np.mean(self.output_token_scores).item()
 
 
-SamplingOutput = GenericSamplingOutput[str]
-
-
 @dataclasses.dataclass(frozen=True)
 class ScoringParams:
   temperature: float = 1.0
@@ -2592,13 +2645,13 @@ class ScoringParams:
 
 
 @dataclasses.dataclass(frozen=True)
-class GenericScoringOutput(Generic[RawT]):
+class ScoringOutput:
   params: ScoringParams
 
-  input_text: RawT
+  input_chunks: sampling_lib.ChunkSequence
   input_token_ids: list[int]
 
-  output_text: RawT
+  output_chunks: sampling_lib.ChunkSequence
   output_token_ids: list[int]
 
   # Log probs of the input tokens computed by log_softmax.
@@ -2608,6 +2661,14 @@ class GenericScoringOutput(Generic[RawT]):
   # Log probs of the input tokens computed by log_softmax.
   # The score values are not affected by the sampling params.
   output_token_scores: list[float]
+
+  @functools.cached_property
+  def input_text(self) -> str:
+    return sampling_lib.chunks_as_text(self.input_chunks)
+
+  @functools.cached_property
+  def output_text(self) -> str:
+    return sampling_lib.chunks_as_text(self.output_chunks)
 
   @functools.cached_property
   def sum_input_score(self) -> float:
@@ -2626,16 +2687,14 @@ class GenericScoringOutput(Generic[RawT]):
     return np.mean(self.output_token_scores).item()
 
 
-ScoringOutput = GenericScoringOutput[str]
-
-
-class GenericInterface(Generic[RawT]):
+class LMInterface:
 
   def __init__(
       self,
       model: module.SimplyModule,
       params: PyTree,
-      vocab: tokenization.SimplyVocab[RawT],
+      vocab: tokenization.SimplyVocab[str] | None = None,
+      input_processor: sampling_lib.InputProcessorInterface | None = None,
       default_sampling_params: SamplingParams | None = None,
       bos_id: int | None = None,
       pad_id: int | None = None,
@@ -2647,7 +2706,11 @@ class GenericInterface(Generic[RawT]):
     Args:
       model: The model to use, for example, a TransformerLM instance.
       params: The `params` to use in `model.apply`.
-      vocab: The vocabulary instance to use.
+      vocab: The vocabulary instance to use. Either `vocab` or `input_processor`
+        should be specified. If `vocab` is specified, it will be used to a
+        instantiate a default input processor for basic text inputs.
+      input_processor: The input processor to use, for specialized input
+        processing. For basic text inputs, it is enough to specify `vocab`.
       default_sampling_params: Default sampling params for `generate`.
       bos_id: The bos id to use, if not given then it will use the `bos_id`
         field of the `vocab`.
@@ -2657,36 +2720,30 @@ class GenericInterface(Generic[RawT]):
       extra_eos_tokens: Extra eos tokens to include.
     """
     self.model = model
-    self.vocab = vocab
-    self.eos_ids = [vocab.eos_id]
-    if extra_eos_ids is not None:
-      self.eos_ids.extend(extra_eos_ids)
-    if extra_eos_tokens is not None:
-      for token in extra_eos_tokens:
-        encoded_token_ids = vocab.encode(token)
-        assert len(encoded_token_ids) == 1, (
-            f'Invalid eos token {token} , '
-            f'valid eos token must be a single token in vocab.')
-        self.eos_ids.append(encoded_token_ids[0])
-    self.eos_ids = list(set(self.eos_ids))
-    # The token id to append at the beginning of the input.
-    if pad_id is None:
-      self.pad_id = vocab.pad_id
+    if input_processor:
+      self.input_processor = input_processor
     else:
-      self.pad_id = pad_id
-    if bos_id is None:
-      self.bos_id = vocab.bos_id
-    else:
-      self.bos_id = bos_id
-
+      assert vocab is not None, 'Must provide one of vocab or input_processor!'
+      self.input_processor = sampling_lib.BasicTextInputProcessor(
+          vocab,
+          bos_id_override=bos_id,
+          pad_id_override=pad_id,
+          extra_eos_ids=extra_eos_ids,
+          extra_eos_tokens=extra_eos_tokens,
+      )
     self.default_sampling_params = default_sampling_params or SamplingParams()
 
     def prefill_fn(
-        params: PyTree, inputs: Array, position: int, return_logits: bool = True
+        params: PyTree,
+        inputs: Array,
+        extra_inputs: Mapping[str, Array],
+        position: int,
+        return_logits: bool = True,
     ) -> tuple[Array | None, PyTree]:
       logits, extra_output = model.apply(
           params,
           inputs,
+          extra_inputs=extra_inputs,
           decode_state={'prefill_position': position},
       )
       if return_logits:
@@ -2706,13 +2763,19 @@ class GenericInterface(Generic[RawT]):
     self.pad_state_to_fn = jax.jit(
         SamplingState.pad_to,
         donate_argnames='self',
-        static_argnames=['length', 'pad_id'],
+        static_argnames=['length'],
     )
     self.model_params = params
 
+  @property
+  def eos_ids(self) -> list[int]:
+    return self.input_processor.eos_ids
+
   def generate(
       self,
-      input_text: RawT | Sequence[RawT],
+      input_text: (
+          sampling_lib.SamplingInput | Sequence[sampling_lib.SamplingInput]
+      ),
       prng_key: int | PRNGKey | None = None,
       params: PyTree = None,
       # TODO: Deprecate in favor of setting directly in
@@ -2721,18 +2784,14 @@ class GenericInterface(Generic[RawT]):
       sampling_params: SamplingParams | None = None,
       scoring_params: ScoringParams | None = None,
       include_eos_in_output_text: bool = False,
-      include_bos_in_input_text: bool = False,
-      microbatch_size: int | None = None,
       scoring_inputs: bool = True,
-  ) -> (
-      list[GenericSamplingOutput[RawT]]
-      | list[list[GenericSamplingOutput[RawT]]]
-  ):
+      batch_size: int | None = None,
+  ) -> list[SamplingOutput] | list[list[SamplingOutput]]:
     """Generate samples from a given input text.
 
     Args:
-      input_text: Input raw format or sequence of inputs to generate samples
-        for.
+      input_text: Single input or sequence of inputs to generate samples for.
+        Input can be either string or sequence of Chunks.
       prng_key: A PRNGKey or seed for controlling the randomness. The key would
         be released inside, and cannot be reused.
       params: parameters of the model, if None, use the default parameters.
@@ -2746,11 +2805,10 @@ class GenericInterface(Generic[RawT]):
         generating the `output_text` field of the sampling outputs. Note that
         even if this is set to `True`, the `vocab.decode` can still skip the eos
         token.
-      include_bos_in_input_text: Whether to include the bos token in the
-        `input_text` field of the sampling outputs.
-      microbatch_size: The number of inputs in each microbatch.
       scoring_inputs: Whether to compute the log likelihood of the input and
         generated output.
+      batch_size: The batch size to use for the generation. If not specified,
+        the batch size will be inferred from the length of the input text.
 
     Returns:
       If the `input_text` is a single text string or a single raw sequence,
@@ -2786,184 +2844,202 @@ class GenericInterface(Generic[RawT]):
     if scoring_params is None:
       scoring_params = ScoringParams.from_sampling_params(sampling_params)
 
-    if not pytree.tree_is_sequence(input_text):
-      all_input_texts = [input_text]
+    is_singleton_input = isinstance(input_text, str)
+    if input_text and isinstance(input_text[0], sampling_lib.Chunk):
+      is_singleton_input = True
+
+    if is_singleton_input:
+      raw_inputs = [sampling_lib.input_as_chunks(input_text)]
     else:
-      all_input_texts = input_text
+      raw_inputs = [sampling_lib.input_as_chunks(x) for x in input_text]
 
-    num_input_texts = len(all_input_texts)
-    # TODO: Support cases where microbatch_size > num_input_texts, for
-    # example, when we want to generate a lot of samples on one example.
-    if microbatch_size is None:
-      microbatch_size = num_input_texts
-    assert num_input_texts % microbatch_size == 0
-    num_microbatches = num_input_texts // microbatch_size
+    unpadded_inputs = [
+        self.input_processor.encode(
+            x, max_input_len=sampling_params.max_input_len)
+        for x in raw_inputs
+    ]
+    processed_input = sampling_lib.ProcessedInputBatch.from_unpadded_inputs(
+        unpadded_inputs, pad_id=self.input_processor.pad_id
+    )
+    # Compute before padding the batch which may create length zero inputs.
+    decoding_schedule = sampling_params.get_decoding_schedule(
+        min_input_length=processed_input.min_length,
+        max_input_length=processed_input.max_length,
+    )
+
+    if batch_size is not None:
+      if processed_input.batch_size > batch_size:
+        raise ValueError(
+            f'Batch size {processed_input.batch_size=} is larger than the'
+            f' specified batch size {batch_size=}.'
+        )
+      if processed_input.batch_size < batch_size:
+        processed_input = processed_input.pad_batch_to(batch_size)
+        logging.info('processed_input=%s after batch padding', processed_input)
+
+    processed_input = processed_input.pad_to(
+        1
+        + max(
+            decoding_schedule.get_next_length(processed_input.max_length - 1),
+            decoding_schedule.prefill_size,
+        )
+    )
+    if sampling_params.num_samples > 1:
+      processed_input = processed_input.repeat(sampling_params.num_samples)
+
+    position = decoding_schedule.begin_position
+    logits, extra_output = self.prefill_fn(
+        params,
+        processed_input.token_slice(0, decoding_schedule.prefill_size),
+        extra_inputs=processed_input.extra_inputs,
+        position=position,
+        return_logits=scoring_inputs,
+    )
+    if scoring_inputs:
+      logits = sharding_lib.with_sharding_constraint(
+          logits, (('replica', 'data'), 'model', None)
+      )
+
+      token_scores = compute_log_likelihood(
+          logits,
+          processed_input.token_slice(1, decoding_schedule.prefill_size + 1),
+          temperature=scoring_params.temperature,
+          top_k=scoring_params.top_k,
+          top_p=scoring_params.top_p,
+      )
+    else:
+      token_scores = jnp.zeros(
+          (processed_input.batch_size, decoding_schedule.prefill_size),
+          dtype=jnp.float32,
+      )
+    del logits  # Release logits to save HBM.
+    # For better readability, we add a dummy score for the BOS token, so that
+    # i-th score and logprob corresponds to the i-th token.
+    token_scores = pad_along_axis(token_scores, (1, 0), axis=1)
+    token_logprobs = jnp.zeros_like(token_scores)
+
+    sampling_state = SamplingState(
+        prng_key=jnp.copy(prng_key),
+        position=jnp.array(position),
+        decode_state=extra_output['decode_state'],
+        tokens=processed_input.tokens,
+        token_logprobs=token_logprobs,
+        token_scores=token_scores,
+        input_lens=jnp.reshape(processed_input.lengths, [-1, 1]),
+        max_decode_steps=einops.repeat(
+            jnp.array(sampling_params.max_decode_steps),
+            '-> b 1',
+            b=processed_input.batch_size,
+        ),
+        eos_ids=jnp.array(self.input_processor.eos_ids, dtype=jnp.int32),
+    )
+
+    # NOTE that `position + 1` is the output position.
+    logging.info('position: %d', position)
+    logging.info('max_input_len: %d', processed_input.max_length)
+    logging.info(
+        'sampling_params.max_decode_steps: %d',
+        sampling_params.max_decode_steps,
+    )
+    logging.info(
+        'sampling_params.max_seq_len: %d', sampling_params.max_seq_len
+    )
+
+    while position < decoding_schedule.end_position:
+      sampling_state = self.pad_state_to_fn(
+          sampling_state, length=decoding_schedule.get_next_length(position)
+      )
+      sampling_state = self.decode_fn(
+          params=params,
+          init_sampling_state=sampling_state,
+          temperature=sampling_params.temperature,
+          top_k=sampling_params.top_k,
+          top_p=sampling_params.top_p,
+          scoring_temperature=scoring_params.temperature,
+          scoring_top_k=scoring_params.top_k,
+          scoring_top_p=scoring_params.top_p,
+      )
+      position = jax.device_get(sampling_state.position)
+      if jax.device_get(jnp.all(sampling_state.has_ended)):
+        break
+    # Post process the outputs.
+    all_raw_token_ids = jax.experimental.multihost_utils.process_allgather(
+        sampling_state.tokens, tiled=True
+    ).tolist()
+    all_raw_token_logprobs = jax.experimental.multihost_utils.process_allgather(
+        sampling_state.token_logprobs, tiled=True
+    ).tolist()
+    all_raw_token_scores = jax.experimental.multihost_utils.process_allgather(
+        sampling_state.token_scores, tiled=True
+    ).tolist()
+
     sample_outputs = []
-    for i in range(num_microbatches):
-      input_texts = all_input_texts[
-          i * microbatch_size : (i + 1) * microbatch_size]
-      input_tokens = [self.vocab.encode(x) for x in input_texts]
-      if self.bos_id is not None:
-        input_tokens = [[self.bos_id] + x for x in input_tokens]
-      processed_input, decoding_schedule = sampling_lib.prepare_sampling_input(
-          sampling_params, input_tokens, pad_id=self.pad_id
-      )
-
-      position = decoding_schedule.begin_position
-      logits, extra_output = self.prefill_fn(
-          params,
-          processed_input.token_slice(0, decoding_schedule.prefill_size),
-          position=position,
-          return_logits=scoring_inputs,
-      )
-      if scoring_inputs:
-        logits = sharding_lib.with_sharding_constraint(
-            logits, (('replica', 'data'), 'model', None)
-        )
-
-        token_scores = compute_log_likelihood(
-            logits,
-            processed_input.token_slice(1, decoding_schedule.prefill_size + 1),
-            temperature=scoring_params.temperature,
-            top_k=scoring_params.top_k,
-            top_p=scoring_params.top_p,
-        )
-      else:
-        token_scores = jnp.zeros(
-            (processed_input.batch_size, decoding_schedule.prefill_size),
-            dtype=jnp.float32,
-        )
-      del logits  # Release logits to save HBM.
-      # For better readability, we add a dummy score for the BOS token, so that
-      # i-th score and logprob corresponds to the i-th token.
-      token_scores = pad_along_axis(token_scores, (1, 0), axis=1)
-      token_logprobs = jnp.zeros_like(token_scores)
-
-      sampling_state = SamplingState(
-          prng_key=jnp.copy(prng_key),
-          position=jnp.array(position),
-          decode_state=extra_output['decode_state'],
-          tokens=processed_input.tokens,
-          token_logprobs=token_logprobs,
-          token_scores=token_scores,
-          input_lens=jnp.reshape(processed_input.lengths, [-1, 1]),
-      )
-      eos_ids_array = jnp.array(self.eos_ids, dtype=jnp.int32)
-      # NOTE that `position + 1` is the output position.
-      logging.info('position: %d', position)
-      logging.info('max_input_len: %d', processed_input.max_length)
-      logging.info(
-          'sampling_params.max_decode_steps: %d',
-          sampling_params.max_decode_steps,
-      )
-      logging.info(
-          'sampling_params.max_seq_len: %d', sampling_params.max_seq_len
-      )
-
-      while position < decoding_schedule.end_position:
-        sampling_state = self.pad_state_to_fn(
-            sampling_state,
-            length=decoding_schedule.get_next_length(position),
-            pad_id=self.pad_id,
-        )
-        sampling_state = self.decode_fn(
-            params=params,
-            init_sampling_state=sampling_state,
-            temperature=sampling_params.temperature,
-            top_k=sampling_params.top_k,
-            top_p=sampling_params.top_p,
-            scoring_temperature=scoring_params.temperature,
-            scoring_top_k=scoring_params.top_k,
-            scoring_top_p=scoring_params.top_p,
-            eos_ids=eos_ids_array,
-        )
-        position = jax.device_get(sampling_state.position)
-        if jax.device_get(sampling_state.all_reached_eos(eos_ids_array)):
-          break
-      # Post process the outputs.
-      assert isinstance(self.eos_ids, list)
-      assert isinstance(self.eos_ids[0], int)
-      all_raw_token_ids = jax.experimental.multihost_utils.process_allgather(
-          sampling_state.tokens, tiled=True
-      ).tolist()
-      all_raw_token_logprobs = (
-          jax.experimental.multihost_utils.process_allgather(
-              sampling_state.token_logprobs, tiled=True
-          ).tolist()
-      )
-      all_raw_token_scores = jax.experimental.multihost_utils.process_allgather(
-          sampling_state.token_scores, tiled=True
-      ).tolist()
-      for i in range(sampling_state.batch_size):
-        raw_token_ids = all_raw_token_ids[i]
-        assert isinstance(raw_token_ids, list)
-        assert isinstance(raw_token_ids[0], int)
-        raw_token_logprobs = all_raw_token_logprobs[i]
-        assert isinstance(raw_token_logprobs, list)
-        assert isinstance(raw_token_logprobs[0], float)
-        raw_token_scores = all_raw_token_scores[i]
-        assert isinstance(raw_token_scores[0], float)
-        assert isinstance(raw_token_scores, list)
-        input_token_ids = []
-        input_token_scores = []
-        output_token_ids = []
-        output_token_scores = []
-        output_token_logprobs = []
-        for t, token_id in enumerate(raw_token_ids):
-          if t >= min(
-              # Ensure python int to prevent overflow.
-              int(processed_input.lengths[i])
-              + sampling_params.max_decode_steps,
-              sampling_params.max_seq_len,
-          ):
-            break
-          if t < processed_input.lengths[i]:
-            input_token_ids.append(token_id)
-            if t > 0:
-              # The first token score is dummy.
-              input_token_scores.append(raw_token_scores[t])
-          else:
-            output_token_ids.append(token_id)
-            output_token_scores.append(raw_token_scores[t])
-            output_token_logprobs.append(raw_token_logprobs[t])
-            if token_id in self.eos_ids:
-              # Generated eos token can only appear in output_tokens.
-              break
-
-        if (
-            output_token_ids
-            and output_token_ids[-1] in self.eos_ids
-            and not include_eos_in_output_text
+    num_outputs = len(raw_inputs) * sampling_params.num_samples
+    for i in range(num_outputs):
+      raw_token_ids = all_raw_token_ids[i]
+      assert isinstance(raw_token_ids, list)
+      assert isinstance(raw_token_ids[0], int)
+      raw_token_logprobs = all_raw_token_logprobs[i]
+      assert isinstance(raw_token_logprobs, list)
+      assert isinstance(raw_token_logprobs[0], float)
+      raw_token_scores = all_raw_token_scores[i]
+      assert isinstance(raw_token_scores[0], float)
+      assert isinstance(raw_token_scores, list)
+      input_token_ids = []
+      input_token_scores = []
+      output_token_ids = []
+      output_token_scores = []
+      output_token_logprobs = []
+      for t, token_id in enumerate(raw_token_ids):
+        if t >= min(
+            # Ensure python int to prevent overflow.
+            int(processed_input.lengths[i])
+            + sampling_params.max_decode_steps,
+            sampling_params.max_seq_len,
         ):
-          output_text = self.vocab.decode(output_token_ids[:-1])
+          break
+        if t < processed_input.lengths[i]:
+          input_token_ids.append(token_id)
+          if t > 0:
+            # The first token score is dummy.
+            input_token_scores.append(raw_token_scores[t])
         else:
-          output_text = self.vocab.decode(output_token_ids)
+          output_token_ids.append(token_id)
+          output_token_scores.append(raw_token_scores[t])
+          output_token_logprobs.append(raw_token_logprobs[t])
+          if token_id in self.input_processor.eos_ids:
+            # Generated eos token can only appear in output_tokens.
+            break
 
-        if input_token_ids[0] == self.bos_id and not include_bos_in_input_text:
-          cur_input_text = self.vocab.decode(input_token_ids[1:])
-        else:
-          cur_input_text = self.vocab.decode(input_token_ids)
+      if (
+          output_token_ids
+          and output_token_ids[-1] in self.input_processor.eos_ids
+          and not include_eos_in_output_text
+      ):
+        output_chunks = self.input_processor.decode(output_token_ids[:-1])
+      else:
+        output_chunks = self.input_processor.decode(output_token_ids)
 
-        sample_outputs.append(
-            GenericSamplingOutput[RawT](
-                input_text=cur_input_text,
-                output_text=output_text,
-                input_token_ids=input_token_ids,
-                output_token_ids=output_token_ids,
-                output_token_logprobs=output_token_logprobs,
-                input_token_scores=input_token_scores,
-                output_token_scores=output_token_scores,
-            )
-        )
+      sample_outputs.append(
+          SamplingOutput(
+              input_chunks=raw_inputs[i // sampling_params.num_samples],
+              output_chunks=output_chunks,
+              input_token_ids=input_token_ids,
+              output_token_ids=output_token_ids,
+              output_token_logprobs=output_token_logprobs,
+              input_token_scores=input_token_scores,
+              output_token_scores=output_token_scores,
+          )
+      )
 
-    if pytree.tree_is_sequence(input_text):
+    if not is_singleton_input:
       sample_outputs = [
           sample_outputs[i : i + sampling_params.num_samples]
           for i in range(0, len(sample_outputs), sampling_params.num_samples)
       ]
 
     if sampling_params.sort_by is not None:
-      if not pytree.tree_is_sequence(input_text):
+      if is_singleton_input:
         sample_outputs.sort(key=lambda x: getattr(x, sampling_params.sort_by))
       else:
         for batch in sample_outputs:
@@ -2974,20 +3050,18 @@ class GenericInterface(Generic[RawT]):
 
   def score(
       self,
-      input_text: RawT,
-      output_text: RawT,
+      input_text: sampling_lib.SamplingInput,
+      output_text: sampling_lib.SamplingInput,
       params: PyTree | None = None,
       scoring_params: ScoringParams | None = None,
   ) -> ScoringOutput:
     """Decode on given texts to compute their token scores (loglikelihood).
 
     Args:
-      input_text (RawT): input text or custom input format.
-      output_text (Optional[RawT]): output text (NOT generated by the current
-        model) or custom output format.
-      params (Optional[PyTree]): parameters of the model, if None, use the
-        default parameters.
-      scoring_params (Optional[ScoringParams]): parameters of the model.
+      input_text: Input, which can be either string or Chunks.
+      output_text: Output, which can be either string or Chunks.
+      params: parameters of the model, if None, use the default parameters.
+      scoring_params: parameters of the model.
 
     Returns:
       The `ScoringOutput` instance.
@@ -2997,57 +3071,66 @@ class GenericInterface(Generic[RawT]):
           self.default_sampling_params
       )
 
-    # add BOS token to input tokens by default
-    input_tokens = [self.bos_id] + self.vocab.encode(input_text)
-    output_tokens = self.vocab.encode(output_text)
+    input_chunks = sampling_lib.input_as_chunks(input_text)
+    output_chunks = sampling_lib.input_as_chunks(output_text)
+
     # TODO: add more choices for whether and how to have the EOS token
-    input_and_output_tokens = np.array(input_tokens + output_tokens).reshape(
-        [1, -1]
+    processed_input_and_output = self.input_processor.encode(
+        input_chunks + output_chunks
     )
-    input_and_output_token_scores = self.score_tokens(
-        input_and_output_tokens, scoring_params=scoring_params,
+    all_tokens = processed_input_and_output.tokens
+    all_scores = self.score_tokens(
+        all_tokens,
+        extra_inputs=processed_input_and_output.extra_inputs,
+        scoring_params=scoring_params,
         params=self.model_params if params is None else params,
     )
-    input_len = len(input_tokens) - 1
-    # The input_token_scores and output_token_scores have the same lengths
-    # as the numbers of input and output tokens.
-    input_token_scores = input_and_output_token_scores[:input_len]
-    output_token_scores = input_and_output_token_scores[input_len:]
 
-    return GenericScoringOutput[RawT](
+    processed_input = self.input_processor.encode(input_chunks)
+    input_len = len(processed_input.tokens)
+
+    return ScoringOutput(
         params=scoring_params,
-        input_text=input_text,
-        input_token_ids=input_tokens,
-        output_text=output_text,
-        output_token_ids=output_tokens,
-        input_token_scores=input_token_scores,
-        output_token_scores=output_token_scores,
+        input_chunks=input_chunks,
+        input_token_ids=list(all_tokens[:input_len]),
+        output_chunks=output_chunks,
+        output_token_ids=list(all_tokens[input_len:]),
+        input_token_scores=all_scores[: input_len - 1],
+        output_token_scores=all_scores[input_len - 1 :],
     )
 
   def score_tokens(
-      self, tokens: list[int], scoring_params: ScoringParams | None = None,
+      self,
+      tokens: Sequence[int],
+      extra_inputs: Mapping[str, Array] | None = None,
+      scoring_params: ScoringParams | None = None,
       params: PyTree | None = None,
   ) -> list[float]:
     """Compute the token scores (loglikelihood) of a list of tokens.
 
     Args:
-      tokens (list[int]): list of tokens.
-      scoring_params (Optional[ScoringParams]): parameters of the model.
-      params (Optional[PyTree]): parameters of the model, if None, use the
-        default parameters.
+      tokens: list of tokens.
+      extra_inputs: any extra inputs for TransformerLM
+      scoring_params: parameters of the model.
+      params: parameters of the model, if None, use the default parameters.
 
     Returns:
-      token_scores (list[float]): loglikelihood of tokens.
+      token_scores: loglikelihood of tokens.
     """
     if scoring_params is None:
       scoring_params = ScoringParams.from_sampling_params(
           self.default_sampling_params
       )
     tokens = np.array(tokens).reshape([1, -1])
+    extra_inputs = jax.tree_util.tree_map(
+        lambda x: x.expand_dims(axis=0), extra_inputs
+    )
     apply_fn = self.model.apply
     logits, _ = jax.jit(apply_fn)(
         self.model_params if params is None else params,
-        tokens[:, :-1])
+        tokens[:, :-1],
+        extra_inputs=extra_inputs,
+    )
     token_scores = compute_log_likelihood(
         logits,
         tokens[:, 1:],
@@ -3059,11 +3142,11 @@ class GenericInterface(Generic[RawT]):
     token_scores = token_scores[0].tolist()
     return token_scores
 
-  def count_num_tokens(self, text: RawT) -> int:
-    return len(self.vocab.encode(text))
-
-
-LMInterface = GenericInterface[str]
+  def count_num_tokens(self, text: sampling_lib.SamplingInput) -> int:
+    processed_input = self.input_processor.encode(
+        sampling_lib.input_as_chunks(text)
+    )
+    return len(processed_input.tokens)
 
 
 def top_k_mask(logits: Array, top_k: int) -> Array:
@@ -3256,7 +3339,6 @@ def continue_decode(
     apply_fn: Callable[..., Array],
     params: PyTree,
     init_sampling_state: SamplingState,
-    eos_ids: Array,  # [n_eos]
     temperature: float = 1.0,
     top_k: int = -1,
     top_p: float = 1.0,
@@ -3276,22 +3358,30 @@ def continue_decode(
         ),
         decode_state=sampling_state.decode_state,
     )
+
     prng_key, key = jax.random.split(sampling_state.prng_key, 2)
     # output_tokens: [batch_size, 1], output_logprobs: [batch_size, 1]
     output_tokens, output_logprobs = sample_from_logits(
         key, logits, temperature=temperature, top_k=top_k, top_p=top_p
     )
-    output_tokens = jnp.where(
-        sampling_state.next_position_is_output,
-        output_tokens,
-        sampling_state.output_tokens,
-    )
-    # If input tokens reached eos, then output tokens should also be the same
-    # eos token.
-    output_tokens = jnp.where(
-        sampling_state.reached_eos(eos_ids),
-        sampling_state.input_tokens,
-        output_tokens,
+
+    # Three cases:
+    # - Sequence is done generating, just output again the current
+    #   token (should be eos), so that we will continue detecting
+    #   the sequence is done (exception is all-padding sequence which
+    #   is detected separately)
+    # - Next position is output, use the sampled output token
+    # - Next position is input, repeat back the existing input token
+    output_tokens = jnp.select(
+        [
+            sampling_state.has_ended,
+            sampling_state.next_position_is_output,
+        ],
+        [
+            sampling_state.input_tokens,
+            output_tokens,
+        ],
+        default=sampling_state.next_tokens,
     )
 
     def _score_fn(logits: Array, tokens: Array) -> Array:
@@ -3321,20 +3411,20 @@ def continue_decode(
     # logprobs might be computed for input tokens and extra beyond eos tokens.
     # scores might be computed for extra beyond eos tokens.
     # We have to ignore those values during post-processing.
-    return SamplingState(
+    return dataclasses.replace(
+        sampling_state,
         prng_key=prng_key,
         position=sampling_state.position + 1,
         decode_state=extra_output['decode_state'],
         tokens=sampling_state.updated_tokens(output_tokens),
         token_logprobs=sampling_state.updated_token_logprobs(output_logprobs),
         token_scores=sampling_state.updated_token_scores(output_scores),
-        input_lens=sampling_state.input_lens,
     )
 
   def cond_fn(sampling_state: SamplingState) -> jax.typing.ArrayLike:
     return (
         sampling_state.position < sampling_state.decode_state_length
-    ) & ~sampling_state.all_reached_eos(eos_ids)
+    ) & ~jnp.all(sampling_state.has_ended)
 
   final_sampling_state = jax.lax.while_loop(
       cond_fn, body_fn, init_sampling_state

@@ -13,10 +13,9 @@
 # limitations under the License.
 """Unit test for RunningMoments."""
 
-import numpy as np
-
 from absl.testing import absltest
 from absl.testing import parameterized
+import numpy as np
 from simply.utils import running_moments
 
 

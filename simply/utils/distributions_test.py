@@ -13,12 +13,11 @@
 # limitations under the License.
 """Unit test for distributions."""
 
+from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.stats
-
-from absl.testing import absltest
 from simply.utils import distributions
 from simply.utils import masked
 
@@ -116,13 +115,13 @@ class DistributionsTest(absltest.TestCase):
     mask = np.random.rand(*logits.shape) <= p
     # The largest index should be sampled for np.bincount.
     mask[:, -1] = True
+    m = distributions.MaskedCategorical(logits, mask)
     masked_probs = jax.nn.softmax(
-        masked.masked(logits, mask=mask, padding_value=float("-inf")), axis=-1
+        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1
     )
     masked_log_probs = jax.nn.log_softmax(
-        masked.masked(logits, mask=mask, padding_value=float("-inf")), axis=-1
+        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1
     )
-    m = distributions.MaskedCategorical(logits, mask)
 
     with self.subTest("DType"):
       self.assertEqual(m.dtype, logits.dtype)

@@ -15,10 +15,9 @@
 
 import typing
 
+from absl.testing import absltest
 import jax
 import numpy as np
-
-from absl.testing import absltest
 from simply.utils import replay_buffers
 
 

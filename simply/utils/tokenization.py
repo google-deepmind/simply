@@ -78,7 +78,14 @@ class HuggingFaceVocab(SimplyVocab[str]):
   """Generic class for HuggingFace vocab."""
 
   def __init__(self, vocab_path: str):
-    import transformers  # pylint: disable=g-import-not-at-top
+    try:
+      import transformers  # pylint: disable=g-import-not-at-top # pytype: disable=import-error
+    except ImportError as exc:
+      raise ImportError(
+          'HuggingFace vocab requires transformers library, which'
+          ' is not included. Please include transformers library and try'
+          ' again.'
+      ) from exc
     self.tokenizer = transformers.AutoTokenizer.from_pretrained(vocab_path)
     self.pad_id = self.tokenizer.pad_token_id
     self.bos_id = self.tokenizer.bos_token_id

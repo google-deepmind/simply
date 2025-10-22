@@ -19,11 +19,17 @@ import collections
 from collections.abc import Iterator, Mapping, Sequence
 import dataclasses
 import functools
+import hashlib
+import json
+import os
 import re
 import threading
+import time
 import types
 from typing import Any, Callable, ClassVar, TypeAlias, TypeVar, Union
 
+from absl import logging
+from etils import epath
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -43,6 +49,7 @@ BasicType: TypeAlias = Union[
 PyTree: TypeAlias = BasicType | Sequence['PyTree'] | Mapping[str, 'PyTree']
 Array: TypeAlias = jax.Array | np.ndarray
 RawT = TypeVar('RawT', str, np.ndarray[Any, np.dtype])
+CacheValue = str | dict[str, Any]
 
 
 THREAD_CONTEXT = threading.local()
@@ -234,3 +241,63 @@ def convert_rows_to_columns(
     for k, v in row.items():
       column_view[k].append(v)
   return {k: np.array(v) for k, v in column_view.items()}
+
+
+def find_unused_argpaths(
+    func: Callable[[Any], Any], argtree: PyTree
+) -> Sequence[jax.tree_util.KeyPath]:
+  """Analyzes a JAX function to find args that are not used in the computation.
+
+  Args:
+    func: The JAX-compatible function to analyze.
+    argtree: Example arguments to trace the function with.
+
+  Returns:
+    A Sequence of KeyPaths that indicate which arguments are unused in the
+    argtree.
+  """
+  argpaths, _ = zip(*jax.tree.leaves_with_path(argtree))
+  closed_jaxpr = jax.make_jaxpr(func)(argtree)
+
+  invars = set(closed_jaxpr.jaxpr.invars)
+  used_invars = set()
+  for var in closed_jaxpr.jaxpr.outvars:
+    if var in invars:
+      used_invars.add(var)
+  for eqn in closed_jaxpr.jaxpr.eqns:
+    for var in eqn.invars:
+      used_invars.add(var)
+
+  unused_argpaths = []
+  for argpath, var in zip(argpaths, closed_jaxpr.jaxpr.invars, strict=True):
+    if var not in used_invars:
+      unused_argpaths.append(argpath)
+
+  return unused_argpaths
+
+
+_TypeVarT: TypeAlias = TypeVar('_TypeVarT')
+
+
+def sorted_with_indices(
+    x: Sequence[_TypeVarT],
+    key: Callable[[_TypeVarT], Any] | None = None,
+    reverse: bool = False,
+) -> tuple[Sequence[_TypeVarT], Sequence[int]]:
+  """Returns a sorted sequence with indices."""
+  if key is None:
+    key_fn = lambda e: e[1]
+  else:
+    key_fn = lambda e: key(e[1])
+  indices, sorted_x = zip(*sorted(enumerate(x), key=key_fn, reverse=reverse))
+  return sorted_x, indices
+
+
+def unsorted(
+    sorted_x: Sequence[_TypeVarT], indices: Sequence[int]
+) -> Sequence[_TypeVarT]:
+  """Returns a unsorted sequence with the given indices."""
+  unsorted_x = [None] * len(sorted_x)
+  for i, v in zip(indices, sorted_x, strict=True):
+    unsorted_x[i] = v
+  return unsorted_x

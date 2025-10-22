@@ -13,9 +13,8 @@
 # limitations under the License.
 """Unit test segment_trees."""
 
-import numpy as np
-
 from absl.testing import absltest
+import numpy as np
 from simply.utils import segment_trees
 
 

@@ -29,8 +29,8 @@ import jax
 import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
-
 from simply import model_lib
+from simply import tool_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import distributions
@@ -40,6 +40,7 @@ from simply.utils import lm_format as lm_format_lib
 from simply.utils import masked
 from simply.utils import registry
 from simply.utils import replay_buffers
+from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
 
@@ -123,7 +124,11 @@ def compute_stats(
     evaluation: eval_lib.Evaluation,
 ) -> dict[str, np.ndarray]:
   stats_rows = []
+  pass_at_k_corrects = []
+  pass_at_k_eval_masks = []
   for rewarded_per_prompt_batch in rewarded_completed_batch.values():
+    corrects = []
+    eval_masks = []
     for rewarded_per_response in rewarded_per_prompt_batch:
       stats = {}
       so = rewarded_per_response['lm_sampling_output']
@@ -140,10 +145,15 @@ def compute_stats(
             reward_type in rewarded_per_response.get('reward_types', [])
         )
       stats_rows.append(stats)
+      corrects.append(stats['correct'])
+      eval_masks.append(stats['eval_mask'])
+    pass_at_k_corrects.append(np.any(corrects))
+    pass_at_k_eval_masks.append(np.any(eval_masks))
   stats_columns = common.convert_rows_to_columns(stats_rows)
   logging.info('stats_columns: %s', jax.tree.map(np.shape, stats_columns))
   eval_mask = stats_columns['eval_mask']
-
+  pass_at_k_corrects = np.array(pass_at_k_corrects)
+  pass_at_k_eval_masks = np.array(pass_at_k_eval_masks)
   stats = {
       'seq_len/mean': np_safe_mean(stats_columns['seq_len'], where=eval_mask),
       'seq_len/max': np.max(
@@ -179,6 +189,8 @@ def compute_stats(
       'truncated': np_safe_mean(stats_columns['truncated'], where=eval_mask),
       'reward': np_safe_mean(stats_columns['reward'], where=eval_mask),
       'accuracy': np_safe_mean(stats_columns['correct'], where=eval_mask),
+      'pass_at_k': np_safe_mean(pass_at_k_corrects, where=pass_at_k_eval_masks),
+      'pass_at_k_eval_count': np.sum(pass_at_k_eval_masks),
       'eval_count': np.sum(eval_mask),
       'train_count': np.sum(stats_columns['train_sample_mask']),
   }
@@ -218,6 +230,9 @@ def compute_stats(
       'response_len/min': np.min(stats['response_len/min']),
       'reward': np_safe_weighted_mean(stats['reward'], eval_count),
       'accuracy': np_safe_weighted_mean(stats['accuracy'], eval_count),
+      'pass_at_k': np_safe_weighted_mean(
+          stats['pass_at_k'], stats['pass_at_k_eval_count']
+      ),
       'eval_count': np.sum(eval_count),
       'train_sample_ratio': np.sum(stats['train_count']) / np.sum(eval_count),
   }
@@ -427,6 +442,7 @@ def create_train_batch(
       rewards: shape = (batch_size, 1)
       sample_masks: shape = (batch_size, 1)
       ref_logprobs: shape = (batch_size, max_seq_len)
+      **extra_inputs: extra inputs from the rewarded batch.
   """
   local_train_rows = []
   for rewarded_batch_per_prompt in rewarded_batch.values():
@@ -437,20 +453,28 @@ def create_train_batch(
       logging.info('all_token_ids_len=%s', len(all_token_ids))
       all_token_scores = so.input_token_scores + so.output_token_scores
       assert len(all_token_ids) == len(all_token_scores) + 1
+      if hasattr(so, 'answer_mask'):
+        answer_mask = np.array(so.answer_mask[1:])
+        assert len(all_token_ids) == len(answer_mask) + 1
+      else:
+        answer_mask = np.concatenate([
+            np.zeros(len(so.input_token_ids) - 1, dtype=np.bool),
+            np.ones(len(so.output_token_ids), dtype=np.bool),
+        ])
       example_per_response = dict(
           input_tokens=np.array(all_token_ids[:-1]),
           target_tokens=np.array(all_token_ids[1:]),
           logprobs=np.array(all_token_scores),
           target_masks=np.ones(len(all_token_ids) - 1, dtype=np.bool),
-          answer_masks=np.concatenate([
-              np.zeros(len(so.input_token_ids) - 1, dtype=np.bool),
-              np.ones(len(so.output_token_ids), dtype=np.bool),
-          ]),
+          answer_masks=answer_mask,
       )
+      extra_inputs = rewarded_per_response.get('extra_inputs', {})
+      example_per_response.update(extra_inputs)
       for k, v in example_per_response.items():
-        example_per_response[k] = model_lib.pad_to_along_axis(
-            v, max_seq_len, axis=0
-        )
+        if k not in extra_inputs:
+          example_per_response[k] = model_lib.pad_to_along_axis(
+              v, max_seq_len, axis=0
+          )
       example_per_response.update(
           dict(
               in_batch_example_ids=(
@@ -535,12 +559,29 @@ def compute_ppo_loss(
     use_policy_logp_as_sampler_logp: bool = False,
 ) -> tuple[float, dict[str, Any]]:
   """Compute PPO loss."""
-
   # TODO: Consider unified field names.
   inputs = batch['input_tokens']
   targets = batch['target_tokens']
   segment_ids = batch.get('decoder_segment_ids', None)
   segment_positions = batch.get('decoder_positions', None)
+
+  standard_keys = [
+      'input_tokens',
+      'target_tokens',
+      'decoder_segment_ids',
+      'decoder_positions',
+      'target_masks',
+      'answer_masks',
+      'train_sample_masks',
+      'rewards',
+      'logprobs',
+      'ref_logprobs',
+      'in_batch_example_ids',
+      'verdicts',
+  ]
+  extra_inputs = {k: v for k, v in batch.items() if k not in standard_keys}
+  if not extra_inputs:
+    extra_inputs = None
 
   target_mask = batch['target_masks']
   answer_mask = batch['answer_masks']  # (batch_size, max_seq_len)
@@ -558,6 +599,7 @@ def compute_ppo_loss(
       inputs,
       segment_ids=segment_ids,
       segment_positions=segment_positions,
+      extra_inputs=extra_inputs,
   )
   logits = jnp.astype(logits, jnp.float32)
   m = distributions.Categorical(logits)
@@ -731,6 +773,7 @@ def run_experiment(
       num_train_steps=config.num_train_steps,
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
+      should_save_ckpt=config.should_save_ckpt,
   )
   model, _ = model_lib.create_model(config, sharding_config)
   helper.save_config_info(config, sharding_config, model)
@@ -832,6 +875,7 @@ def run_experiment(
   evaluation_executor = futures.ThreadPoolExecutor(
       max_workers=config.batch_size * config.num_samples_per_example
   )
+  tool_executor = tool_lib.create_tool_executor(config)
   tokenizer = tokenization.TokenizerRegistry.get(config.vocab_name)()
   sampling_params = model_lib.SamplingParams(
       temperature=config.sampling_temperature,
@@ -855,11 +899,19 @@ def run_experiment(
   extra_eos_tokens = list(
       set(config.extra_eos_tokens) | set(lm_format.extra_eos_tokens)
   )
+  input_processor = sampling_lib.create_input_processor(
+      config,
+      vocab=tokenizer,
+      bos_id_override=lm_format.bos_id,
+      pad_id_override=lm_format.pad_id,
+      extra_eos_tokens=extra_eos_tokens,
+  )
   with decoding_mesh_context(decoding_mesh_shape, dcn_mesh_shape):
     lm_interface = model_lib.LMInterface(
         model_for_decoding,
         params=None,
         vocab=tokenizer,
+        input_processor=input_processor,
         bos_id=lm_format.bos_id,
         pad_id=lm_format.pad_id,
         default_sampling_params=sampling_params,
@@ -889,7 +941,7 @@ def run_experiment(
   steps = start_steps
   train_iter = iter(train_set)
   prng_key = jax.random.key(seed=seed)
-  accuracy = 0.0
+  stats = {}
   should_early_stop = False
   final_result = {}
   final_result['eval_accuracy_history'] = []
@@ -935,22 +987,48 @@ def run_experiment(
         for i, example in enumerate(example_batch):
           # NOTE: We should assume example is immutable to avoid data cache
           # pollution.
+          lm_request = list(
+              sampling_lib.input_as_chunks(
+                  lm_format.format(evaluation.get_messages(example))
+              )
+          )
+          extra_inputs = example.get('extra_inputs', {})
+          for extra_input_key in extra_inputs:
+            lm_request.append(
+                sampling_lib.Chunk(
+                    type=sampling_lib.Chunk.Type.ARRAY,
+                    content=example['extra_inputs'][extra_input_key],
+                )
+            )
           example_batch[i] = example | dict(
-              lm_request=lm_format.format(evaluation.get_messages(example)),
+              lm_request=lm_request,
               steps=steps,
               in_batch_example_index=in_batch_example_index,
+              extra_inputs=extra_inputs,
           )
           in_batch_example_index += 1
         print(f'example_batch: {example_batch}')
 
         prng_key, subkey = jax.random.split(prng_key)
-        sampling_outputs = lm_interface.generate(
-            [e['lm_request'] for e in example_batch],
-            prng_key=subkey,
-            params=decoding_params,
-            prefill_size=config.sampling_prefill_size,
-            scoring_inputs=False,
-        )
+        if tool_executor:
+          sampling_outputs = tool_executor.sample_with_tool(
+              lm_interface,
+              lm_format,
+              [e['lm_request'] for e in example_batch],
+              prng_key=subkey,
+              params=decoding_params,
+              prefill_size=config.sampling_prefill_size,
+              max_turns=config.max_turns,
+              max_tool_response_len=config.sampling_max_tool_response_len,
+          )
+        else:
+          sampling_outputs = lm_interface.generate(
+              [e['lm_request'] for e in example_batch],
+              prng_key=subkey,
+              params=decoding_params,
+              prefill_size=config.sampling_prefill_size,
+              scoring_inputs=False,
+          )
 
         # At this point, each process only processes a part of the batch, i.e.
         # per-process batch or local batch.
@@ -1031,6 +1109,12 @@ def run_experiment(
               # truncated
               if config.filter_truncated:
                 rewarded_per_response['train_sample_mask'] = False
+            if (
+                tool_executor
+                and config.filter_throttled
+                and rewarded_per_response['lm_sampling_output'].is_throttled
+            ):
+              rewarded_per_response['train_sample_mask'] = False
             corrects.append(rewarded_per_response['correct'])
 
         num_truncated = 0
@@ -1168,17 +1252,42 @@ def run_experiment(
                   and eval_steps >= config.validation_num_eval_steps
               ):
                 break
-              eval_prompt_batch = [
-                  lm_format.format(evaluation.get_messages(example))
-                  for example in eval_batch
-              ]
-              eval_sampling_outputs = lm_interface.generate(
-                  eval_prompt_batch,
-                  prng_key=subkey,
-                  params=decoding_params,
-                  sampling_params=eval_sampling_params,
-                  prefill_size=config.sampling_prefill_size,
-              )
+              eval_prompt_batch = []
+              for example in eval_batch:
+                lm_request = list(
+                    sampling_lib.input_as_chunks(
+                        lm_format.format(evaluation.get_messages(example))
+                    )
+                )
+                extra_inputs = example.get('extra_inputs', {})
+                for extra_input_key in extra_inputs:
+                  lm_request.append(
+                      sampling_lib.Chunk(
+                          type=sampling_lib.Chunk.Type.ARRAY,
+                          content=example['extra_inputs'][extra_input_key],
+                      )
+                  )
+                eval_prompt_batch.append(lm_request)
+              if tool_executor:
+                eval_sampling_outputs = tool_executor.sample_with_tool(
+                    lm_interface,
+                    lm_format,
+                    eval_prompt_batch,
+                    prng_key=subkey,
+                    params=decoding_params,
+                    sampling_params=eval_sampling_params,
+                    prefill_size=config.sampling_prefill_size,
+                    max_turns=config.max_turns,
+                    max_tool_response_len=config.sampling_max_tool_response_len,
+                )
+              else:
+                eval_sampling_outputs = lm_interface.generate(
+                    eval_prompt_batch,
+                    prng_key=subkey,
+                    params=decoding_params,
+                    sampling_params=eval_sampling_params,
+                    prefill_size=config.sampling_prefill_size,
+                )
               for example, eval_so in zip(
                   eval_batch, eval_sampling_outputs, strict=True
               ):
@@ -1242,7 +1351,7 @@ def run_experiment(
     total_time = time.time() - start_time
     print(f'Total time: {total_time} sec')
     helper.add_metric('total_time', total_time)
-  final_result['train_accuracy'] = float(accuracy)
+  final_result['train_accuracy'] = float(stats.get('accuracy', 0.0))
   final_result['early_stop'] = should_early_stop
   if should_early_stop: logging.info('Training is early stopped!')
   helper.close(final_result)

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import dataclasses
 from typing import Any
 
@@ -18,7 +19,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from simply.utils import common
-from simply.utils import optimizer as opt_lib
+from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 
 
@@ -44,7 +45,7 @@ class OptimizerTest(absltest.TestCase):
     )
 
   def test_dump(self):
-    js = pytree.dump_dataclasses(opt_lib.SGD())
+    js = pytree.dump(opt_lib.SGD())
     self.assertEqual(js, {'__dataclass__': 'Optimizer:SGD'})
 
   def test_init_step(self):

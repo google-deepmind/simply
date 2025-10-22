@@ -13,9 +13,8 @@
 # limitations under the License.
 """Unit test for data_lib.py."""
 
-import numpy as np
-
 from absl.testing import absltest
+import numpy as np
 from simply import data_lib
 
 

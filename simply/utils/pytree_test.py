@@ -15,6 +15,7 @@ from collections.abc import Sequence
 import dataclasses
 
 from absl.testing import absltest
+import jax
 import numpy as np
 from simply.utils import pytree
 from simply.utils import registry
@@ -64,18 +65,23 @@ class PyTreeTest(absltest.TestCase):
     pytree.set_tree_value(tree, 'b[2]/a', 4)
     pytree.set_tree_value(tree, 'b[2]/d[1][2]', 4)
     pytree.set_tree_value(tree, 'b[2]/c[1][0]/e', 4)
+    pytree.set_tree_value(tree, 'b[0]', 'test')
     self.assertEqual(
         tree,
         {
             'a': 10,
             'b': [
-                None,
+                'test',
                 20,
                 {'a': 4, 'd': [None, [None, None, 4]], 'c': [None, [{'e': 4}]]},
             ],
             'c': [None, [None, None, 4]],
         },
     )
+    with self.assertRaisesRegex(ValueError, 'Cannot access path'):
+      pytree.set_tree_value(tree, 'a/b', 4)
+    with self.assertRaisesRegex(ValueError, 'does not match'):
+      pytree.set_tree_value(tree, 'b/a', 4)
 
   def test_tree_type(self):
     self.assertTrue(pytree.tree_is_mapping({'a': 1}))
@@ -246,6 +252,33 @@ class PyTreeTest(absltest.TestCase):
     path = self.create_tempfile().full_path
     pytree.save_pytree_to(tree, path)
     self.assertEqual(pytree.load_pytree_from(path), tree)
+
+  def test_tree_leaves_with_tag(self):
+    tree = {'a': 1, 'b': {'loss': 2, 'c': 3}, 'loss': 4, 'd': [5, {'loss': 6}]}
+    leaves_with_path = list(pytree.tree_leaves_with_tag(tree, tag='loss'))
+    leaves_with_path = sorted(leaves_with_path, key=lambda x: x[0])
+    self.assertLen(leaves_with_path, 3)
+    self.assertEqual(leaves_with_path[0][0], 2)
+    self.assertEqual(
+        leaves_with_path[0][1],
+        jax.tree_util.KeyPath(
+            [jax.tree_util.DictKey('b'), jax.tree_util.DictKey('loss')]
+        ),
+    )
+    self.assertEqual(leaves_with_path[1][0], 4)
+    self.assertEqual(
+        leaves_with_path[1][1],
+        jax.tree_util.KeyPath([jax.tree_util.DictKey('loss')]),
+    )
+    self.assertEqual(leaves_with_path[2][0], 6)
+    self.assertEqual(
+        leaves_with_path[2][1],
+        jax.tree_util.KeyPath([
+            jax.tree_util.DictKey('d'),
+            jax.tree_util.SequenceKey(1),
+            jax.tree_util.DictKey('loss'),
+        ]),
+    )
 
 
 if __name__ == '__main__':

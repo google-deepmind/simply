@@ -14,12 +14,14 @@
 """Optimizers for Simply."""
 
 import abc
+import collections
 import dataclasses
 import functools
 import operator
-from typing import Any, ClassVar, Mapping, cast, final
+from typing import Any, cast, ClassVar, final, Mapping
 
 from absl import logging
+import einops
 import jax
 import jax.numpy as jnp
 from simply.utils import common
@@ -27,9 +29,10 @@ from simply.utils import registry
 from simply.utils import sharding
 
 
+Counter = collections.Counter
 PyTree = common.PyTree
 Array = common.Array
-
+AnnotatedArray = common.AnnotatedArray
 
 ################################################################################
 ## Optimizers.
@@ -165,6 +168,225 @@ class Lion(Optimizer):
         state['m'], grad)
     return update, state
 
+
+## Muon.
+@OptimizerRegistry.register
+@dataclasses.dataclass(frozen=True)
+class Muon(Optimizer):
+  """Implementation of the Muon Optimizer.
+
+  Muon is Scalable for LLM Training: https://arxiv.org/html/2502.16982v1
+
+  """
+
+  learning_rate: float = 1.0
+  muon_a: float = 3.4445
+  muon_b: float = -4.7750
+  muon_c: float = 2.0315
+  ns_steps: int = 5
+  beta: float = 0.95
+  eps: float = 1e-8
+  nesterov: bool = True
+  adam_b1: float = 0.9
+  adam_b2: float = 0.95
+  dim_threshold: int = 10000
+
+  def init(self, params):
+    """Initializes the optimizer state, using string indices as keys.
+
+    Args:
+      params: A dictionary of model parameters (PyTree).
+
+    Returns:
+      A dictionary representing the optimizer state.
+    """
+    def init_muon(p):
+      if p.ndim < 2 or max(p.shape) > self.dim_threshold:
+        return None
+      else:
+        sharded_zeros = jax.lax.with_sharding_constraint(
+            jnp.zeros_like(p), p.sharding)
+        return sharded_zeros
+    def init_adam(p):
+      if p.ndim < 2 or max(p.shape) > self.dim_threshold:
+        sharded_zeros = jax.lax.with_sharding_constraint(
+            jnp.zeros_like(p), p.sharding)
+        return sharded_zeros
+      else:
+        return None
+    state = {
+        'params': params,
+        'adam_m': jax.tree_util.tree_map(init_adam, params),
+        'adam_v': jax.tree_util.tree_map(init_adam, params),
+        'mu': jax.tree_util.tree_map(init_muon, params),
+        'steps': get_init_steps(),
+    }
+    return state
+
+  def apply(self, state, grad):
+    # Compute update and state for each leaf
+    def _mu(g, mu):
+      if mu is not None:
+        new_mu = mu * self.beta + g
+        return new_mu
+
+    def _adam_m(g, adam_m):
+      if adam_m is not None:
+        new_adam_m = adam_m * self.adam_b1 + g * (1 - self.adam_b1)
+        return new_adam_m
+
+    def _adam_v(g, adam_v):
+      if adam_v is not None:
+        new_adam_v = adam_v * self.adam_b2 + jnp.square(g) * (
+            1 - self.adam_b2
+        )
+        return new_adam_v
+
+    def _param_update(g, adam_m, adam_v, mu):
+      if mu.array is not None:
+        mu_ = (self.beta * mu.array + g.array) if self.nesterov else mu.array
+        mu_ = self._orthogonalize_via_newton_schulz(mu_, mu.dim_annotation)
+        return dataclasses.replace(mu, array=mu_)
+      elif adam_v.array is not None and adam_m.array is not None:
+        adam_ = (adam_m.array / (1 - self.adam_b1 ** (state['steps'] + 1))) / (
+            jnp.sqrt(adam_v.array / (1 - self.adam_b2 ** (state['steps'] + 1)))
+            + self.eps
+        )
+        return dataclasses.replace(adam_m, array=adam_)
+
+    state['adam_m'] = jax.tree_util.tree_map(_adam_m, grad, state['adam_m'])
+    state['adam_v'] = jax.tree_util.tree_map(_adam_v, grad, state['adam_v'])
+    state['mu'] = jax.tree_util.tree_map(_mu, grad, state['mu'])
+
+    updates = jax.tree_util.tree_map(
+        _param_update,
+        grad,
+        state['adam_m'],
+        state['adam_v'],
+        state['mu'],
+        is_leaf=lambda x: isinstance(x, AnnotatedArray),
+    )
+    # updates = common.transfer_metadata(state['params'], updates)
+    return updates, state
+
+  def _orthogonalize_via_newton_schulz(self, x, dim_annotation):
+    """Newton-Schulz orthogonalization."""
+    # Handle batch dimensions
+    x, recipe = self.merge_repeated_dims(x, dim_annotation)
+    # Ensure more columns than rows for efficiency
+    transposed = x.shape[-1] < x.shape[-2]
+    if transposed:
+      x = jnp.einsum('...ij->...ji', x)
+
+    # Normalize
+    x_norm = jnp.linalg.norm(x, axis=(-2, -1), keepdims=True) + self.eps
+    x = x / x_norm
+
+    # Newton-Schulz iterations
+    for _ in range(self.ns_steps):
+      a = jnp.einsum('...ij,...kj->...ik', x, x)
+      a_squared = jnp.einsum('...ij,...jk->...ik', a, a)
+      b = self.muon_b * a + self.muon_c * a_squared
+      x = self.muon_a * x + jnp.einsum('...ij,...jk->...ik', b, x)
+
+    # Restore original orientation and shape
+    if transposed:
+      x = jnp.einsum('...ji->...ij', x)
+
+    scale = 0.2 * jnp.sqrt(jnp.maximum(x.shape[-1], x.shape[-2]))
+
+    # Reshape back to original shape
+    x = self.reconstruct_from_merged(x, recipe)
+
+    return scale * x
+
+  def merge_repeated_dims(self, tensor, dim_annotation):
+    """Merges repeated dimensions in a tensor using einops.
+
+    This method identifies dimensions with the same label in `dim_annotation`
+    and merges them into a single dimension. It returns the rearranged tensor
+    and a recipe to reconstruct the original shape.
+
+    Args:
+      tensor: The input tensor.
+      dim_annotation: A list of strings or characters annotating each dimension
+        of the tensor.
+
+    Returns:
+      A tuple containing:
+        - merged_tensor: The tensor with repeated dimensions merged.
+        - recipe: A dictionary containing information to reverse the merge,
+          or None if no dimensions were merged.
+    """
+    counts = Counter(dim_annotation)
+
+    repeated_labels = [label for label, count in counts.items() if count > 1]
+    if len(repeated_labels) > 1:
+      raise ValueError(
+          'merge_repeated_dims only supports merging one type of repeated'
+          f' dimension. Found multiple repeated labels: {repeated_labels}'
+      )
+
+    try:
+      merge_label = next(iter(repeated_labels))
+    except StopIteration:
+      return tensor, None
+
+    # Generate unique names for each input axis.
+    from_names = []
+    label_counts = Counter()
+    for label in dim_annotation:
+      label_counts[label] += 1
+      suffix = str(label_counts[label]) if counts[label] > 1 else ''
+      if label == '.':
+        name = f'dot{suffix}'
+      else:
+        name = label + suffix
+      from_names.append(name)
+
+    # Build the 'to' pattern.
+    to_merge_names = [
+        name
+        for name, label in zip(from_names, dim_annotation)
+        if label == merge_label
+    ]
+    to_keep_names = [
+        name
+        for name, label in zip(from_names, dim_annotation)
+        if label != merge_label
+    ]
+
+    # Store the original shapes of the dimensions that will be merged.
+    merged_shapes = [
+        s for s, l in zip(tensor.shape, dim_annotation) if l == merge_label
+    ]
+
+    # Construct the forward and backward patterns.
+    pattern_from = ' '.join(from_names)
+    pattern_to = f"{' '.join(to_keep_names)} ({' '.join(to_merge_names)})"
+    rearrange_pattern = f'{pattern_from} -> {pattern_to}'
+
+    merged_tensor = einops.rearrange(tensor, rearrange_pattern)
+
+    # The recipe contains everything needed for the reverse operation.
+    recipe = {
+        'reconstruct_pattern': f'{pattern_to} -> {pattern_from}',
+        'merged_shapes': {
+            name: shape for name, shape in zip(to_merge_names, merged_shapes)
+        },
+    }
+
+    return merged_tensor, recipe
+
+  def reconstruct_from_merged(self, merged_tensor, recipe):
+    """Reshapes a merged tensor back to its original shape using a recipe."""
+    if not recipe:
+      return merged_tensor
+    reconstructed_tensor = einops.rearrange(
+        merged_tensor, recipe['reconstruct_pattern'], **recipe['merged_shapes']
+    )
+
+    return reconstructed_tensor
 
 ################################################################################
 ## Schedules.

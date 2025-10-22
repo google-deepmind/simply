@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from absl.testing import absltest
+import jax
 import jax.numpy as jnp
 import numpy as np
 from simply.utils import common
@@ -81,6 +82,46 @@ class CommonTest(absltest.TestCase):
     self.assertEqual(z1.metadata, {'dim_annotation': 'io'})
     self.assertEqual(y1.array.tolist(), y.tolist())
     self.assertEqual(z1.array.tolist(), z.array.tolist())
+
+  def test_find_unused_argpaths(self):
+    def _func(tree):
+      return tree['a']['x'] + tree['b'][1], tree['d']
+
+    tree = {
+        'a': {'x': jnp.array([1, 2]), 'y': jnp.array(0)},
+        'b': [jnp.array([1, 2, 3]), jnp.array([3, 4])],
+        'd': jnp.array(3),
+        'c': jnp.array(4),
+    }
+    unused_argpaths = common.find_unused_argpaths(_func, tree)
+    self.assertEqual(
+        unused_argpaths,
+        [
+            jax.tree_util.KeyPath(
+                [jax.tree_util.DictKey('a'), jax.tree_util.DictKey('y')]
+            ),
+            jax.tree_util.KeyPath(
+                [jax.tree_util.DictKey('b'), jax.tree_util.SequenceKey(0)]
+            ),
+            jax.tree_util.KeyPath([
+                jax.tree_util.DictKey('c'),
+            ]),
+        ],
+    )
+
+  def test_sorted_with_indices(self):
+    x = [2, 1, 3, 4]
+    sorted_x, indices = common.sorted_with_indices(x)
+    self.assertSequenceEqual(sorted_x, [1, 2, 3, 4])
+    self.assertSequenceEqual(indices, [1, 0, 2, 3])
+    unsorted_x = common.unsorted(sorted_x, indices)
+    self.assertSequenceEqual(unsorted_x, x)
+
+    sorted_x, indices = common.sorted_with_indices(x, key=lambda e: -e)
+    self.assertSequenceEqual(sorted_x, [4, 3, 2, 1])
+    self.assertSequenceEqual(indices, [3, 2, 0, 1])
+    unsorted_x = common.unsorted(sorted_x, indices)
+    self.assertSequenceEqual(unsorted_x, x)
 
 
 if __name__ == '__main__':

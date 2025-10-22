@@ -18,19 +18,17 @@ from collections.abc import Sequence
 import functools
 import json
 import logging
-import os
 from typing import Any, Callable, cast, Mapping
 
 from clu import metric_writers
+from etils import epath
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
-import yaml
-
-
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import pytree
+import yaml
 
 
 def is_primary_process() -> bool:
@@ -50,8 +48,9 @@ class ExperimentHelper:
       metric_log_interval,
       num_train_steps,
       log_additional_info,
+      should_save_ckpt: bool = True,
   ):
-    self.experiment_dir = experiment_dir
+    self.experiment_dir = epath.Path(experiment_dir)
     self.ckpt_interval = ckpt_interval
     self.ckpt_max_to_keep = ckpt_max_to_keep
     self.ckpt_keep_period = ckpt_keep_period
@@ -59,11 +58,13 @@ class ExperimentHelper:
     self.metric_log_interval = metric_log_interval
     self.log_additional_info = log_additional_info
     self.is_primary = is_primary_process()
-    self.should_save_data = self.is_primary and self.experiment_dir
-    self.metric_logdir = os.path.join(experiment_dir, 'tb_log')
+    self.should_save_ckpt = should_save_ckpt
+    self.should_save_data = self.is_primary and experiment_dir
+    self.has_experiment_dir = bool(experiment_dir)
+    self.metric_logdir = self.experiment_dir / 'tb_log'
     if self.should_save_data:
-      if not os.path.exists(self.experiment_dir):
-        os.mkdir(self.experiment_dir)
+      if not self.experiment_dir.exists():
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
     self.metric_writer = self.create_metric_writer()
     self.ckpt_mngr, self.ckpt_dir = self.create_ckpt_manager()
     self.metrics_aggregator = MetricsAggregator(
@@ -77,19 +78,19 @@ class ExperimentHelper:
     """Save model and config information."""
     if model is not None:
       model_basic_jsons = json.dumps(
-          pytree.dump_dataclasses(model, only_dump_basic=True), indent=2
+          pytree.dump(model, only_dump_basic=True), indent=2
       )
       model_full_jsons = json.dumps(
-          pytree.dump_dataclasses(model, only_dump_basic=False), indent=2
+          pytree.dump(model, only_dump_basic=False), indent=2
       )
     else:
       model_basic_jsons = ''
       model_full_jsons = ''
     experiment_config_jsons = json.dumps(
-        pytree.dump_dataclasses(config), indent=2
+        pytree.dump(config), indent=2
     )
     sharding_config_jsons = json.dumps(
-        pytree.dump_dataclasses(sharding_config), indent=2
+        pytree.dump(sharding_config), indent=2
     )
     self.metric_writer.write_texts(
         step=0,
@@ -101,23 +102,15 @@ class ExperimentHelper:
         )
     self.metric_writer.flush()
     if self.should_save_data:
-      experiment_config_path = os.path.join(
-          self.experiment_dir, 'experiment_config.json')
-      with open(experiment_config_path, 'w') as f:
+      with (self.experiment_dir / 'experiment_config.json').open('w') as f:
         f.write(experiment_config_jsons)
-
-      model_basic_path = os.path.join(self.experiment_dir, 'model_basic.json')
-      with open(model_basic_path, 'w') as f:
+      with (self.experiment_dir / 'model_basic.json').open('w') as f:
         f.write(model_basic_jsons)
-
-      model_full_path = os.path.join(self.experiment_dir, 'model_full.json')
-      with open(model_full_path, 'w') as f:
+      with (self.experiment_dir / 'model_full.json').open('w') as f:
         f.write(model_full_jsons)
 
       if sharding_config:
-        sharding_config_path = os.path.join(
-            self.experiment_dir, 'sharding_config.json')
-        with open(sharding_config_path, 'w') as f:
+        with (self.experiment_dir / 'sharding_config.json').open('w') as f:
           f.write(sharding_config_jsons)
 
   def add_metric(self, metric_name, metric_value, **kwargs):
@@ -147,8 +140,8 @@ class ExperimentHelper:
     """Creates a metric writer."""
     # Create experiment folder with tensorboard log and checkpoint.
     if self.should_save_data:
-      if not os.path.exists(self.metric_logdir):
-        os.mkdir(self.metric_logdir)
+      if not self.metric_logdir.exists():
+        self.metric_logdir.mkdir(parents=True, exist_ok=True)
     writer = metric_writers.create_default_writer(
         logdir=self.metric_logdir,
         just_logging=not self.should_save_data,
@@ -157,7 +150,7 @@ class ExperimentHelper:
 
   def create_ckpt_manager(self):
     """Creates a checkpoint manager."""
-    ckpt_dir = os.path.join(self.experiment_dir, 'checkpoints')
+    ckpt_dir = self.experiment_dir / 'checkpoints'
     # TODO: Use SaveDecisionPolicy and PreservationPolicy.
     if (
         self.ckpt_keep_period
@@ -173,7 +166,7 @@ class ExperimentHelper:
         keep_period=self.ckpt_keep_period,
         async_options=ocp.AsyncOptions(timeout_secs=360000),
     )
-    if self.experiment_dir:
+    if self.has_experiment_dir:
       mngr = ocp.CheckpointManager(ckpt_dir, options=options)
     else:
       mngr = None
@@ -203,17 +196,22 @@ class ExperimentHelper:
             'param_info_text': f'```\n{param_info_text}\n```',},)
     self.metric_writer.flush()
     if self.should_save_data:
-      with open(
-          os.path.join(self.experiment_dir, 'params_info.json'), 'w') as f:
-        json.dump(
-            {
-                'params_shape': params_shape,
-                'params_sharding': params_sharding,
-                'num_params': int(num_params),
-            },
-            f, indent=2)
+      with (self.experiment_dir / 'params_info.json').open('w') as f:
+        f.write(
+            json.dumps(
+                {
+                    'params_shape': params_shape,
+                    'params_sharding': params_sharding,
+                    'num_params': int(num_params),
+                },
+                indent=2,
+            )
+        )
 
   def save_ckpt(self, state, step, data=None, force=False):
+    # TODO: simplify the conditions for when to save ckpt.
+    if not self.should_save_ckpt:
+      return
     if self.ckpt_mngr and (
         force or self.ckpt_mngr.should_save(step) or
         step == self.num_train_steps):
@@ -227,9 +225,8 @@ class ExperimentHelper:
     if self.ckpt_mngr: self.ckpt_mngr.close()
     self.metric_writer.close()
     if self.should_save_data and final_result:
-      with open(
-          os.path.join(self.experiment_dir, 'final_result.json'), 'w') as f:
-        json.dump(final_result, f, indent=2)
+      with (self.experiment_dir / 'final_result.json').open('w') as f:
+        f.write(json.dumps(final_result, indent=2))
 
 
 class MetricsAggregator(object):
