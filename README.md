@@ -57,7 +57,7 @@ python setup/setup_assets.py --models-only
 python setup/setup_assets.py --datasets-only
 ```
 
-This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`.
+This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`. (Currently we only included a few datasets and models for testing, and will add more soon.)
 
 ## Citation
 
@@ -72,6 +72,10 @@ If you find *Simply* helpful, please cite the following BibTeX:
   url          = {https://github.com/google-deepmind/simply}
 }
 ```
+
+Contributors list:
+Alex Zhai, [Xingjian Zhang](https://github.com/xingjian-zhang), [Jiaxi Tang](https://github.com/graytowne)
+
 
 ## License
 
