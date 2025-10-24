@@ -41,6 +41,24 @@ pip install -U "jax[tpu]"
 pip install -r requirements.txt
 ```
 
+## Setup Models and Datasets
+
+Download pretrained models and datasets from HuggingFace:
+
+```bash
+# Install huggingface_hub
+pip install huggingface_hub
+
+# Download both models and datasets
+python setup/setup_assets.py
+
+# Or download only models/datasets
+python setup/setup_assets.py --models-only
+python setup/setup_assets.py --datasets-only
+```
+
+This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`.
+
 ## Citation
 
 If you find *Simply* helpful, please cite the following BibTeX:
