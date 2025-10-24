@@ -41,9 +41,9 @@ pip install -U "jax[tpu]"
 pip install -r requirements.txt
 ```
 
-## Setup Models and Datasets
+## Setup Model Checkpoints and Datasets
 
-Download pretrained models and datasets from HuggingFace:
+Download datasets and model checkpoints in format supported by Simply from HuggingFace:
 
 ```bash
 # Install huggingface_hub
