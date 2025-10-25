@@ -1,5 +1,7 @@
 jax
-orbax
+orbax-export
+orbax-checkpoint
+tensorflow
 seqio
 einops
 absl-py
