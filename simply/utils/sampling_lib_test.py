@@ -14,6 +14,7 @@
 
 from absl.testing import absltest
 import numpy as np
+from simply.utils import pytree
 from simply.utils import sampling_lib
 
 
@@ -81,6 +82,16 @@ class SamplingLibTest(absltest.TestCase):
     np.testing.assert_equal(
         batch.extra_inputs["extra_field"], expected_extra_field
     )
+
+  def test_chunk_dump_and_load(self):
+    chunk = sampling_lib.Chunk(
+        type=sampling_lib.Chunk.Type.TEXT,
+        content="chunk",
+    )
+    tmp_path = self.create_tempfile().full_path
+    pytree.save_pytree_to(chunk, tmp_path)
+    loaded = pytree.load_pytree_from(tmp_path)
+    self.assertEqual(chunk, loaded)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import dataclasses
 import functools
 import time
 from typing import Any, ClassVar, Self, Tuple, cast
+import warnings
 
 from absl import logging
 import einops
@@ -31,6 +32,7 @@ import jax.sharding as js
 import numpy as np
 
 from simply import config_lib
+from simply import data_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import distributions
@@ -2093,12 +2095,19 @@ class TrainLoopRegistry(registry.RootRegistry):
 
 @functools.partial(TrainLoopRegistry.register, name='default')
 def run_experiment(
-    config, sharding_config, mesh_shape, create_dataset,
+    config,
+    sharding_config,
+    mesh_shape,
+    create_dataset=None,
     # Leave `experiment_dir` as empty string to skip saving experiment data.
     # Useful if no need to save any data and can reduce some overhead.
     experiment_dir='',
     dcn_mesh_shape=None,
-    decoding_mesh_shape=None):
+    decoding_mesh_shape=None,
+):
+  if create_dataset is not None:
+    warnings.warn('create_dataset is deprecated.')
+  del create_dataset
   del decoding_mesh_shape
   logging.info('jax.process_index(): %s', jax.process_index())
   # Setup model, optimizer, initial state, and mesh.
@@ -2141,42 +2150,42 @@ def run_experiment(
   lr_fn = common.named_jit(opt_lib.create_lr_schedule(config), 'lr_fn')
 
   # Prepare datasets.
-  start_steps = int(state['steps'].addressable_data(0))
   logging.info('Initializing dataset.')
-  train_set, validation_set = create_dataset(
-      # TODO: Add support for saving and loading num_examples_seen
-      # directly instead of relying on start_steps.
-      config, num_past_examples=start_steps * config.batch_size)
+  train_set = data_lib.create_iter_dataset(config, training=True)
   logging.info('sharding_config.data_partition: %s',
                sharding_config.data_partition)
 
-  build_global_array_fn = get_build_global_array_fn(
-      config.batch_size, config.seq_len,
-      data_partition=sharding_config.data_partition)
-  train_set_iter = iter(train_set)
+  train_iter = iter(train_set)
+
+  train_iter_state = None
+  if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
+    data_state = ckpt_lib.load_data_state_from_dir(
+        helper.ckpt_dir, helper.ckpt_mngr.latest_step()
+    )
+    assert isinstance(data_state, Mapping)
+    train_iter_state = data_state.get('train_iter_state', None)
+  if train_iter_state is not None:
+    train_iter.set_state(train_iter_state)
 
   # Start training.
   prev_step_timestamp = time.time()
   final_result = {}
-  steps = start_steps
+  steps = int(state['steps'].addressable_data(0))
 
   # Create eval_fn for validation set.
   if config.use_validation_set:
     loss_fn = common.named_jit(
         compute_eval_loss, 'validation_loss_fn', model=model
     )
-    eval_batch_size = (
-        config.validation_eval_batch_size
-        if config.validation_eval_batch_size > 0 else config.batch_size)
-    eval_build_global_array_fn = get_build_global_array_fn(
-        eval_batch_size, config.seq_len,
-        data_partition=sharding_config.data_partition)
+    validation_set = data_lib.create_iter_dataset(
+        config, training=False
+    )
     eval_fn = functools.partial(
         run_eval,
         eval_set=validation_set,
         num_eval_steps=config.validation_num_eval_steps,
         loss_fn=loss_fn,
-        build_global_array_fn=eval_build_global_array_fn)
+    )
   else:
     eval_fn = None
   agg_metrics = {}
@@ -2185,18 +2194,27 @@ def run_experiment(
   while steps <= config.num_train_steps and not should_early_stop:
     with jax.profiler.StepTraceAnnotation('train', step_num=steps):
       logging.info('steps: %s', steps)
-      helper.save_ckpt(state, steps)
+      helper.save_ckpt(state, steps, data=train_iter.get_state())
       # Run eval every validation_eval_interval steps and at the very end.
       if config.use_validation_set and (
-          steps % config.validation_eval_interval == 0 or
-          steps == config.num_train_steps):
+          steps % config.validation_eval_interval == 0
+          or steps == config.num_train_steps
+      ):
         eval_result = eval_fn(state=state)
         helper.write_scalars(steps, eval_result)
         helper.flush()
 
       t1 = time.time()
-      batch = next(train_set_iter)
-      batch = jax.tree_util.tree_map(build_global_array_fn, batch)
+      batch = next(train_iter)
+      logging.info('batch=%s', batch)
+
+      batch = build_global_array_from_replicated(
+          batch, data_partition=(('replica', 'data'),)
+      )
+      logging.info(
+          'batch.addressable_shards=%s',
+          batch['decoder_target_tokens'].addressable_shards,
+      )
       data_generation_step_time = time.time() - t1
 
       t1 = time.time()
@@ -2285,18 +2303,32 @@ def create_model(config, sharding_config):
   return model, {'teacher': teacher_model}
 
 
-def get_build_global_array_fn(
-    batch_size, seq_len, data_partition=None):
-  # Data is initially fully sharded across all devices.
-  init_data_sharding = mesh_sharding(
-      (('replica', 'data', 'model'), None))
-  data_sharding = mesh_sharding(data_partition)
-  build_global_array_fn = functools.partial(
-      build_global_array,
-      global_shape=(batch_size, seq_len),
-      init_sharding=init_data_sharding,
-      final_sharding=data_sharding)
-  return build_global_array_fn
+def build_global_array_from_replicated(
+    batch: PyTree, data_partition: PartitionAnnotation = None
+):
+  return jax.tree_util.tree_map(
+      lambda x: jax.lax.with_sharding_constraint(
+          x, sharding_lib.mesh_sharding(data_partition)
+      ),
+      batch,
+  )
+
+
+def build_global_batch_from_sharded(
+    batch: PyTree, data_partition: PartitionAnnotation = None
+):
+  data_sharding = sharding_lib.mesh_sharding(data_partition)
+
+  def _build_global_array_from_sharded(array: np.ndarray):
+    if array.ndim < 1:
+      raise ValueError(f'Array {array} must have at least 1 dimension.')
+    global_shape = (array.shape[0] * jax.process_count(), *array.shape[1:])
+    global_array = jax.make_array_from_process_local_data(
+        data_sharding, array, global_shape
+    )
+    return global_array
+
+  return jax.tree_util.tree_map(_build_global_array_from_sharded, batch)
 
 
 def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
@@ -2353,9 +2385,7 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   return state
 
 
-def run_eval(
-    eval_set, num_eval_steps, loss_fn, state, build_global_array_fn,
-) -> dict[str, Any]:
+def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
   mean_eval_loss = 0.0
   mean_eval_accuracy = 0.0
   # The `loss_weights` is normally the same as `num_tokens`.
@@ -2363,8 +2393,12 @@ def run_eval(
   total_num_tokens = 0
   eval_start_time = time.time()
   eval_steps = 0
-  for eval_steps, eval_batch in enumerate(eval_set.repeat(1)):
-    eval_batch = jax.tree_util.tree_map(build_global_array_fn, eval_batch)
+  for eval_steps, eval_batch in enumerate(eval_set):
+    if num_eval_steps > 0 and (eval_steps >= num_eval_steps):
+      break
+    eval_batch = build_global_array_from_replicated(
+        eval_batch, (('replica', 'data'),)
+    )
     eval_batch_stats_info = compute_batch_stats_info(eval_batch)
     eval_loss, extra_output = loss_fn(
         params=state['params'], batch=eval_batch)
@@ -2388,8 +2422,6 @@ def run_eval(
           (eval_accuracy - mean_eval_accuracy) * weights_ratio)
     total_weights += batch_weights
     total_num_tokens += num_tokens
-    if num_eval_steps > 0 and (eval_steps >= num_eval_steps):
-      break
   eval_time = time.time() - eval_start_time
   if eval_steps == 0:
     eval_step_time = 0
@@ -2462,10 +2494,6 @@ def compute_batch_stats_info(
 
 ################################################################################
 # Decoding
-
-
-class SamplingRegistry(registry.RootRegistry):
-  namespace: ClassVar[str] = 'Sampling'
 
 
 @jax.tree_util.register_dataclass
@@ -2571,7 +2599,7 @@ class SamplingState:
     )
 
 
-@SamplingRegistry.register
+@sampling_lib.SamplingRegistry.register
 @dataclasses.dataclass(frozen=True)
 class SamplingOutput:
   input_chunks: sampling_lib.ChunkSequence
@@ -2582,6 +2610,8 @@ class SamplingOutput:
 
   # Sampling logprobs of the output tokens.
   output_token_logprobs: list[float]
+  # Whether the output was truncated before reaching natural eos.
+  is_truncated: bool
 
   # Log probs of the input tokens computed by log_softmax.
   # The score values are not affected by the sampling params.
@@ -3011,11 +3041,11 @@ class LMInterface:
             # Generated eos token can only appear in output_tokens.
             break
 
-      if (
+      ends_in_eos = (
           output_token_ids
           and output_token_ids[-1] in self.input_processor.eos_ids
-          and not include_eos_in_output_text
-      ):
+      )
+      if ends_in_eos and not include_eos_in_output_text:
         output_chunks = self.input_processor.decode(output_token_ids[:-1])
       else:
         output_chunks = self.input_processor.decode(output_token_ids)
@@ -3029,6 +3059,7 @@ class LMInterface:
               output_token_logprobs=output_token_logprobs,
               input_token_scores=input_token_scores,
               output_token_scores=output_token_scores,
+              is_truncated=(not ends_in_eos),
           )
       )
 
@@ -3076,7 +3107,7 @@ class LMInterface:
 
     # TODO: add more choices for whether and how to have the EOS token
     processed_input_and_output = self.input_processor.encode(
-        input_chunks + output_chunks
+        [*input_chunks, *output_chunks]
     )
     all_tokens = processed_input_and_output.tokens
     all_scores = self.score_tokens(
@@ -3434,16 +3465,6 @@ def continue_decode(
 
 ################################################################################
 # Utilities
-
-
-def build_global_array(inputs, global_shape, init_sharding, final_sharding):
-  arrays = jax.device_put(
-      jnp.split(inputs, len(jax.local_devices()), axis=0),
-      jax.local_devices())
-  arr = jax.make_array_from_single_device_arrays(
-      global_shape, init_sharding, arrays)
-  arr = jax.lax.with_sharding_constraint(arr, final_sharding)
-  return arr
 
 
 def get_scaling_info(config, also_print=False, add_attn_flops=False):

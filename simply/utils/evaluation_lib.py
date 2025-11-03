@@ -25,8 +25,10 @@ from typing import Any, ClassVar
 
 from etils import epath
 import numpy as np
+from simply.utils import lm_format as lm_format_lib
 from simply.utils import math_eval
 from simply.utils import registry
+from simply.utils import sampling_lib
 
 
 maybe_remove_comma = math_eval.maybe_remove_comma
@@ -82,6 +84,38 @@ class Evaluation(abc.ABC):
       {"role": "user", "content": prompt}.
     """
     raise NotImplementedError()
+
+  def get_sampling_input(
+      self, example: Mapping[str, Any], lm_format: lm_format_lib.LMFormat
+  ) -> sampling_lib.SamplingInput:
+    """Converts raw example to SamplingInput.
+
+    Args:
+      example: The example to be evaluated.
+      lm_format: LMFormat for putting text in the proper text format.
+
+    Returns:
+      SamplingInput.
+
+    NOTE: This is just a default implementation for backwards compatibility with
+    text-only evaluations based on get_messages(). If you are using input that
+    is not pure text (e.g. interleaving text and images), consider overriding
+    with your own custom handling.
+    """
+    chunks = list(
+        sampling_lib.input_as_chunks(
+            lm_format.format(self.get_messages(example))
+        )
+    )
+    extra_inputs = example.get('extra_inputs', {})
+    for extra_input_value in extra_inputs.values():
+      chunks.append(
+          sampling_lib.Chunk(
+              type=sampling_lib.Chunk.Type.ARRAY,
+              content=extra_input_value,
+          )
+      )
+    return chunks
 
 
 @EvaluationRegistry.register

@@ -40,11 +40,12 @@ GEMMA2_2B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-2B-IT-ORBAX')
 GEMMA2_9B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-9B-IT-ORBAX')
 GEMMA2_27B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-27B-IT-ORBAX')
 
-GEMMA3_270M_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-270M-PT-ORBAX')
+GEMMA3_270M_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA3_270M_PT_ORBAX')
 GEMMA3_1B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-1B-PT-ORBAX')
 GEMMA3_4B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-4B-PT-ORBAX')
 GEMMA3_12B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-12B-PT-ORBAX')
 GEMMA3_27B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-27B-PT-ORBAX')
+GEMMA3_270M_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA3_270M_IT_ORBAX')
 GEMMA3_1B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-1B-IT-ORBAX')
 GEMMA3_4B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-4B-IT-ORBAX')
 GEMMA3_12B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-12B-IT-ORBAX')
@@ -196,7 +197,7 @@ class ExperimentConfig:
 
 @ExperimentConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
-class TFM1p7BLM1B(ExperimentConfig):
+class BaseExperimentConfig(ExperimentConfig):
   # number of parameters: ~1700.790328 M
   # `_variant` is used when you need to create a series of configs based on
   # a base config, e.g., for different hparams search. Default to empty string.
@@ -256,6 +257,10 @@ class TFM1p7BLM1B(ExperimentConfig):
   expert_capacity_factor: float | None = None
   lbl_loss_weight: float = 0.01
   router_z_loss_weight: float = 0.0
+  tile_batch_seq: int = 1024
+  tile_model_dim: int = 1024
+  tile_expand_dim: int = 1024
+  gmm_impl: str = 'ragged_dot'
 
   # Data config
   batch_size: int = 64 * 16
@@ -277,6 +282,12 @@ class TFM1p7BLM1B(ExperimentConfig):
   # `dataset_name` will be used.
   validation_dataset_name: str | None = None
   feature_converter_name: str = 'LMFeatureConverter'
+  # Number of prefetch workers for the data pipeline. Since we use
+  # pygrain's multi-processing prefetching, this is the number of processes.
+  # Set to 0 to disable multi-processing. Note that changing
+  # prefetch_num_workers will change the order of the data loading.
+  prefetch_num_workers: int = 16
+  prefetch_per_worker_buffer_size: int = 2
 
   # Training config
   train_loop_name: str = 'default'
@@ -323,6 +334,7 @@ class TFM1p7BLM1B(ExperimentConfig):
   mask_start_token: str = ''
   mask_end_token: str = ''
   vocab_path: str = ''
+  vocab_name: str = ''
 
   # Name for the model, i.e., the main module.
   model_name: str = 'TransformerLM'
@@ -337,9 +349,59 @@ class TFM1p7BLM1B(ExperimentConfig):
   # Early stopping threshold.
   early_stop: opt_lib.EarlyStop | None = None
 
-# TODO: consider renaming BaseExperimentConfig since ExperimentConfig
-# is the real base class.
-BaseExperimentConfig = TFM1p7BLM1B
+
+@ExperimentConfigRegistry.register
+@dataclasses.dataclass(frozen=True)
+class RLExperimentConfig(BaseExperimentConfig):
+  train_loop_name: str = 'rl'
+  evaluation: evaluation_lib.Evaluation = (
+      evaluation_lib.ZeroShotBoxedInQuestionEvaluation()
+  )
+  dataset_name: str = 'simply_json:gsm8k_train'
+  num_train_steps: int = 1_000_000
+  use_validation_set: bool = False
+  validation_num_eval_steps: int = 8
+  validation_eval_interval: int = 100
+  validation_dataset_name: str | None = 'simply_json:gsm8k_test'
+  validation_eval_batch_size: int = -1
+  validation_eval_epochs: int = 1
+
+  # We need to define the format for sampling.
+  lm_format_name: str = 'Pretrain'
+  # We draw `batch_size` examples from the dataset, generate
+  # `num_samples_per_example` samples per example, wait for their rewards
+  # asynchronously, and finally start training when there are
+  # `train_batch_size` total samples.
+  batch_size: int = 16
+  train_batch_size: int = 16 * 8
+  num_samples_per_example: int = 8
+  sampling_temperature: float = 1.0
+
+  # Use train_max_seq_len to control the max decode steps.
+  sampling_max_decode_steps: int = 32768
+  train_max_seq_len: int = 2048
+  sampling_prefill_size: int = 1024
+  sampling_max_input_len: int = 1024
+  sampling_intermediate_decode_steps: int = 1024
+  # How many steps to run given one batch of samples for training.
+  num_train_steps_per_batch: int = 4
+  max_num_samples_per_train_batch: int | None = None
+
+  extra_eos_tokens: tuple[str, ...] = ()
+
+  # RL algorithm configs.
+  gamma: float = 1.0
+  kl_coeff: float = 0.001
+  use_grpo: bool = True
+  ppo_clip_eps: float = 0.2
+  ppo_clip_eps_high: float | None = None
+  ppo_clip_eps_low: float | None = None
+  policy_ratio_cap: float | None = 10.0
+  normalize_reward_method: str = 'ByGroup'
+  normalize_advantage: bool = False
+  max_abs_advantage: float | None = 10.0
+  filter_truncated: bool = False
+  use_policy_logp_as_sampler_logp: bool = False
 
 
 ################################################################################
@@ -347,50 +409,40 @@ BaseExperimentConfig = TFM1p7BLM1B
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops6e20TFM2BC4L2048(TFM1p7BLM1B):
-  # num_params: 2321.380352 M
-  # num_non_embedding_params: 2114.81088 M
-  # num_embedding_params: 206.569472 M
-  # embedding_params_ratio: 0.08898562091387943
-  # num_tokens: 44755.320832 M
-  # num_tokens / num_params: 19.27961559312793
-  # num_tokens / num_non_embedding_params: 21.162800539403314
-  # num_flops: 6.233647345611666e+20
-  # Fitted optimal ratio for 6.2e20: 19.24
-  model_dim: int = 2048
-  per_head_dim: int = 256
-  n_heads: int = 8
-  n_layers: int = 18
-  expand_factor: int = 8
-  seq_len: int = 2048
-  vocab_size: int = 100_864
-
-  # 2321380352 * 19.24 / 2048 / 1024 = 21297 steps
-  dataset_name: str = 'c4.vb100864_openmix_v1'
-  batch_size: int = 1024
-  clip_grad_norm: float = 1.0
-  num_train_steps: int = 21_297
-  lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 0.3
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-3),
-      ('warmup_steps', 1_000),
-      ('steps_after_decay', 0),
-      ('end_decay', 0.1),
+def flops6e20_tfm2b_c4_l2048():
+  config = BaseExperimentConfig()
+  config = dataclasses.replace(
+      config,
+      model_dim=2048,
+      per_head_dim=256,
+      n_heads=8,
+      n_layers=18,
+      expand_factor=8,
+      seq_len=2048,
+      vocab_size=100_864,
+      dataset_name='c4.vb100864_openmix_v1',
+      batch_size=1024,
+      clip_grad_norm=1.0,
+      num_train_steps=21_297,
+      weight_decay=0.3,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-3,
+          warmup_steps=1_000,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      ckpt_max_to_keep=1,
+      use_validation_set=True,
+      validation_num_eval_steps=2,
+      validation_eval_interval=1000,
+      validation_eval_batch_size=1024,
+      ffn_use_bias=False,
   )
-
-  ckpt_max_to_keep: int = 1
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 2
-  validation_eval_interval: int = 1000
-  validation_eval_batch_size: int = 1024
+  return config
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops1e20TFM986MC4L2048(Flops6e20TFM2BC4L2048):
+def flops1e20_tfm986m_c4_l2048():
   # num_params: 985.890304 M
   # num_non_embedding_params: 830.9632 M
   # num_embedding_params: 154.927104 M
@@ -400,34 +452,22 @@ class Flops1e20TFM986MC4L2048(Flops6e20TFM2BC4L2048):
   # num_tokens / num_non_embedding_params: 22.14978296030438
   # num_flops: 1.0887573802757338e+20
   # Fitted optimal ratio for 1.1e20: 18.67
-  model_dim: int = 1536
-  per_head_dim: int = 256
-  n_heads: int = 8
-  n_layers: int = 12
-  expand_factor: int = 8
-  vocab_size: int = 100_864
-
-  # 985890304 * 18.67 / 2048 / 256 = 35106 steps
-  batch_size: int = 256
-  num_train_steps: int = 35_106
-  weight_decay: float = 0.3
-  lr_schedule_name: str = 'cosine_decay'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-3),
-      ('warmup_steps', 1_000),
-      ('steps_after_decay', 0),
-      ('end_decay', 0.1),
+  config = flops6e20_tfm2b_c4_l2048()
+  config = dataclasses.replace(
+      config,
+      model_dim=1536,
+      n_layers=12,
+      # 985890304 * 18.67 / 2048 / 256 = 35106 steps
+      batch_size=256,
+      num_train_steps=35_106,
+      validation_num_eval_steps=4,
+      validation_eval_batch_size=512,
   )
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 4
-  validation_eval_interval: int = 1000
-  validation_eval_batch_size: int = 512
+  return config
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops1e19TFM338MC4L2048(Flops6e20TFM2BC4L2048):
+def flops1e19_tfm338m_c4_l2048():
   # num_params: 338.440192 M
   # num_non_embedding_params: 235.155456 M
   # num_embedding_params: 103.284736 M
@@ -437,34 +477,31 @@ class Flops1e19TFM338MC4L2048(Flops6e20TFM2BC4L2048):
   # num_tokens / num_non_embedding_params: 26.15247948999321
   # num_flops: 1.2488236446756372e+19
   # Fitted optimal ratio for 1.2e19: 17.97
-  model_dim: int = 1024
-  per_head_dim: int = 128
-  n_heads: int = 8
-  n_layers: int = 8
-  expand_factor: int = 8
-  vocab_size: int = 100_864
-
-  # 338440192 * 17.97 / 2048 / 192 = 15466 steps
-  batch_size: int = 192
-  num_train_steps: int = 15_466
-  lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 0.276
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 0.0013656918867398535),
-      ('steps_after_decay', 0),
-      ('warmup_steps', 1_000),
-      ('end_decay', 0.1),
+  config = flops6e20_tfm2b_c4_l2048()
+  config = dataclasses.replace(
+      config,
+      model_dim=1024,
+      per_head_dim=128,
+      n_layers=8,
+      # 338440192 * 17.97 / 2048 / 192 = 15466 steps
+      batch_size=192,
+      num_train_steps=15_466,
+      weight_decay=0.276,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=0.0013656918867398535,
+          warmup_steps=1_000,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      validation_num_eval_steps=4,
+      validation_eval_interval=500,
+      validation_eval_batch_size=512,
   )
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 4
-  validation_eval_interval: int = 500
-  validation_eval_batch_size: int = 512
+  return config
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops1e18TFM111MC4L2048(Flops6e20TFM2BC4L2048):
+def flops1e18_tfm111m_c4_l2048():
   # num_params: 110.550528 M
   # num_non_embedding_params: 58.90816 M
   # num_embedding_params: 51.642368 M
@@ -474,33 +511,31 @@ class Flops1e18TFM111MC4L2048(Flops6e20TFM2BC4L2048):
   # num_tokens / num_non_embedding_params: 32.27173091130329
   # num_flops: 1.2609846180147364e+18
   # Predicted optimal ratio for 1.3e18: 17.2
-  model_dim: int = 512
-  per_head_dim: int = 64
-  n_heads: int = 8
-  n_layers: int = 8
-  expand_factor: int = 8
-  vocab_size: int = 100_864
-
-  # 110550528 * 17.2 / 2048 / 128 = 7252 steps
-  batch_size: int = 128
-  num_train_steps: int = 7252
-  lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 0.261
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 0.0016486710944803309),
-      ('steps_after_decay', 0),
-      ('end_decay', 0.1),
+  config = flops6e20_tfm2b_c4_l2048()
+  config = dataclasses.replace(
+      config,
+      model_dim=512,
+      per_head_dim=64,
+      n_layers=8,
+      # 110550528 * 17.2 / 2048 / 128 = 7252 steps
+      batch_size=128,
+      num_train_steps=7252,
+      weight_decay=0.261,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=0.0016486710944803309,
+          warmup_steps=1_000,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      validation_num_eval_steps=8,
+      validation_eval_interval=500,
+      validation_eval_batch_size=256,
   )
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 8
-  validation_eval_interval: int = 500
-  validation_eval_batch_size: int = 256
+  return config
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops2e17TFM41MC4L2048(Flops6e20TFM2BC4L2048):
+def flops2e17_tfm41m_c4_l2048():
   # num_params: 40.645632 M
   # num_non_embedding_params: 14.824448 M
   # num_embedding_params: 25.821184 M
@@ -510,33 +545,31 @@ class Flops2e17TFM41MC4L2048(Flops6e20TFM2BC4L2048):
   # num_tokens / num_non_embedding_params: 45.764177661117635
   # num_flops: 1.6545097284216422e+17
   # Fitted optimal ratio for 1.7e17: 16.69
-  model_dim: int = 256  # 2048 // 8
-  per_head_dim: int = 32  # 256 // 8
-  n_heads: int = 8
-  n_layers: int = 8  # 18 // 2 - 1
-  expand_factor: int = 8
-  vocab_size: int = 100_864
-
-  # 40645632 * 16.69 / 2048 / 80 = 4140 steps
-  batch_size: int = 80
-  num_train_steps: int = 4140
-  lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 0.248
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 0.0019495171900601506),
-      ('steps_after_decay', 0),
-      ('end_decay', 0.1),
+  config = flops6e20_tfm2b_c4_l2048()
+  config = dataclasses.replace(
+      config,
+      model_dim=256,  # 2048 // 8
+      per_head_dim=32,  # 256 // 8
+      n_layers=8,  # 18 // 2 - 1
+      # 40645632 * 16.69 / 2048 / 80 = 4140 steps
+      batch_size=80,
+      num_train_steps=4140,
+      weight_decay=0.248,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=0.0019495171900601506,
+          warmup_steps=1_000,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      validation_num_eval_steps=16,
+      validation_eval_interval=500,
+      validation_eval_batch_size=128,
   )
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 16
-  validation_eval_interval: int = 500
-  validation_eval_batch_size: int = 128
+  return config
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Flops2e16TFM15MC4L2048(Flops6e20TFM2BC4L2048):
+def flops2e16_tfm15m_c4_l2048():
   # num_params: 14.857408 M
   # num_non_embedding_params: 1.946816 M
   # num_embedding_params: 12.910592 M
@@ -546,28 +579,27 @@ class Flops2e16TFM15MC4L2048(Flops6e20TFM2BC4L2048):
   # num_tokens / num_non_embedding_params: 116.00547628866
   # num_flops: 2.006201364854e+16
   # Data / model ratio for 2.0e16: 15.15
-  model_dim: int = 128  # 2048 // 16
-  per_head_dim: int = 16  # 256 // 16
-  n_heads: int = 8
-  n_layers: int = 4  # 18 => 4
-  expand_factor: int = 8
-  vocab_size: int = 100_864
-
-  # 14.066880 * 16 / 2048 / 64 = 1717 steps
-  batch_size: int = 64
-  num_train_steps: int = 1717  # TODO: update the number of steps.
-  lr_schedule_name: str = 'cosine_decay'
-  weight_decay: float = 0.1
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 0.01),
-      ('steps_after_decay', 0),
-      ('end_decay', 0.1),
+  config = flops6e20_tfm2b_c4_l2048()
+  config = dataclasses.replace(
+      config,
+      model_dim=128,  # 2048 // 16
+      per_head_dim=16,  # 256 // 16
+      n_layers=4,  # 18 => 4
+      # 14.066880 * 16 / 2048 / 64 = 1717 steps
+      batch_size=64,
+      num_train_steps=1717,  # TODO: update the number of steps.
+      weight_decay=0.1,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=0.01,
+          warmup_steps=1_000,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      validation_num_eval_steps=16,
+      validation_eval_interval=500,
+      validation_eval_batch_size=128,
   )
-
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 16
-  validation_eval_interval: int = 500
-  validation_eval_batch_size: int = 128
+  return config
 
 ##########################
 ## Gemma models.
@@ -575,212 +607,234 @@ class Flops2e16TFM15MC4L2048(Flops6e20TFM2BC4L2048):
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2(TFM1p7BLM1B):
-  # number of parameters: ~2.61B
-  seq_len: int = 4096
-  vocab_size: int = 256128
-  model_dim: int = 2304
-  per_head_dim: int = 256
-  n_heads: int = 8
-  n_layers: int = 26
-  expand_factor: int = 4
-  use_scan: bool = True
-  use_remat: bool = True
-  model_seed: int = 42
-  use_rmsnorm: bool = True
-  use_pre_ln: bool = True
-  use_post_ln: bool = True
-  use_post_skip_ln: bool = False
-  use_per_dim_scale: bool = False
-  use_gated_activation_in_ffn: bool = True
-  activation_dtype_name: str = 'bfloat16'
-  use_flash_attention: bool = False
-  window_size: int = 4096 - 1
-  use_window_chunk: bool = False
-  n_kv_heads: int = 4
-  block_attn_pattern: tuple[str, ...] = (
-      'local',
-      'global',
+def gemma2_2b():
+  config = BaseExperimentConfig()
+  return dataclasses.replace(
+      config,
+      # number of parameters: ~2.61B
+      seq_len=4096,
+      vocab_size=256128,
+      model_dim=2304,
+      per_head_dim=256,
+      n_heads=8,
+      n_layers=26,
+      expand_factor=4,
+      use_scan=True,
+      use_remat=True,
+      model_seed=42,
+      use_rmsnorm=True,
+      use_pre_ln=True,
+      use_post_ln=True,
+      use_post_skip_ln=False,
+      use_per_dim_scale=False,
+      use_gated_activation_in_ffn=True,
+      use_flash_attention=False,
+      window_size=4096 - 1,
+      use_window_chunk=False,
+      n_kv_heads=4,
+      block_attn_pattern=(
+          'local',
+          'global',
+      ),
+      output_layer_use_bias=False,
+      ffn_use_bias=False,
+      # NOTE: Data config is vocab dependent. We currently do not have dataset
+      # prepared with Gemma2 vocab.
+      vocab_name='vb256128_gemma2',
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=GEMMA2_2B_PT_CKPT_DIR,
+      init_ckpt_step=-1,
+      init_ckpt_opt_state=False,
+      init_ckpt_format='Gemma3pLegacyFormat',
+      reset_steps=True,
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
   )
-  output_layer_use_bias: bool = False
-  ffn_use_bias: bool = False
-
-  # NOTE: Data config is vocab dependent. We currently do not have dataset
-  # prepared with Gemma2 vocab.
-  vocab_name: str = 'vb256128_gemma2'
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = GEMMA2_2B_PT_CKPT_DIR
-  init_ckpt_step: int = -1
-  init_ckpt_opt_state: bool = False
-  init_ckpt_format: str = 'Gemma3pLegacyFormat'
-  reset_steps: bool = True
-
-  activation_dtype_name: str = 'bfloat16'
-  decoding_quant_scheme: str = 'bfloat16'
-  ref_params_dtype: str = 'bfloat16'
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BC4Vocab100864L2048BS1024(Gemma2BV2):
+def gemma2_2b_c4_vocab100864_l2048_bs1024():
   """Gemma 2B model with C4 vocab 100864 and seq_len 2048."""
-  dataset_name: str = 'c4.vb100864_openmix_v1'
-  seq_len: int = 2048  # 4096 // 2
-  vocab_size: int = 100_864
-  init_ckpt_dir: str = ''
-  use_validation_set: bool = False
-  num_train_steps: int = 45_000
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma9BV2(Gemma2BV2):
-  # number of parameters: ~9.24B
-  model_dim: int = 3584
-  per_head_dim: int = 256
-  n_heads: int = 16
-  n_layers: int = 42
-  expand_factor: int = 4
-  n_kv_heads: int = 8
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = GEMMA2_9B_PT_CKPT_DIR
-  init_ckpt_format: str = 'Gemma3pFormat'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma27BV2(Gemma2BV2):
-  # number of parameters: ~27.23B
-  model_dim: int = 4608
-  per_head_dim: int = 128
-  n_heads: int = 32
-  n_layers: int = 46
-  expand_factor: int = 8
-  n_kv_heads: int = 16
-  batch_size: int = 256
-  query_scale: float = math.sqrt(model_dim / n_heads)
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = GEMMA2_27B_PT_CKPT_DIR
-  init_ckpt_format: str = 'Gemma3pFormat'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2IT(Gemma2BV2):
-  init_ckpt_dir: str = GEMMA2_2B_IT_CKPT_DIR
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma1BV3(TFM1p7BLM1B):
-  seq_len: int = 4096
-  vocab_size: int = 262144
-  model_dim: int = 1152
-  per_head_dim: int = 256
-  n_heads: int = 4
-  n_layers: int = 26
-  expand_factor: int = 6
-  use_scan: bool = True
-  use_remat: bool = True
-  model_seed: int = 42
-  use_rmsnorm: bool = True
-  use_pre_ln: bool = True
-  use_post_ln: bool = True
-  use_post_skip_ln: bool = False
-  use_qk_norm: bool = True
-  use_per_dim_scale: bool = False
-  use_gated_activation_in_ffn: bool = True
-  activation_dtype_name: str = 'bfloat16'
-  use_flash_attention: bool = False
-  window_size: int = 512 - 1
-  use_window_chunk: bool = False
-  n_kv_heads: int = 1
-  block_attn_pattern: tuple[str, ...] = (
-      'local',
-      'local',
-      'local',
-      'local',
-      'local',
-      'global',
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      dataset_name='c4.vb100864_openmix_v1',
+      seq_len=2048,  # 4096 // 2
+      vocab_size=100_864,
+      init_ckpt_dir='',
+      use_validation_set=False,
+      num_train_steps=45_000,
   )
-  output_layer_use_bias: bool = False
-  ffn_use_bias: bool = False
-  local_rope_max_timescale: int = 10_000
-  global_rope_max_timescale: int = 1_000_000
-  attn_soft_cap: float = -1.0
-  output_logits_soft_cap: float = -1.0
-
-  # NOTE: Data config is vocab dependent. We currently do not have dataset
-  # prepared with Gemma3 vocab.
-  vocab_name: str = 'vb262144_gemma3'
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = GEMMA3_1B_PT_CKPT_DIR
-  init_ckpt_step: int = -1
-  init_ckpt_opt_state: bool = False
-  init_ckpt_format: str = 'Gemma3pFormat'
-  reset_steps: bool = True
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma270MV3(Gemma1BV3):
-  model_dim: int = 640
-  ffn_expand_dim: int | None = 2048
-  n_layers: int = 18
-  init_ckpt_dir: str = GEMMA3_270M_PT_CKPT_DIR
+def gemma2_9b():
+  # number of parameters: ~9.24B
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      model_dim=3584,
+      per_head_dim=256,
+      n_heads=16,
+      n_layers=42,
+      expand_factor=4,
+      n_kv_heads=8,
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=GEMMA2_9B_PT_CKPT_DIR,
+      init_ckpt_format='Gemma3pFormat',
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma4BV3(Gemma1BV3):
-  model_dim: int = 2560
-  expand_factor: int = 4
-  n_layers: int = 34
-  n_heads: int = 8
-  n_kv_heads: int = 4
-  window_size: int = 1024 - 1
-  global_rope_scale_factor: float = 8.0
-  init_ckpt_dir: str = GEMMA3_4B_PT_CKPT_DIR
+def gemma2_27b():
+  # number of parameters: ~27.23B
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      model_dim=4608,
+      per_head_dim=128,
+      n_heads=32,
+      n_layers=46,
+      expand_factor=8,
+      n_kv_heads=16,
+      batch_size=256,
+      query_scale=math.sqrt(4608 / 32),
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=GEMMA2_27B_PT_CKPT_DIR,
+      init_ckpt_format='Gemma3pFormat',
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma12BV3(Gemma1BV3):
-  model_dim: int = 30 * 128
-  expand_factor: int = 4
-  n_layers: int = 48
-  n_heads: int = 16
-  n_kv_heads: int = 8
-  window_size: int = 1024 - 1
-  global_rope_scale_factor: float = 8.0
-  init_ckpt_dir: str = GEMMA3_12B_PT_CKPT_DIR
+def gemma2_2b_it():
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      init_ckpt_dir=GEMMA2_2B_IT_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma27BV3(Gemma1BV3):
-  model_dim: int = 5376
-  expand_factor: int = 4
-  n_layers: int = 62
-  per_head_dim: int = 128
-  n_heads: int = 32
-  n_kv_heads: int = 16
-  window_size: int = 1024 - 1
-  global_rope_scale_factor: float = 8.0
-  query_scale: float = math.sqrt(model_dim / n_heads)
-  init_ckpt_dir: str = GEMMA3_27B_PT_CKPT_DIR
+def gemma3_1b():
+  config = BaseExperimentConfig()
+  return dataclasses.replace(
+      config,
+      seq_len=4096,
+      vocab_size=262144,
+      model_dim=1152,
+      per_head_dim=256,
+      n_heads=4,
+      n_layers=26,
+      expand_factor=6,
+      use_scan=True,
+      use_remat=True,
+      model_seed=42,
+      use_rmsnorm=True,
+      use_pre_ln=True,
+      use_post_ln=True,
+      use_post_skip_ln=False,
+      use_qk_norm=True,
+      use_per_dim_scale=False,
+      use_gated_activation_in_ffn=True,
+      activation_dtype_name='bfloat16',
+      use_flash_attention=False,
+      window_size=512 - 1,
+      use_window_chunk=False,
+      n_kv_heads=1,
+      block_attn_pattern=(
+          'local',
+          'local',
+          'local',
+          'local',
+          'local',
+          'global',
+      ),
+      output_layer_use_bias=False,
+      ffn_use_bias=False,
+      local_rope_max_timescale=10_000,
+      global_rope_max_timescale=1_000_000,
+      attn_soft_cap=-1.0,
+      output_logits_soft_cap=-1.0,
+      # NOTE: Data config is vocab dependent. We currently do not have dataset
+      # prepared with Gemma3 vocab.
+      vocab_name='vb262144_gemma3',
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=GEMMA3_1B_PT_CKPT_DIR,
+      init_ckpt_step=-1,
+      init_ckpt_opt_state=False,
+      init_ckpt_format='Gemma3pFormat',
+      reset_steps=True,
+  )
 
 
 @ExperimentConfigRegistry.register
-def Gemma12BV3_IT_DSR40K_B2K_L10K_RL():  # PF_4x4x8
-  config = DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLBF16V2()
-  base_config = DeepSeekQwen1p5BV2()
-  new_base_config = Gemma12BV3()
+def gemma3_270m():
+  config = gemma3_1b()
+  return dataclasses.replace(
+      config,
+      model_dim=640,
+      ffn_expand_dim=2048,
+      n_layers=18,
+      init_ckpt_dir=GEMMA3_270M_PT_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma3_4b():
+  config = gemma3_1b()
+  return dataclasses.replace(
+      config,
+      model_dim=2560,
+      expand_factor=4,
+      n_layers=34,
+      n_heads=8,
+      n_kv_heads=4,
+      window_size=1024 - 1,
+      global_rope_scale_factor=8.0,
+      init_ckpt_dir=GEMMA3_4B_PT_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma3_12b():
+  config = gemma3_1b()
+  return dataclasses.replace(
+      config,
+      model_dim=30 * 128,
+      expand_factor=4,
+      n_layers=48,
+      n_heads=16,
+      n_kv_heads=8,
+      window_size=1024 - 1,
+      global_rope_scale_factor=8.0,
+      init_ckpt_dir=GEMMA3_12B_PT_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma3_27b():
+  config = gemma3_1b()
+  return dataclasses.replace(
+      config,
+      model_dim=5376,
+      expand_factor=4,
+      n_layers=62,
+      per_head_dim=128,
+      n_heads=32,
+      n_kv_heads=16,
+      window_size=1024 - 1,
+      global_rope_scale_factor=8.0,
+      query_scale=math.sqrt(5376 / 32),
+      init_ckpt_dir=GEMMA3_27B_PT_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma3_12b_it_dsr40k_b2k_l10k_rl():  # PF_4x4x8
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2()
+  base_config = deepseek_qwen2_1p5b()
+  new_base_config = gemma3_12b()
   config = apply_config_diff(config, base_config, new_base_config)
   train_batch_size = 2048
   config = dataclasses.replace(
@@ -806,10 +860,10 @@ def Gemma12BV3_IT_DSR40K_B2K_L10K_RL():  # PF_4x4x8
 
 
 @ExperimentConfigRegistry.register
-def Gemma27BV3_IT_DSR40K_B2K_L10K_RL():  # VF_4x4x8
-  config = DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V3()
-  base_config = DeepSeekQwen1p5BV2()
-  new_base_config = Gemma27BV3()
+def gemma3_27b_it_dsr40k_b2k_l10k_rl():  # VF_4x4x8
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3()
+  base_config = deepseek_qwen2_1p5b()
+  new_base_config = gemma3_27b()
   config = apply_config_diff(config, base_config, new_base_config)
   config = dataclasses.replace(
       config,
@@ -835,255 +889,265 @@ def Gemma27BV3_IT_DSR40K_B2K_L10K_RL():  # VF_4x4x8
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8K0ShotRL(Gemma2BV2):
-  dataset_name: str = 'simply_json:gsm8k_train'
-  num_train_steps: int = 1_000_000
-  train_loop_name: str = 'rl'
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotBoxedInQuestionEvaluation()
-  )
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 8
-  validation_eval_interval: int = 100
-  validation_dataset_name: str | None = 'simply_json:gsm8k_test'
-  validation_eval_batch_size: int = -1
-  validation_eval_epochs: int = 1
-
-  lm_format_name: str = 'Pretrain'
-  train_batch_size: int = 16 * 8
-  batch_size: int = 16
-  num_samples_per_example: int = 8
-  sampling_temperature: float = 1.0
-  # Use train_max_seq_len to control the max decode steps.
-  sampling_max_decode_steps: int = 32768
-  train_max_seq_len: int = 2048
-  sampling_prefill_size: int = 1024
-  sampling_max_input_len: int = 1024
-  sampling_intermediate_decode_steps: int = 1024
-  num_train_steps_per_batch: int = 4
-  max_num_samples_per_train_batch: int | None = None
-
-  # TODO: Change the extra_eos_tokens when the prompt is improved.
-  extra_eos_tokens: tuple[str, ...] = newlines_from_counts(range(3, 6))
-
-  # RL algorithm configs.
-  gamma: float = 1.0
-  kl_coeff: float = 0.001
-  use_grpo: bool = True
-  ppo_clip_eps: float = 0.2
-  ppo_clip_eps_high: float | None = None
-  ppo_clip_eps_low: float | None = None
-  policy_ratio_cap: float | None = 10.0
-  normalize_reward_method: str = 'ByGroup'
-  normalize_advantage: bool = False
-  max_abs_advantage: float | None = 10.0
-  filter_truncated: bool = False
-  use_policy_logp_as_sampler_logp: bool = False
-
-  # Optimizer configs.
-  optimizer: opt_lib.Optimizer = opt_lib.Adam(
-      beta1=0.9, beta2=0.95, epsilon=1e-8
-  )
-  weight_decay: float = 0.0
-  lr_schedule_name: str = 'constant'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-7),
-      ('warmup_steps', 1),
-  )
-
-  # Checkpoint and tensorboard configs.
-  init_ckpt_opt_state: bool = False
-  ckpt_max_to_keep: int = 1
-  tb_log_interval: int = 20
-  ckpt_interval: int = 100
-
-  # Sharding config.
-  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8KCoT0ShotRL(Gemma2BV2GSM8K0ShotRL):
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation()
+def gemma2_2b_gsm8k_0shot_rl():
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:gsm8k_train',
+      num_train_steps=1_000_000,
+      train_loop_name='rl',
+      evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
+      use_validation_set=True,
+      validation_num_eval_steps=8,
+      validation_eval_interval=100,
+      validation_dataset_name='simply_json:gsm8k_test',
+      validation_eval_batch_size=-1,
+      validation_eval_epochs=1,
+      lm_format_name='Pretrain',
+      train_batch_size=16 * 8,
+      batch_size=16,
+      num_samples_per_example=8,
+      sampling_temperature=1.0,
+      # Use train_max_seq_len to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=2048,
+      sampling_prefill_size=1024,
+      sampling_max_input_len=1024,
+      sampling_intermediate_decode_steps=1024,
+      num_train_steps_per_batch=4,
+      max_num_samples_per_train_batch=None,
+      # TODO: Change the extra_eos_tokens when the prompt is improved.
+      extra_eos_tokens=newlines_from_counts(range(3, 6)),
+      # RL algorithm configs.
+      gamma=1.0,
+      kl_coeff=0.001,
+      use_grpo=True,
+      ppo_clip_eps=0.2,
+      ppo_clip_eps_high=None,
+      ppo_clip_eps_low=None,
+      policy_ratio_cap=10.0,
+      normalize_reward_method='ByGroup',
+      normalize_advantage=False,
+      max_abs_advantage=10.0,
+      filter_truncated=False,
+      use_policy_logp_as_sampler_logp=False,
+      # Optimizer configs.
+      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
+      weight_decay=0.0,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-7,
+          warmup_steps=1,
+      ),
+      # Checkpoint and tensorboard configs.
+      init_ckpt_opt_state=False,
+      ckpt_max_to_keep=1,
+      tb_log_interval=20,
+      ckpt_interval=100,
+      # Sharding config.
+      decoding_sharding_config=DecodeGSPMDSharding(),
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2DSR40K0ShotRL(Gemma2BV2GSM8K0ShotRL):
-  dataset_name: str = 'simply_json:dsr40k_train'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2DSR40KCoT0ShotRL(Gemma2BV2DSR40K0ShotRL):
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation()
+def gemma2_2b_gsm8k_cot_0shot_rl():
+  config = gemma2_2b_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      evaluation=evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation(),
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8KSeqLen2kRL(Gemma2BV2GSM8K0ShotRL):
-  # Use train_max_seq_len to control the max decode steps.
-  sampling_max_decode_steps: int = 32768
-  train_max_seq_len: int = 2048
-  sampling_prefill_size: int = 1024
-  sampling_max_input_len: int = 1024
-  num_train_steps_per_batch: int = 4
+def gemma2_2b_dsr40k_0shot_rl():
+  config = gemma2_2b_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:dsr40k_train',
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8KSeqLen2kBS16x16RL(Gemma2BV2GSM8KSeqLen2kRL):
-  batch_size: int = 16
-  num_samples_per_example: int = 16
-  tb_log_interval: int = 8
-  ckpt_interval: int = 40
+def gemma2_2b_dsr40k_cot_0shot_rl():
+  config = gemma2_2b_dsr40k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      evaluation=evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation(),
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8KSeqLen2kBS16x8RL(Gemma2BV2GSM8KSeqLen2kRL):
-  batch_size: int = 16
-  num_samples_per_example: int = 8
-  tb_log_interval: int = 20
-  ckpt_interval: int = 100
+def gemma2_2b_gsm8k_seqlen2k_rl():
+  config = gemma2_2b_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      # Use train_max_seq_len to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=2048,
+      sampling_prefill_size=1024,
+      sampling_max_input_len=1024,
+      num_train_steps_per_batch=4,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8KSeqLen2kBS32x16RL(Gemma2BV2GSM8KSeqLen2kRL):
-  # Feasible setup: glp_2x4
-  batch_size: int = 32
-  num_samples_per_example: int = 16
-  tb_log_interval: int = 4
-  ckpt_interval: int = 20
-  use_flash_attention: bool = True
-  grad_accum_steps: int = 2
+def gemma2_2b_gsm8k_seqlen2k_bs16x16_rl():
+  config = gemma2_2b_gsm8k_seqlen2k_rl()
+  return dataclasses.replace(
+      config,
+      batch_size=16,
+      num_samples_per_example=16,
+      tb_log_interval=8,
+      ckpt_interval=40,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2GSM8K32ExamplesRL(Gemma2BV2):
-  dataset_name: str = 'simply_json:gsm8k_train32'
+def gemma2_2b_gsm8k_seqlen2k_bs16x8_rl():
+  config = gemma2_2b_gsm8k_seqlen2k_rl()
+  return dataclasses.replace(
+      config,
+      batch_size=16,
+      num_samples_per_example=8,
+      tb_log_interval=20,
+      ckpt_interval=100,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2ITGSM8K0ShotRL(Gemma2BV2GSM8K0ShotRL):
+def gemma2_2b_gsm8k_seqlen2k_bs32x16_rl():
+  config = gemma2_2b_gsm8k_seqlen2k_rl()
+  return dataclasses.replace(
+      config,
+      # Feasible setup: glp_2x4
+      batch_size=32,
+      num_samples_per_example=16,
+      tb_log_interval=4,
+      ckpt_interval=20,
+      use_flash_attention=True,
+      grad_accum_steps=2,
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma2_2b_gsm8k_32examples_rl():
+  config = gemma2_2b()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:gsm8k_train32',
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma2_2b_it_gsm8k_0shot_rl():
   """Gemma 2B IT model for GSM8K RL."""
-
-  lm_format_name: str = 'GemmaV2Chat'
-  extra_eos_tokens: tuple[str, ...] = ()
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotBoxedInQuestionEvaluation()
-  )
-  init_ckpt_dir: str = GEMMA2_2B_IT_CKPT_DIR
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2ITGSM8KCoT0ShotRL(Gemma2BV2ITGSM8K0ShotRL):
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation()
+  config = gemma2_2b_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      lm_format_name='GemmaV2Chat',
+      extra_eos_tokens=(),
+      evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
+      init_ckpt_dir=GEMMA2_2B_IT_CKPT_DIR,
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2ITDSR40K0ShotRL(Gemma2BV2ITGSM8K0ShotRL):
-  dataset_name: str = 'simply_json:dsr40k_train'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma2BV2ITDSR40KCoT0ShotRL(Gemma2BV2ITDSR40K0ShotRL):
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation()
+def gemma2_2b_it_gsm8k_cot_0shot_rl():
+  config = gemma2_2b_it_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      evaluation=evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation(),
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Gemma4BV3ITSimpleQANumberOnlyToolUseRL(Gemma4BV3):
-  # Model config.
-  init_ckpt_dir: str = GEMMA3_4B_IT_CKPT_DIR
-  lm_format_name: str = 'GemmaV2Chat'
-
-  # Dataset & evaluation config.
-  dataset_name: str = 'simply_json:simple_qa_num'
-  evaluation: evaluation_lib.Evaluation = evaluation_lib.QAToolUseEvaluation()
-
-  # Tool config.
-  tool_manager_name: str = 'GoogleSearchToolExecutor'
-  max_turns: int = 3
-  filter_throttled: bool = True
-
-  # Sampling configs.
-  sampling_max_decode_steps: int = 512
-  train_max_seq_len: int = 2048
-  sampling_prefill_size: int = 512
-  sampling_max_input_len: int = 512
-  sampling_temperature: float = 1.0
-  sampling_intermediate_decode_steps: int = 512
-  sampling_max_tool_response_len: int = 1024
-  # TODO: Change the extra_eos_tokens when the prompt is improved.
-  extra_eos_tokens: tuple[str, ...] = newlines_from_counts(range(3, 6))
-
-  # RL algorithm configs.
-  train_loop_name: str = 'rl'
-  num_train_steps: int = 500
-  num_train_steps_per_batch: int = 4
-  max_num_samples_per_train_batch: int | None = None
-  use_validation_set: bool = False
-  train_batch_size: int = 16 * 32
-  batch_size: int = 32
-  grad_accum_steps: int = 8
-  num_samples_per_example: int = 4
-
-  gamma: float = 1.0
-  kl_coeff: float = 0.001
-  use_grpo: bool = True
-  ppo_clip_eps: float = 0.2
-  ppo_clip_eps_high: float | None = None
-  ppo_clip_eps_low: float | None = None
-  policy_ratio_cap: float | None = 10.0
-  normalize_reward_method: str = 'ByGroup'
-  normalize_advantage: bool = False
-  max_abs_advantage: float | None = 10.0
-  use_kl_correction: bool = True
-  filter_zero_variance: bool = True
-  filter_truncated: bool = False
-  use_policy_logp_as_sampler_logp: bool = False
-  soft_ppo_forward_kl_coeff: float = 0.0
-  soft_ppo_reverse_kl_coeff: float = 0.0
-  # Optimizer configs.
-  optimizer: opt_lib.Optimizer = opt_lib.Adam(
-      beta1=0.9, beta2=0.95, epsilon=1e-8
-  )
-  weight_decay: float = 0.0
-  lr_schedule_name: str = 'constant'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-6),
-      ('warmup_steps', 100),
+def gemma2_2b_it_dsr40k_0shot_rl():
+  config = gemma2_2b_it_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:dsr40k_train',
   )
 
-  # bf16 config from Gemma2BV2.
-  activation_dtype_name: str = 'bfloat16'
-  decoding_quant_scheme: str = 'bfloat16'
-  ref_params_dtype: str = 'bfloat16'
 
-  # Checkpoint and tensorboard configs.
-  init_ckpt_opt_state: bool = False
-  ckpt_max_to_keep: int = 1
-  tb_log_interval: int = 10
-  ckpt_interval: int = 100
+@ExperimentConfigRegistry.register
+def gemma2_2b_it_dsr40k_cot_0shot_rl():
+  config = gemma2_2b_it_dsr40k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      evaluation=evaluation_lib.ZeroShotCoTBoxedInQuestionEvaluation(),
+  )
 
-  # Sharding config.
-  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
+
+@ExperimentConfigRegistry.register
+def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
+  config = gemma3_4b()
+  return dataclasses.replace(
+      config,
+      # Model config.
+      init_ckpt_dir=GEMMA3_4B_IT_CKPT_DIR,
+      lm_format_name='GemmaV2Chat',
+      # Dataset & evaluation config.
+      dataset_name='simply_json:simple_qa_num',
+      evaluation=evaluation_lib.QAToolUseEvaluation(),
+      # Tool config.
+      tool_manager_name='GoogleSearchToolExecutor',
+      max_turns=3,
+      filter_throttled=True,
+      # Sampling configs.
+      sampling_max_decode_steps=512,
+      train_max_seq_len=2048,
+      sampling_prefill_size=512,
+      sampling_max_input_len=512,
+      sampling_temperature=1.0,
+      sampling_intermediate_decode_steps=512,
+      sampling_max_tool_response_len=1024,
+      # TODO: Change the extra_eos_tokens when the prompt is improved.
+      extra_eos_tokens=newlines_from_counts(range(3, 6)),
+      # RL algorithm configs.
+      train_loop_name='rl',
+      num_train_steps=500,
+      num_train_steps_per_batch=4,
+      max_num_samples_per_train_batch=None,
+      use_validation_set=False,
+      train_batch_size=16 * 32,
+      batch_size=32,
+      grad_accum_steps=8,
+      num_samples_per_example=4,
+      gamma=1.0,
+      kl_coeff=0.001,
+      use_grpo=True,
+      ppo_clip_eps=0.2,
+      ppo_clip_eps_high=None,
+      ppo_clip_eps_low=None,
+      policy_ratio_cap=10.0,
+      normalize_reward_method='ByGroup',
+      normalize_advantage=False,
+      max_abs_advantage=10.0,
+      use_kl_correction=True,
+      filter_zero_variance=True,
+      filter_truncated=False,
+      use_policy_logp_as_sampler_logp=False,
+      soft_ppo_forward_kl_coeff=0.0,
+      soft_ppo_reverse_kl_coeff=0.0,
+      # Optimizer configs.
+      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
+      weight_decay=0.0,
+      lr_schedule_name='constant',
+      lr_schedule_config=(
+          ('lr', 1e-6),
+          ('warmup_steps', 100),
+      ),
+      # bf16 config from Gemma2BV2.
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+      # Checkpoint and tensorboard configs.
+      init_ckpt_opt_state=False,
+      ckpt_max_to_keep=1,
+      tb_log_interval=10,
+      ckpt_interval=100,
+      # Sharding config.
+      decoding_sharding_config=DecodeGSPMDSharding(),
+  )
 
 
 #################################################################################
@@ -1092,282 +1156,310 @@ class Gemma4BV3ITSimpleQANumberOnlyToolUseRL(Gemma4BV3):
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2(TFM1p7BLM1B):
-  # number of parameters: ~1.5B
-  seq_len: int = 4096
-  vocab_size: int = 151936
-  model_dim: int = 1536
-  expand_factor: int = 0
-  ffn_expand_dim: int = 8960
-  per_head_dim: int = 128
-  n_heads: int = 12
-  n_layers: int = 28
-  n_kv_heads: int = 2
-  ffn_activation: str = 'silu'
-  use_post_ln: bool = False
-  use_per_dim_scale: bool = False
-  ffn_use_bias: bool = False
-  qkv_use_bias: bool = True
-  output_layer_use_bias: bool = False
-  use_tied_embedding: bool = False
-  use_combined_qkv: bool = False
-  embedding_lookup_scale: float | None = None
-  norm_scale_plus_one: bool = False
-  attn_soft_cap: float = -1.0
-  output_logits_soft_cap: float = -1.0
-
-  # NOTE: Data config is vocab dependent. We currently do not have dataset
-  # prepared with qwen vocab.
-  vocab_name: str = 'DeepSeek-R1-Distill-Qwen'
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = DEEPSEEK_QWEN_1P5B_CKPT_DIR
-  init_ckpt_step: int = -1
-  init_ckpt_opt_state: bool = False
-  reset_steps: bool = True
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL(DeepSeekQwen1p5BV2):
-  dataset_name: str = 'simply_json:dsr40k_train'
-  num_train_steps: int = 1_000_000
-  train_loop_name: str = 'rl'
-
-  train_batch_size: int = 16 * 8
-  batch_size: int = 16
-  num_samples_per_example: int = 8
-  sampling_temperature: float = 1.0
-  num_train_steps_per_batch: int = 4
-
-  # RL algorithm configs.
-  gamma: float = 1.0
-  kl_coeff: float = 0.001
-  use_grpo: bool = True
-  ppo_clip_eps: float = 0.2
-  ppo_clip_eps_high: float | None = None
-  ppo_clip_eps_low: float | None = None
-  policy_ratio_cap: float | None = 10.0
-  normalize_reward_method: str = 'ByGroup'
-  normalize_advantage: bool = False
-  max_abs_advantage: float | None = 10.0
-  use_policy_logp_as_sampler_logp: bool = False
-  filter_truncated: bool = False
-  max_num_samples_per_train_batch: int | None = None
-
-  # Optimizer configs.
-  optimizer: opt_lib.Optimizer = opt_lib.Adam(
-      beta1=0.9, beta2=0.95, epsilon=1e-8
-  )
-  weight_decay: float = 0.0
-  lr_schedule_name: str = 'constant'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-6),
-      ('warmup_steps', 1),
-  )
-
-  # Checkpoint and tensorboard configs.
-  init_ckpt_opt_state: bool = False
-  ckpt_max_to_keep: int = 1
-  tb_log_interval: int = 4
-  ckpt_interval: int = 4
-
-  # Sharding config.
-  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
-
-  # Use train_max_seq_len to control the max decode steps.
-  sampling_max_decode_steps: int = 32768
-  train_max_seq_len: int = 9 * 1024
-  sampling_prefill_size: int = 1024
-  sampling_max_input_len: int = 1024
-  sampling_intermediate_decode_steps: int = 1024
-
-  lm_format_name: str = 'DeepSeekQwenR1DistillChat'
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotDeepSeekQwenR1CoTBoxed()
-  )
-  extra_eos_tokens: tuple[str, ...] = ()
-
-  activation_dtype_name: str = 'bfloat16'
-  decoding_quant_scheme: str = 'bfloat16'
-  ref_params_dtype: str = 'bfloat16'
-  use_flash_attention: bool = True
-  flash_attention_block_size: int = 512
-
-  use_validation_set: bool = True
-  validation_eval_interval: int = 50
-  validation_dataset_name: str | None = 'simply_json:aime24'
-  validation_eval_batch_size: int = 64
-  validation_eval_epochs: int = 5
-  validation_evaluation: evaluation_lib.Evaluation | None = None
-  validation_lm_format_name: str = ''
-  validation_max_decode_steps: int | None = None
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL):
-  activation_dtype_name: str = 'float32'
-  decoding_quant_scheme: str = 'float32'
-  ref_params_dtype: str = 'float32'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32):
-  # Batch size and gradient accumulation configs.
-  train_batch_size: int = 64 * 8
-  batch_size: int = 64
-  num_samples_per_example: int = 8
-  grad_accum_steps: int = 4
-
-  # Checkpoint and tensorboard logging configs.
-  tb_log_interval: int = 1
-  ckpt_interval: int = 20
-  ckpt_max_to_keep: int = 1
-
-  # Flash attention configs.
-  use_flash_attention: bool = True
-  flash_attention_block_size: int = 512
-
-  # RL algorithm configs.
-  num_train_steps_per_batch: int = 1
-  normalize_reward_method: str = 'ByGroup'
-  policy_ratio_cap: float | None = None
-  max_abs_advantage: float | None = None
-
-  lr_schedule_name: str = 'constant'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-6),
-      ('warmup_steps', 1),
+def deepseek_qwen2_1p5b():
+  config = BaseExperimentConfig()
+  return dataclasses.replace(
+      config,
+      # number of parameters: ~1.5B
+      seq_len=4096,
+      vocab_size=151936,
+      model_dim=1536,
+      expand_factor=0,
+      ffn_expand_dim=8960,
+      per_head_dim=128,
+      n_heads=12,
+      n_layers=28,
+      n_kv_heads=2,
+      ffn_activation='silu',
+      use_post_ln=False,
+      use_per_dim_scale=False,
+      ffn_use_bias=False,
+      qkv_use_bias=True,
+      output_layer_use_bias=False,
+      use_tied_embedding=False,
+      use_combined_qkv=False,
+      embedding_lookup_scale=None,
+      norm_scale_plus_one=False,
+      attn_soft_cap=-1.0,
+      output_logits_soft_cap=-1.0,
+      # NOTE: Data config is vocab dependent. We currently do not have dataset
+      # prepared with qwen vocab.
+      vocab_name='DeepSeek-R1-Distill-Qwen',
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=DEEPSEEK_QWEN_1P5B_CKPT_DIR,
+      init_ckpt_step=-1,
+      init_ckpt_opt_state=False,
+      reset_steps=True,
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLV2(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2):
-  activation_dtype_name: str = 'bfloat16'
-  decoding_quant_scheme: str = 'bfloat16'
-  ref_params_dtype: str = 'bfloat16'
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V3(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2):
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 3e-6),
-      ('warmup_steps', 1),
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
+  config = deepseek_qwen2_1p5b()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:dsr40k_train',
+      num_train_steps=1_000_000,
+      train_loop_name='rl',
+      train_batch_size=16 * 8,
+      batch_size=16,
+      num_samples_per_example=8,
+      sampling_temperature=1.0,
+      num_train_steps_per_batch=4,
+      # RL algorithm configs.
+      gamma=1.0,
+      kl_coeff=0.001,
+      use_grpo=True,
+      ppo_clip_eps=0.2,
+      ppo_clip_eps_high=None,
+      ppo_clip_eps_low=None,
+      policy_ratio_cap=10.0,
+      normalize_reward_method='ByGroup',
+      normalize_advantage=False,
+      max_abs_advantage=10.0,
+      use_policy_logp_as_sampler_logp=False,
+      filter_truncated=False,
+      max_num_samples_per_train_batch=None,
+      # Optimizer configs.
+      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
+      weight_decay=0.0,
+      lr_schedule_name='constant',
+      lr_schedule_config=(
+          ('lr', 1e-6),
+          ('warmup_steps', 1),
+      ),
+      # Checkpoint and tensorboard configs.
+      init_ckpt_opt_state=False,
+      ckpt_max_to_keep=1,
+      tb_log_interval=4,
+      ckpt_interval=4,
+      # Sharding config.
+      decoding_sharding_config=DecodeGSPMDSharding(),
+      # Use train_max_seq_len to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=9 * 1024,
+      sampling_prefill_size=1024,
+      sampling_max_input_len=1024,
+      sampling_intermediate_decode_steps=1024,
+      lm_format_name='DeepSeekQwenR1DistillChat',
+      evaluation=evaluation_lib.ZeroShotDeepSeekQwenR1CoTBoxed(),
+      extra_eos_tokens=(),
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+      use_flash_attention=True,
+      flash_attention_block_size=512,
+      use_validation_set=True,
+      validation_eval_interval=50,
+      validation_dataset_name='simply_json:aime24',
+      validation_eval_batch_size=64,
+      validation_eval_epochs=5,
+      validation_evaluation=None,
+      validation_lm_format_name='',
+      validation_max_decode_steps=None,
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLBF16V2(
-    DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2
-):
-  activation_dtype_name: str = 'bfloat16'
-  decoding_quant_scheme: str = 'bfloat16'
-  ref_params_dtype: str = 'bfloat16'
-  use_validation_set: bool = True
-  validation_eval_batch_size: int = 64
-  validation_eval_interval: int = 50
-  use_policy_logp_as_sampler_logp: bool = True
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V4(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2):
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-5),
-      ('warmup_steps', 1),
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='float32',
+      decoding_quant_scheme='float32',
+      ref_params_dtype='float32',
   )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32T0p6(DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL):
-  activation_dtype_name: str = 'float32'
-  decoding_quant_scheme: str = 'float32'
-  ref_params_dtype: str = 'float32'
-  sampling_temperature: float = 0.6
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32()
+  return dataclasses.replace(
+      config,
+      # Batch size and gradient accumulation configs.
+      train_batch_size=64 * 8,
+      batch_size=64,
+      num_samples_per_example=8,
+      grad_accum_steps=4,
+      # Checkpoint and tensorboard logging configs.
+      tb_log_interval=1,
+      ckpt_interval=20,
+      ckpt_max_to_keep=1,
+      # Flash attention configs.
+      use_flash_attention=True,
+      flash_attention_block_size=512,
+      # RL algorithm configs.
+      num_train_steps_per_batch=1,
+      normalize_reward_method='ByGroup',
+      policy_ratio_cap=None,
+      max_abs_advantage=None,
+      lr_schedule_name='constant',
+      lr_schedule_config=(
+          ('lr', 1e-6),
+          ('warmup_steps', 1),
+      ),
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen7BV2(DeepSeekQwen1p5BV2):
-  vocab_size: int = 152064
-  model_dim: int = 3584
-  ffn_expand_dim: int = 18944
-  n_layers: int = 28
-  n_heads: int = 28
-  n_kv_heads: int = 4
-  init_ckpt_dir: str = DEEPSEEK_QWEN_7B_CKPT_DIR
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen14BV2(DeepSeekQwen1p5BV2):
-  vocab_size: int = 152064
-  model_dim: int = 5120
-  ffn_expand_dim: int = 13824
-  n_layers: int = 48
-  n_heads: int = 40
-  n_kv_heads: int = 8
-  global_rope_max_timescale: int = 1_000_000
-  rms_norm_epsilon: float = 1e-5
-
-  init_ckpt_dir: str = DEEPSEEK_QWEN_14B_CKPT_DIR
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      lr_schedule_config=(
+          ('lr', 3e-6),
+          ('warmup_steps', 1),
+      ),
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DeepSeekQwen32BV2(DeepSeekQwen1p5BV2):
-  vocab_size: int = 152064
-  model_dim: int = 5120
-  ffn_expand_dim: int = 27648
-  n_layers: int = 64
-  n_heads: int = 40
-  n_kv_heads: int = 8
-  global_rope_max_timescale: int = 1_000_000
-  rms_norm_epsilon: float = 1e-5
-  init_ckpt_dir: str = DEEPSEEK_QWEN_32B_CKPT_DIR
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+      use_validation_set=True,
+      validation_eval_batch_size=64,
+      validation_eval_interval=50,
+      use_policy_logp_as_sampler_logp=True,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v4():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      lr_schedule_config=(
+          ('lr', 1e-5),
+          ('warmup_steps', 1),
+      ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_t0p6():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='float32',
+      decoding_quant_scheme='float32',
+      ref_params_dtype='float32',
+      sampling_temperature=0.6,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_7b():
+  config = deepseek_qwen2_1p5b()
+  return dataclasses.replace(
+      config,
+      vocab_size=152064,
+      model_dim=3584,
+      ffn_expand_dim=18944,
+      n_layers=28,
+      n_heads=28,
+      n_kv_heads=4,
+      init_ckpt_dir=DEEPSEEK_QWEN_7B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_14b():
+  config = deepseek_qwen2_1p5b()
+  return dataclasses.replace(
+      config,
+      vocab_size=152064,
+      model_dim=5120,
+      ffn_expand_dim=13824,
+      n_layers=48,
+      n_heads=40,
+      n_kv_heads=8,
+      global_rope_max_timescale=1_000_000,
+      rms_norm_epsilon=1e-5,
+      init_ckpt_dir=DEEPSEEK_QWEN_14B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_32b():
+  config = deepseek_qwen2_1p5b()
+  return dataclasses.replace(
+      config,
+      vocab_size=152064,
+      model_dim=5120,
+      ffn_expand_dim=27648,
+      n_layers=64,
+      n_heads=40,
+      n_kv_heads=8,
+      global_rope_max_timescale=1_000_000,
+      rms_norm_epsilon=1e-5,
+      init_ckpt_dir=DEEPSEEK_QWEN_32B_CKPT_DIR,
+  )
 
 
 # TODO: The ideal way should be first define Qwen native configs and use
 # them to define DeepSeek Qwen configs.
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class QwenMath1p5BV2p5(DeepSeekQwen1p5BV2):
-  use_tied_embedding = True
-
-  vocab_name: str = 'Qwen2.5'
-  init_ckpt_dir: str = QWEN2p5_MATH_1p5B_CKPT_DIR
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class QwenMath7BV2p5(DeepSeekQwen7BV2):
-  init_ckpt_dir: str = QWEN2p5_MATH_7B_CKPT_DIR
+def qwen_math_1p5b_v2p5():
+  config = deepseek_qwen2_1p5b()
+  return dataclasses.replace(
+      config,
+      use_tied_embedding=True,
+      vocab_name='Qwen2.5',
+      init_ckpt_dir=QWEN2p5_MATH_1p5B_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class QwenMath14BV2p5(DeepSeekQwen14BV2):
-  init_ckpt_dir: str = QWEN2p5_MATH_14B_CKPT_DIR
+def qwen_math_7b_v2p5():
+  config = deepseek_qwen2_7b()
+  return dataclasses.replace(
+      config,
+      init_ckpt_dir=QWEN2p5_MATH_7B_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class QwenMath32BV2p5(DeepSeekQwen32BV2):
-  init_ckpt_dir: str = QWEN2p5_MATH_32B_CKPT_DIR
+def qwen_math_14b_v2p5():
+  config = deepseek_qwen2_14b()
+  return dataclasses.replace(
+      config,
+      init_ckpt_dir=QWEN2p5_MATH_14B_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class QwQ32B(DeepSeekQwen32BV2):
-  vocab_name: str = 'QwQ'
-  init_ckpt_dir: str = QWQ_32B_CKPT_DIR
+def qwen_math_32b_v2p5():
+  config = deepseek_qwen2_32b()
+  return dataclasses.replace(
+      config,
+      init_ckpt_dir=QWEN2p5_MATH_32B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwq_32b():
+  config = deepseek_qwen2_32b()
+  return dataclasses.replace(
+      config,
+      vocab_name='QwQ',
+      init_ckpt_dir=QWQ_32B_CKPT_DIR,
+  )
 
 
 def apply_config_diff(config, diff_base, diff_new):
@@ -1382,38 +1474,32 @@ def apply_config_diff(config, diff_base, diff_new):
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRL():
+def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl():
   return apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen7BV2())
-
-
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRL,
-    name='dsqwen_v2-7b-dsr40k-R1_distill_cot0shot-rl')
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_7b())
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V2():
+def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2():
   config = apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLF32V2(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen7BV2())
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_7b())
   config = dataclasses.replace(config, batch_size=32)
   return config
 
 
 # Register the config with a more readable name.
 ExperimentConfigRegistry.register(
-    DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V2,
+    deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2,
     name='dsqwen_v2-7b-dsr40k-R1_distill_cot0shot-rl-f32-v2')
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V3():
-  config = DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V2()
+def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3():
+  config = deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
   config = dataclasses.replace(
       config,
       lr_schedule_config=(
@@ -1425,9 +1511,9 @@ def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V3():
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLBF16V2():
+def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
   config = dataclasses.replace(
-      DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V2(),
+      deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2(),
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
@@ -1439,44 +1525,27 @@ def DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLBF16V2():
   return config
 
 
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen7BV2ITDSR40KR1DistillCoT0ShotRLF32V3,
-    name='dsqwen_v2-7b-dsr40k-R1_distill_cot0shot-rl-f32-v3')
-
-
 @ExperimentConfigRegistry.register
-def DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRL():
+def deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl():
   return apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen14BV2())
-
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRL,
-    name='dsqwen_v2-14b-dsr40k-R1_distill_cot0shot-rl')
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_14b())
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV2():
+def deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl_v2():
   config = apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLV2(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen14BV2())
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_v2(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_14b())
   config = dataclasses.replace(config, batch_size=16)
   return config
 
 
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV2,
-    name='dsqwen_v2-14b-dsr40k-R1_distill_cot0shot-rl-v2')
-
-
 @ExperimentConfigRegistry.register
-def DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV3():
-  config = DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV2()
+def deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl_v3():
+  config = deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl_v2()
   config = dataclasses.replace(
       config,
       lr_schedule_config=(
@@ -1487,44 +1556,27 @@ def DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV3():
   return config
 
 
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen14BV2ITDSR40KR1DistillCoT0ShotRLV3,
-    name='dsqwen_v2-14b-dsr40k-R1_distill_cot0shot-rl-v3')
-
-
 @ExperimentConfigRegistry.register
-def DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRL():
+def deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl():
   return apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRL(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen32BV2())
-
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRL,
-    name='dsqwen_v2-32b-dsr40k-R1_distill_cot0shot-rl')
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_32b())
 
 
 @ExperimentConfigRegistry.register
-def DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV2():
+def deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl_v2():
   config = apply_config_diff(
-      config=DeepSeekQwen1p5BV2ITDSR40KR1DistillCoT0ShotRLV2(),
-      diff_base=DeepSeekQwen1p5BV2(),
-      diff_new=DeepSeekQwen32BV2())
+      config=deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_v2(),
+      diff_base=deepseek_qwen2_1p5b(),
+      diff_new=deepseek_qwen2_32b())
   config = dataclasses.replace(config, batch_size=16)
   return config
 
 
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV2,
-    name='dsqwen_v2-32b-dsr40k-R1_distill_cot0shot-rl-v2')
-
-
 @ExperimentConfigRegistry.register
-def DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV3():
-  config = DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV2()
+def deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl_v3():
+  config = deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl_v2()
   config = dataclasses.replace(
       config,
       lr_schedule_config=(
@@ -1533,12 +1585,6 @@ def DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV3():
       ),
   )
   return config
-
-
-# Register the config with a more readable name.
-ExperimentConfigRegistry.register(
-    DeepSeekQwen32BV2ITDSR40KR1DistillCoT0ShotRLV3,
-    name='dsqwen_v2-32b-dsr40k-R1_distill_cot0shot-rl-v3')
 
 
 #################################################################################
@@ -1547,97 +1593,108 @@ ExperimentConfigRegistry.register(
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen0p6BV3(TFM1p7BLM1B):
-  seq_len: int = 4096
-  vocab_size: int = 151936
-  model_dim: int = 1024
-  expand_factor: int = 0
-  ffn_expand_dim: int = 3072
-  per_head_dim: int = 128
-  n_heads: int = 16
-  n_layers: int = 28
-  n_kv_heads: int = 8
-  ffn_activation: str = 'silu'
-  use_post_ln: bool = False
-  use_qk_norm: bool = True
-  use_per_dim_scale: bool = False
-  ffn_use_bias: bool = False
-  qkv_use_bias: bool = False
-  output_layer_use_bias: bool = False
-  use_tied_embedding: bool = True
-  use_combined_qkv: bool = False
-  embedding_lookup_scale: float | None = None
-  norm_scale_plus_one: bool = False
-  attn_soft_cap: float = -1.0
-  output_logits_soft_cap: float = -1.0
-  global_rope_max_timescale: int = 1_000_000
-
-  # NOTE: Data config is vocab dependent. We currently do not have dataset
-  # prepared with qwen vocab.
-  vocab_name: str = 'Qwen3'
-
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = QWEN3_0P6B_CKPT_DIR
-  init_ckpt_step: int = -1
-  init_ckpt_opt_state: bool = False
-  reset_steps: bool = True
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen1p7BV3(Qwen0p6BV3):
-  model_dim: int = 2048
-  ffn_expand_dim: int = 6144
-
-  init_ckpt_dir: str = QWEN3_1P7B_CKPT_DIR
+def qwen3_0p6b():
+  config = BaseExperimentConfig()
+  return dataclasses.replace(
+      config,
+      seq_len=4096,
+      vocab_size=151936,
+      model_dim=1024,
+      expand_factor=0,
+      ffn_expand_dim=3072,
+      per_head_dim=128,
+      n_heads=16,
+      n_layers=28,
+      n_kv_heads=8,
+      ffn_activation='silu',
+      use_post_ln=False,
+      use_qk_norm=True,
+      use_per_dim_scale=False,
+      ffn_use_bias=False,
+      qkv_use_bias=False,
+      output_layer_use_bias=False,
+      use_tied_embedding=True,
+      use_combined_qkv=False,
+      embedding_lookup_scale=None,
+      norm_scale_plus_one=False,
+      attn_soft_cap=-1.0,
+      output_logits_soft_cap=-1.0,
+      global_rope_max_timescale=1_000_000,
+      # NOTE: Data config is vocab dependent. We currently do not have dataset
+      # prepared with qwen vocab.
+      vocab_name='Qwen3',
+      # Config for init from existing checkpoint.
+      init_ckpt_dir=QWEN3_0P6B_CKPT_DIR,
+      init_ckpt_step=-1,
+      init_ckpt_opt_state=False,
+      reset_steps=True,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen4BV3(Qwen0p6BV3):
-  model_dim: int = 2560
-  ffn_expand_dim: int = 9728
-  n_heads: int = 32
-  n_layers: int = 36
-
-  init_ckpt_dir: str = QWEN3_4B_CKPT_DIR
-
-
-@ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen8BV3(Qwen0p6BV3):
-  model_dim: int = 4096
-  ffn_expand_dim: int = 12288
-  n_heads: int = 32
-  n_layers: int = 36
-  use_tied_embedding: bool = False
-
-  init_ckpt_dir: str = QWEN3_8B_CKPT_DIR
+def qwen3_1p7b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      model_dim=2048,
+      ffn_expand_dim=6144,
+      init_ckpt_dir=QWEN3_1P7B_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen14BV3(Qwen0p6BV3):
-  model_dim: int = 5120
-  ffn_expand_dim: int = 17408
-  n_heads: int = 40
-  n_layers: int = 40
-  use_tied_embedding: bool = False
-
-  init_ckpt_dir: str = QWEN3_14B_CKPT_DIR
+def qwen3_4b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      model_dim=2560,
+      ffn_expand_dim=9728,
+      n_heads=32,
+      n_layers=36,
+      init_ckpt_dir=QWEN3_4B_CKPT_DIR,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class Qwen32BV3(Qwen0p6BV3):
-  model_dim: int = 5120
-  ffn_expand_dim: int = 25600
-  n_heads: int = 64
-  n_layers: int = 64
-  use_tied_embedding: bool = False
+def qwen3_8b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      model_dim=4096,
+      ffn_expand_dim=12288,
+      n_heads=32,
+      n_layers=36,
+      use_tied_embedding=False,
+      init_ckpt_dir=QWEN3_8B_CKPT_DIR,
+  )
 
-  init_ckpt_dir: str = QWEN3_32B_CKPT_DIR
+
+@ExperimentConfigRegistry.register
+def qwen3_14b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      model_dim=5120,
+      ffn_expand_dim=17408,
+      n_heads=40,
+      n_layers=40,
+      use_tied_embedding=False,
+      init_ckpt_dir=QWEN3_14B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_32b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      model_dim=5120,
+      ffn_expand_dim=25600,
+      n_heads=64,
+      n_layers=64,
+      use_tied_embedding=False,
+      init_ckpt_dir=QWEN3_32B_CKPT_DIR,
+  )
 
 
 ################################################################################
@@ -1645,142 +1702,145 @@ class Qwen32BV3(Qwen0p6BV3):
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class TransformerLMTest(TFM1p7BLM1B):
-  # Model config
-  model_dim: int = 8
-  per_head_dim: int = 4
-  n_heads: int = 2
-  n_layers: int = 2
-  expand_factor: int = 2
-  use_scan: bool = True
-  use_flash_attention: bool = False
-  activation_dtype_name: str = 'bfloat16'
-
-  # Data config
-  num_train_steps: int = 50
-  batch_size: int = 4
-
-  vocab_size: int = 32_000
-  seq_len: int = 64
-  dataset_name: str = 'imdb_reviews.vb32000_t5_cc'
-  lr: opt_lib.Schedule = opt_lib.LinearWarmupCosineDecay(
-      value=1e-3,
-      warmup_steps=10,
-      steps_after_decay=10,
-      end_decay=0.1,
+def lm_test():
+  config = BaseExperimentConfig()
+  return dataclasses.replace(
+      config,
+      # Model config
+      model_dim=8,
+      per_head_dim=4,
+      n_heads=2,
+      n_layers=2,
+      expand_factor=2,
+      use_scan=True,
+      use_flash_attention=False,
+      activation_dtype_name='bfloat16',
+      # Data config
+      num_train_steps=50,
+      batch_size=4,
+      vocab_size=32_000,
+      seq_len=64,
+      prefetch_num_workers=0,
+      prefetch_per_worker_buffer_size=2,
+      dataset_name='imdb_reviews.vb32000_t5_cc',
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-3,
+          warmup_steps=10,
+          steps_after_decay=10,
+          end_decay=0.1,
+      ),
+      clip_grad_norm=-1.0,
+      clip_update_norm=-1.0,
+      use_validation_set=True,
+      validation_num_eval_steps=2,
+      validation_eval_interval=5,
+      validation_eval_batch_size=-1,
+      # Checkpoint and tensorboard config
+      ckpt_interval=10,
+      ckpt_max_to_keep=3,
+      tb_log_interval=2,
   )
-  clip_grad_norm: float = -1.0
-  clip_update_norm: float = -1.0
-  use_validation_set: bool = True
-  validation_num_eval_steps: int = 2
-  validation_eval_interval: int = 5
-  validation_eval_batch_size: int = -1
-
-  # Checkpoint and tensorboard config
-  ckpt_interval: int = 10
-  ckpt_max_to_keep: int = 3
-  tb_log_interval: int = 2
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class TransformerLMTestC4(TransformerLMTest):
-  seq_len: int = 4096
-  dataset_name: str = 'c4.vb100864_openmix_v1'
+def lm_c4_test():
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      seq_len=4096,
+      dataset_name='c4.vb100864_openmix_v1',
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class TransformerLMTestNoScan(TransformerLMTest):
-  use_scan: bool = False
-  use_remat: bool = False
+def lm_no_scan_test():
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      use_scan=False,
+      use_remat=False,
+  )
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class TransformerLMTestSFT(TransformerLMTest):
-  num_train_steps: int = 2000
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-4),
-      ('warmup_steps', 100),
-      ('steps_after_decay', 10),
-      ('end_decay', 0.1),
+def lm_sft_test():
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      num_train_steps=2000,
+      lr_schedule_config=(
+          ('lr', 1e-4),
+          ('warmup_steps', 100),
+          ('steps_after_decay', 10),
+          ('end_decay', 0.1),
+      ),
+      dataset_name='tulu_v2_sft.vb100864_openmix_v1',
+      # Config for init from existing checkpoint.
+      init_ckpt_dir='/tmp/simply_test_pt_1/checkpoints',
+      init_ckpt_step=-1,
+      use_validation_set=False,
+      # Add masks to only calculate loss on assistant responses.
+      add_chat_loss_mask=True,
+      mask_start_token='<reserved_2>',
+      mask_end_token='<reserved_4>',
   )
-  dataset_name: str = 'tulu_v2_sft.vb100864_openmix_v1'
-  # Config for init from existing checkpoint.
-  init_ckpt_dir: str = '/tmp/simply_test_pt_1/checkpoints'
-  init_ckpt_step: int = -1
-
-  use_validation_set: bool = False
-
-  # Add masks to only calculate loss on assistant responses.
-  add_chat_loss_mask: bool = True
-  mask_start_token: str = '<reserved_2>'
-  mask_end_token: str = '<reserved_4>'
 
 
 @ExperimentConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class TransformerLMTestRL(TransformerLMTest):
-  dataset_name: str = 'simply_json:dsr40k_train'
-  num_train_steps: int = 30
-  train_loop_name: str = 'rl'
-  evaluation: evaluation_lib.Evaluation = (
-      evaluation_lib.ZeroShotBoxedInQuestionEvaluation()
-  )
-  use_validation_set: bool = False
-
-  vocab_name: str = 'vb32768_openmix_v1'
-  lm_format_name: str = 'SimplyV1Chat'
-  batch_size: int = 4
-  train_batch_size: int = 4
-  num_samples_per_example: int = 1
-  normalize_reward_method: str = 'Global'
-  sampling_temperature: float = 1.0
-  filter_truncated: bool = False
-  max_num_samples_per_train_batch: int | None = None
-
-  # Use train_max_seq_len to control the max decode steps.
-  sampling_max_decode_steps: int = 32768
-  train_max_seq_len: int = 8
-  sampling_prefill_size: int = 16
-  sampling_max_input_len: int = 8
-  sampling_intermediate_decode_steps: int = -1
-  sampling_microbatch_size: int | None = 2
-
-  num_train_steps_per_batch: int = 4
-  lr_schedule_name: str = 'constant'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-7),
-      ('warmup_steps', 100),
-  )
-  extra_eos_tokens: tuple[str, ...] = newlines_from_counts(range(1, 2))
-  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
-
-  # RL algorithm configs.
-  gamma: float = 1.0
-  kl_coeff: float = 0.01
-  use_grpo: bool = True
-  ppo_clip_eps: float = 0.2
-  ppo_clip_eps_low: float | None = None
-  ppo_clip_eps_high: float | None = None
-  policy_ratio_cap: float | None = 10.0
-  normalize_reward_method: str = 'ByGroup'
-  normalize_advantage: bool = False
-  max_abs_advantage: float | None = 10.0
-  use_policy_logp_as_sampler_logp: bool = False
-
-  activation_dtype_name: str = 'float32'
-  decoding_quant_scheme: str = 'float32'
-  ref_params_dtype: str = 'float32'
-  grad_accum_steps: int = 2
-
-  # Early stopping threshold.
-  early_stop: opt_lib.EarlyStop | None = opt_lib.SimpleEarlyStop(
-      thresholds=(
-          (20, ('<', 'accuracy', 0.5)),
-      )
+def lm_rl_test():
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:dsr40k_train',
+      num_train_steps=30,
+      train_loop_name='rl',
+      evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
+      use_validation_set=False,
+      vocab_name='vb32768_openmix_v1',
+      lm_format_name='SimplyV1Chat',
+      batch_size=4,
+      train_batch_size=4,
+      num_samples_per_example=1,
+      sampling_temperature=1.0,
+      filter_truncated=False,
+      max_num_samples_per_train_batch=None,
+      # Use train_max_seq_len to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=8,
+      sampling_prefill_size=16,
+      sampling_max_input_len=8,
+      sampling_intermediate_decode_steps=-1,
+      sampling_microbatch_size=2,
+      num_train_steps_per_batch=4,
+      lr_schedule_name='constant',
+      lr_schedule_config=(
+          ('lr', 1e-7),
+          ('warmup_steps', 100),
+      ),
+      extra_eos_tokens=newlines_from_counts(range(1, 2)),
+      decoding_sharding_config=DecodeGSPMDSharding(),
+      # RL algorithm configs.
+      gamma=1.0,
+      kl_coeff=0.01,
+      use_grpo=True,
+      ppo_clip_eps=0.2,
+      ppo_clip_eps_low=None,
+      ppo_clip_eps_high=None,
+      policy_ratio_cap=10.0,
+      normalize_reward_method='ByGroup',
+      normalize_advantage=False,
+      max_abs_advantage=10.0,
+      use_policy_logp_as_sampler_logp=False,
+      activation_dtype_name='float32',
+      decoding_quant_scheme='float32',
+      ref_params_dtype='float32',
+      grad_accum_steps=2,
+      # Early stopping threshold.
+      early_stop=opt_lib.SimpleEarlyStop(
+          thresholds=(
+              (20, ('<', 'accuracy', 0.5)),
+          )
+      ),
   )
 
 

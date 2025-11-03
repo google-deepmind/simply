@@ -261,17 +261,14 @@ class EinsumLinear(SimplyModule):
           self.weight_dim_annotation += 'o'
         else:
           raise ValueError(f"Invalid character '{char}' in einsum string.")
-    weight_shape_char_dict = create_char_dict(weight_term, self.weight_shape)
-    weight_dim_annotation_char_dict = create_char_dict(
-        weight_term, self.weight_dim_annotation)
-    output_partition_char_dict = create_char_dict(
-        output_term, self.output_partition)
     if self.bias_term:
-      assert '...' not in self.bias_term, ('Bias term cannot contain "...".')
+      assert '...' not in self.bias_term, 'Bias term cannot contain "...".'
+      weight_shape_char_dict = create_char_dict(weight_term, self.weight_shape)
+      weight_dim_annotation_char_dict = create_char_dict(
+          weight_term, self.weight_dim_annotation)
       self.output_term = output_term
       self.bias_dim_annotation = ''
       bias_shape = []
-      bias_partition = []
       for char in self.bias_term:
         if not (char in weight_term and char in output_term):
           raise ValueError(
@@ -281,10 +278,16 @@ class EinsumLinear(SimplyModule):
         bias_shape.append(weight_shape_char_dict[char])
         wd = weight_dim_annotation_char_dict[char]
         self.bias_dim_annotation += '.' if wd == '.' else 'h'
-        # We assume bias should follow the output's sharding.
-        bias_partition.append(output_partition_char_dict[char])
       self.bias_shape = tuple(bias_shape)
-      self.bias_partition = tuple(bias_partition)
+
+      if (self.output_partition is None or
+          self.output_partition == sharding_lib.NOT_ANNOTATED):
+        self.bias_partition = self.output_partition
+      else:
+        output_partition_char_dict = create_char_dict(
+            output_term, self.output_partition)
+        self.bias_partition = [
+            output_partition_char_dict[char] for char in self.bias_term]
 
   def init(self, prng_key: PRNGKey) -> PyTree:
     params = {}
@@ -334,3 +337,125 @@ class EinsumLinear(SimplyModule):
         output, self.output_partition
     )
     return output
+
+
+@ModuleRegistry.register
+@dataclasses.dataclass
+class EmbeddingLinear(SimplyModule):
+  """A EinsumLinear layer that also supports embedding lookup.
+
+  This layer includes both an embedding lookup and a linear projection
+  from inputs to vocabulary logits. The weights for embedding lookup
+  and linear projection can be tied by setting `use_tied_embedding` to True.
+
+  Attributes:
+    vocab_size: Vocabulary size.
+    dim: Embedding dimension.
+    embedding_scale: scalar rescaling factor for embeddings. Embeddings are
+      scaled by `sqrt(dim) * embedding_scale` after lookup.
+    use_lookup: Whether to use table lookup for embedding. If False, use
+      one-hot encoding and einsum.
+    weight_init: Initializer for weight tensor of linear layer.
+    use_bias: Whether to use bias in linear layer.
+    bias_init: Initializer for bias in linear layer. Only used when
+      `use_bias` is True.
+    use_tied_embedding: Whether to tie embeddings with the weights of linear
+      projection. If True, the weights / embeddings are initialized with
+      `weight_init`.
+    embed_init: Initializer for embeddings if `use_tied_embedding` is False.
+    weight_dtype: Dtype of weights.
+    activation_dtype: Dtype of activations.
+    weight_partition: Sharding annotation for weights.
+    output_partition: Sharding annotation for outputs.
+    weight_name: Name of weight parameter in parameter PyTree.
+    bias_name: Name of bias parameter in parameter PyTree.
+    embed_name: Name of embedding parameter in parameter PyTree if
+      `use_tied_embedding` is False.
+    einsum_linear: The `EinsumLinear` instance used for the linear projection.
+  """
+  vocab_size: int
+  dim: int
+  use_lookup: bool = True
+  embedding_scale: float = 1.0
+  weight_init: initializer.Initializer = initializer.LecunNormalInit()
+  use_bias: bool = True
+  # Only used when `use_bias` is True.
+  bias_init: initializer.Initializer = initializer.ZeroInit()
+  use_tied_embedding: bool = True
+  # Only used when `use_tied_embedding` is False.
+  embed_init: initializer.Initializer = initializer.LecunNormalInit()
+  # Mixed precision related.
+  weight_dtype: jax.typing.DTypeLike = 'float32'
+  activation_dtype: jax.typing.DTypeLike = 'bfloat16'
+  # Sharding related.
+  weight_partition: common.PartitionAnnotation = None
+  output_partition: common.PartitionAnnotation = (
+      sharding_lib.NOT_ANNOTATED
+  )
+  # Others.
+  weight_name: str = 'w'
+  bias_name: str = 'b'
+  embed_name: str = 'embed'
+
+  def setup(self):
+    self.einsum_linear = EinsumLinear(
+        eqn='vd,...d->...v',
+        bias_term='v' if self.use_bias else '',
+        # Rationale: we interpret embedding matrix as `.oi`, a stack of linear
+        # projections from `model_dim` to 1 and we then squeezed the `o` since
+        # it is just 1 and ended up with `.i` only.
+        weight_dim_annotation='.i',
+        weight_shape=(self.vocab_size, self.dim),
+        weight_init=self.weight_init,
+        bias_init=self.bias_init,
+        weight_dtype=self.weight_dtype,
+        activation_dtype=self.activation_dtype,
+        weight_partition=self.weight_partition,
+        output_partition=self.output_partition,
+        weight_name=self.weight_name,
+        bias_name=self.bias_name,
+    )
+
+  def init(self, prng_key: PRNGKey) -> PyTree:
+    prng_key, embed_key = jax.random.split(prng_key)
+    params = self.einsum_linear.init(prng_key)
+    if not self.use_tied_embedding:
+      params[self.embed_name] = self.embed_init(
+          embed_key,
+          shape=(self.vocab_size, self.dim),
+          dtype=self.weight_dtype,
+          dim_annotation='.i',
+      )
+    return params
+
+  def embed(self, params: PyTree, x: Array) -> Array:
+    """Embeds token IDs into embedding vectors.
+
+    Args:
+      params: Parameters of the module.
+      x: Token IDs, an integer tensor of shape (...).
+
+    Returns:
+      Embedding vectors of shape (..., dim).
+    """
+    params = get_raw_arrays(params)
+    if self.use_tied_embedding:
+      params = params[self.weight_name]
+    else:
+      params = params[self.embed_name]
+    params = common.convert_or_dequantize(params, dtype=self.activation_dtype)
+    if self.use_lookup:
+      output = jnp.take(params, x, axis=0)
+    else:
+      onehot_x = jax.nn.one_hot(x, self.vocab_size, dtype=self.activation_dtype)
+      output = jnp.einsum('vd,...v->...d', params, onehot_x)
+    # Assume the embedding matrix is initialized with LecunNormalInit
+    # (scale=1/sqrt(dim)), so the output is scaled by
+    # sqrt(dim) * embedding_scale to have variance of
+    # embedding_scale (default to 1.0).
+    scaling_factor = jnp.asarray(
+        jnp.sqrt(self.dim) * self.embedding_scale, self.activation_dtype)
+    return output * scaling_factor
+
+  def apply(self, params: PyTree, x: Array) -> Array:
+    return self.einsum_linear.apply(params, x)

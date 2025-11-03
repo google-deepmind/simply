@@ -439,6 +439,13 @@ class LinearWarmupConstant(Schedule):
 
 @ScheduleRegistry.register
 @dataclasses.dataclass(frozen=True)
+class Constant(LinearWarmupConstant):
+  value: float
+  warmup_steps: int = 1
+
+
+@ScheduleRegistry.register
+@dataclasses.dataclass(frozen=True)
 class LinearWarmupCosineDecay(Schedule):
   """Constant schedule."""
   value: float

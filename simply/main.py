@@ -32,16 +32,15 @@ import os
 import re
 from typing import Sequence
 
-from absl import app
 from absl import flags
 from absl import logging
 from etils import epath
 from simply import config_lib
-from simply import data_lib
 from simply import model_lib
 from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
 from simply.utils import pytree
+from absl import app
 
 
 _EXPERIMENT_CONFIG = flags.DEFINE_string(
@@ -138,10 +137,10 @@ def main(argv: Sequence[str]) -> None:
   logging.info('dcn_mesh_shape: %s', dcn_mesh_shape)
   run_experiment_fn = model_lib.TrainLoopRegistry.get(config.train_loop_name)
   run_experiment_fn(
-      config=config, sharding_config=sharding_config,
+      config=config,
+      sharding_config=sharding_config,
       mesh_shape=mesh_shape,
       dcn_mesh_shape=dcn_mesh_shape,
-      create_dataset=data_lib.create_dataset,
       experiment_dir=_EXPERIMENT_DIR.value,
       decoding_mesh_shape=decoding_mesh_shape,
   )

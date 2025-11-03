@@ -17,6 +17,7 @@ from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 from unittest import mock
+import numpy as np
 from simply.utils import sharding
 
 
@@ -46,6 +47,53 @@ class ShardingTest(absltest.TestCase):
     sharding.with_sharding_constraint(
         jnp.array([1, 2]), sharding.mesh_sharding([['replica', 'data']])
     )
+
+  def test_pytree_ragged_stack_allgather(self):
+    abstract_pytree = {
+        'a': jax.ShapeDtypeStruct(shape=(), dtype=np.bool),
+        'b': jax.ShapeDtypeStruct(shape=(2,), dtype=np.int32),
+    }
+    local_pytrees = [
+        {'a': True, 'b': np.array([1, 2])},
+        {'a': False, 'b': np.array([3, 4])},
+        {'a': True, 'b': np.array([5, 6])},
+    ]
+
+    with mock.patch.object(jax, 'process_count', return_value=3):
+      with mock.patch.object(jax, 'process_index', return_value=0):
+        global_pytree = sharding._local_pytrees_to_global(
+            abstract_pytree,
+            local_pytrees,
+            num_per_process=np.array([3, 2, 1]),
+            global_batch_size=6,
+        )
+        np.testing.assert_equal(global_pytree['a'], [1, 0, 1, 0, 0, 0])
+        np.testing.assert_equal(
+            global_pytree['b'], [[1, 2], [3, 4], [5, 6], [0, 0], [0, 0], [0, 0]]
+        )
+      with mock.patch.object(jax, 'process_index', return_value=1):
+        global_pytree = sharding._local_pytrees_to_global(
+            abstract_pytree,
+            local_pytrees,
+            num_per_process=np.array([2, 3, 1]),
+            global_batch_size=6,
+        )
+        np.testing.assert_equal(global_pytree['a'], [0, 0, 1, 0, 1, 0])
+        np.testing.assert_equal(
+            global_pytree['b'], [[0, 0], [0, 0], [1, 2], [3, 4], [5, 6], [0, 0]]
+        )
+      with mock.patch.object(jax, 'process_index', return_value=2):
+        # Truncating the end.
+        global_pytree = sharding._local_pytrees_to_global(
+            abstract_pytree,
+            local_pytrees,
+            num_per_process=np.array([2, 3, 3]),
+            global_batch_size=6,
+        )
+        np.testing.assert_equal(global_pytree['a'], [0, 0, 0, 0, 0, 1])
+        np.testing.assert_equal(
+            global_pytree['b'], [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [1, 2]]
+        )
 
   def test_multihost_sharded(self):
     batch = [1, 2, 3, 4, 5, 6]

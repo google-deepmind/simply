@@ -113,7 +113,8 @@ class XavierUniformInit(Initializer):
     o_dim = math.prod(
         float(d) for c, d in zip(dim_annotation, shape) if c in 'o'
     )
-    scale = jnp.array(self.scale * jax.lax.rsqrt(i_dim + o_dim), dtype=dtype)
+    sum_dim = jnp.asarray(i_dim + o_dim, dtype=jnp.float32)
+    scale = jnp.array(self.scale * jax.lax.rsqrt(sum_dim), dtype=dtype)
     return (
         jax.random.uniform(
             prng_key, shape, dtype=dtype, minval=-1.0, maxval=1.0
@@ -124,10 +125,10 @@ class XavierUniformInit(Initializer):
 
 @InitializerRegistry.register
 @dataclasses.dataclass(frozen=True)
-class HeNormalInit(Initializer):
-  """Initializes with He normal distribution."""
+class LecunNormalInit(Initializer):
+  """Initializes with Lecun normal distribution."""
 
-  scale: float = math.sqrt(2.0)
+  scale: float = math.sqrt(1.0)
 
   def init(
       self,
@@ -145,8 +146,17 @@ class HeNormalInit(Initializer):
     i_dim = math.prod(
         float(d) for c, d in zip(dim_annotation, shape) if c == 'i'
     )
+    i_dim = jnp.asarray(i_dim, dtype=jnp.float32)
     scale = jnp.array(self.scale * jax.lax.rsqrt(i_dim), dtype=dtype)
     return jax.random.normal(prng_key, shape, dtype=dtype) * scale
+
+
+@InitializerRegistry.register
+@dataclasses.dataclass(frozen=True)
+class HeNormalInit(LecunNormalInit):
+  """Initializes with He normal distribution."""
+
+  scale: float = math.sqrt(2.0)
 
 
 @InitializerRegistry.register

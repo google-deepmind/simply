@@ -15,7 +15,7 @@
 
 import dataclasses
 import functools
-from typing import Any, cast
+from typing import cast
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -35,54 +35,55 @@ from simply.utils import tokenization
 jax.config.update('jax_threefry_partitionable', False)
 
 
-@dataclasses.dataclass(frozen=True)
-class TFMTest(config_lib.TFM1p7BLM1B):
-  # Model config
-  model_dim: int = 16
-  per_head_dim: int = 4
-  n_heads: int = 8
-  n_layers: int = 2
-  expand_factor: int = 4
-  use_scan: bool = True
-  use_flash_attention: bool = False
-  activation_dtype_name: str = 'float32'
-  ffn_expand_dim: int | None = None
-
-  # Data config
-  num_train_steps: int = 2000
-  batch_size: int = 16
-
-  vocab_size: int = 64
-  seq_len: int = 10
-  dataset_name: str = 'simply_det:lm1b'
-  lr_schedule_name: str = 'cosine_decay'
-  lr_schedule_config: tuple[tuple[str, Any], ...] = (
-      ('lr', 1e-3),
-      ('warmup_steps', 10),
-      ('steps_after_decay', 10),
-      ('end_decay', 0.1),
+def lm_test():
+  """Returns a test config for TransformerLM."""
+  config = config_lib.BaseExperimentConfig()
+  config = dataclasses.replace(
+      config,
+      # Model config
+      model_dim=16,
+      per_head_dim=4,
+      n_heads=8,
+      n_layers=2,
+      expand_factor=4,
+      use_scan=True,
+      use_flash_attention=False,
+      activation_dtype_name='float32',
+      ffn_expand_dim=None,
+      # Data config
+      num_train_steps=2000,
+      batch_size=16,
+      vocab_size=64,
+      seq_len=10,
+      dataset_name='simply_det:lm1b',
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-3,
+          warmup_steps=10,
+          steps_after_decay=10,
+          end_decay=0.1,
+      ),
+      clip_grad_norm=1.0,
+      clip_update_norm=1.0,
+      # Checkpoint and tensorboard config
+      ckpt_interval=10,
+      ckpt_max_to_keep=3,
+      tb_log_interval=2,
   )
-  clip_grad_norm: float = 1.0
-  clip_update_norm: float = 1.0
-
-  # Checkpoint and tensorboard config
-  ckpt_interval: int = 10
-  ckpt_max_to_keep: int = 3
-  tb_log_interval: int = 2
+  return dataclasses.replace(config)
 
 
 class ModelLibTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
-    self.config = TFMTest()
+    self.config = lm_test()
     self.tfm_lm = model_lib.TransformerLM(self.config)
 
   def test_forward_pass(self):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
     model = model_lib.TransformerLM(
         config, sharding_config=config_lib.GSPMDSharding()
@@ -203,7 +204,7 @@ class ModelLibTest(parameterized.TestCase):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
     model = model_lib.TransformerLM(
         config, sharding_config=config_lib.GSPMDSharding()
@@ -349,7 +350,7 @@ class ModelLibTest(parameterized.TestCase):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
     model = model_lib.TransformerLM(
         config, sharding_config=config_lib.GSPMDSharding()
@@ -437,7 +438,7 @@ class ModelLibTest(parameterized.TestCase):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
     model = model_lib.TransformerLM(
         config, sharding_config=config_lib.GSPMDSharding()
@@ -496,7 +497,7 @@ class ModelLibTest(parameterized.TestCase):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     new_config = dataclasses.replace(
         config, activation_dtype_name=activation_dtype_name)
     tfm_lm = model_lib.TransformerLM(
@@ -521,7 +522,7 @@ class ModelLibTest(parameterized.TestCase):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
-    config = TFMTest()
+    config = lm_test()
     new_config = dataclasses.replace(
         config, activation_dtype_name=activation_dtype_name)
     tfm_lm = model_lib.TransformerLM(
@@ -1295,7 +1296,8 @@ class ModelLibTest(parameterized.TestCase):
       dict(testcase_name='expand_dim_5', ffn_expand_dim=5),
   )
   def test_expand_dim_in_ffn(self, ffn_expand_dim: int):
-    new_config = TFMTest(ffn_expand_dim=ffn_expand_dim)
+    new_config = dataclasses.replace(
+        lm_test(), ffn_expand_dim=ffn_expand_dim)
     self.tfm_lm = model_lib.TransformerLM(
         new_config, config_lib.GSPMDSharding()
     )

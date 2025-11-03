@@ -20,8 +20,10 @@ import contextlib
 import dataclasses
 import functools
 import os
+import time
 from typing import Any
 
+from absl import logging
 from etils import epath
 import jax
 from jax.experimental import mesh_utils
@@ -186,6 +188,80 @@ def sum_across_hosts(in_tree: common.PyTree) -> common.PyTree:
 def max_across_hosts(in_tree: common.PyTree) -> common.PyTree:
   """Sums data across all hosts."""
   return reduce_across_hosts(in_tree, jnp.max)
+
+
+def _local_pytrees_to_global(
+    abstract_pytree: common.PyTree,
+    local_pytrees: Sequence[common.PyTree],
+    num_per_process: np.ndarray,
+    global_batch_size: int,
+) -> common.PyTree:
+  """See pytree_ragged_stack_allgather."""
+  process_index = jax.process_index()
+  assert len(local_pytrees) == num_per_process[process_index]
+
+  start_indices = np.cumulative_sum(num_per_process, include_initial=True)
+  start = min(global_batch_size, start_indices[process_index])
+  end = min(global_batch_size, start_indices[process_index + 1])
+  logging.info(
+      '[pytree_ragged_stack_allgather] slice is (%s, %s] for process %s',
+      start,
+      end,
+      process_index,
+  )
+
+  if end > start:
+    batched_local_pytree = jax.tree.map(
+        lambda *xs: np.stack(xs), *local_pytrees[: end - start]
+    )
+
+    def pad_to_global(x):
+      pad_widths = [(start, global_batch_size - end)] + [(0, 0)] * (x.ndim - 1)
+      return np.pad(x, pad_widths, constant_values=0)
+
+    return jax.tree.map(pad_to_global, batched_local_pytree)
+  else:
+    return jax.tree.map(
+        lambda x: np.zeros((global_batch_size,) + x.shape, dtype=x.dtype),
+        abstract_pytree,
+    )
+
+
+def pytree_ragged_stack_allgather(
+    abstract_pytree: common.PyTree,
+    local_pytrees: Sequence[common.PyTree],
+    num_per_process: np.ndarray,
+    global_batch_size: int,
+) -> common.PyTree:
+  """Combines pytrees local to each process into a global one by stacking.
+
+  Args:
+    abstract_pytree: Pytree of ShapeDtypeStruct providing the common structure
+      of all pytrees to be combined.
+    local_pytrees: The pytrees available to the current local process.
+    num_per_process: The number of pytrees for each process, needed to
+      coordinate how to combine the local pytrees.
+    global_batch_size: The final batch size of the resulting output. If the
+      total number of pytrees exceeds this amount, later ones will be dropped.
+
+  Returns:
+    A stacked pytree with the same shapes as `abstract_pytree` except
+    with a leading batch dimension.
+  """
+  global_pytree = _local_pytrees_to_global(
+      abstract_pytree, local_pytrees, num_per_process, global_batch_size
+  )
+  time_start = time.time()
+  global_pytree = sum_across_hosts(global_pytree)
+  # Sum may turn some bool into int. Convert it back here.
+  global_pytree = jax.tree.map(
+      lambda x, y: x.astype(y.dtype), global_pytree, abstract_pytree
+  )
+  logging.info(
+      '[pytree_ragged_stack_allgather] sum_across_hosts took %f seconds',
+      time.time() - time_start,
+  )
+  return global_pytree
 
 
 def multihost_sharded(

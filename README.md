@@ -1,5 +1,5 @@
 <!-- mdlint off(LINE_OVER_80) -->
-# Simply: Minimal Code for Frontier LLM Research in JAX 
+# Simply: Minimal Code for Frontier LLM Research in JAX
 
 *Simply* is a minimal and scalable research codebase in JAX, designed for rapid iteration on frontier research in LLM and other autoregressive models.
 
@@ -12,12 +12,12 @@
 
 #### Local test for debug
 ```shell
-EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config TransformerLMTest --experiment_dir /tmp/${EXP} --alsologtostderr
+EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 Or if you want to debug by printing arrays like normal python code, you can disable `jit` and `use_scan` using the command below.
 
 ```shell
-export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config TransformerLMTestNoScan --experiment_dir /tmp/${EXP} --alsologtostderr
+export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 
 ## Dependencies
@@ -75,7 +75,6 @@ If you find *Simply* helpful, please cite the following BibTeX:
 
 Contributors list:
 Alex Zhai, [Xingjian Zhang](https://github.com/xingjian-zhang), [Jiaxi Tang](https://github.com/graytowne), [Lizhang Chen](https://github.com/L-z-Chen)
-
 
 ## License
 

@@ -70,7 +70,7 @@ class ToolOutput:
   metadata: dict[str, Any] | None = None
 
 
-@model_lib.SamplingRegistry.register
+@sampling_lib.SamplingRegistry.register
 @dataclasses.dataclass(frozen=True)
 class SamplingOutputToolUse(SamplingOutput):
   answer_mask: list[bool]

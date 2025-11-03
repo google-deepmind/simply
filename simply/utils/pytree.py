@@ -15,6 +15,7 @@
 
 from collections.abc import Sequence, Set
 import dataclasses
+import enum
 import json
 import re
 from typing import Any, Callable, cast
@@ -256,6 +257,10 @@ def load(jtree: PyTree) -> Any:
         else:
           input_params[k.name] = load(jtree[k.name])
       return module_cls(**input_params)
+    if '__enum__' in jtree:
+      enum_cls = registry.RootRegistry.get(jtree['__enum__'])
+      assert isinstance(enum_cls, enum.EnumType)
+      return enum_cls(jtree['value'])
     if '__numpy_ndarray_dtype__' in jtree:
       dtype = jtree['__numpy_ndarray_dtype__']
       return np.asarray(jtree['data'], dtype=dtype)
@@ -288,6 +293,13 @@ def dump(ptree: Any, only_dump_basic: bool = True) -> PyTree:
     for k in keys:
       v = ptree.__dict__[k]
       res[k] = dump(v, only_dump_basic=only_dump_basic)
+    return res
+  if isinstance(ptree, enum.Enum):
+    res = {}
+    registered_name = getattr(ptree, '__registered_name__')
+    if registered_name:
+      res['__enum__'] = registered_name
+    res['value'] = ptree.value
     return res
   if isinstance(ptree, np.ndarray):
     return dict(data=ptree.tolist(), __numpy_ndarray_dtype__=str(ptree.dtype))

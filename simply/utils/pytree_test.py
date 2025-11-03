@@ -13,6 +13,7 @@
 # limitations under the License.
 from collections.abc import Sequence
 import dataclasses
+import enum
 
 from absl.testing import absltest
 import jax
@@ -39,6 +40,12 @@ class _C:
   a: _A
   b: _B = dataclasses.field(default_factory=_B)
   d: Sequence[_A] = dataclasses.field(default_factory=list)
+
+
+@registry.RootRegistry.register
+class _TestEnum(enum.Enum):
+  VAL1 = 1
+  VAL2 = 2
 
 
 class PyTreeTest(absltest.TestCase):
@@ -235,6 +242,20 @@ class PyTreeTest(absltest.TestCase):
     self.assertLen(loaded['y'], 3)
     np.testing.assert_array_equal(loaded['y'][2], c['y'][2])
     self.assertEqual(loaded['y'][:2], c['y'][:2])
+
+  def test_enum(self):
+    tree = {
+        'a': _TestEnum.VAL1,
+        'b': [_TestEnum.VAL2, 1],
+    }
+    dumped = pytree.dump(tree)
+    expected_dumped = {
+        'a': {'__enum__': '_TestEnum', 'value': 1},
+        'b': [{'__enum__': '_TestEnum', 'value': 2}, 1],
+    }
+    self.assertEqual(dumped, expected_dumped)
+    loaded = pytree.load(dumped)
+    self.assertEqual(loaded, tree)
 
   def test_concatenate_pytrees(self):
     tree1 = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])

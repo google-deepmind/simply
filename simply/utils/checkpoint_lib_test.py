@@ -41,21 +41,23 @@ def load_state(json_file):
 
 class CheckpointFormatTest(absltest.TestCase):
 
-  @dataclasses.dataclass(frozen=True)
-  class TestTransformerConfig(config_lib.TransformerLMTest):
-    model_dim: int = 4
-    expand_factor: int = 2
-    n_heads: int = 2
-    n_layers: int = 2
-    per_head_dim: int = 4
-    vocab_size: int = 2
-    use_per_dim_scale: bool = False
-    output_layer_use_bias: bool = False
+  def lm_test_config(self):
+    return dataclasses.replace(
+        config_lib.lm_test(),
+        model_dim=4,
+        expand_factor=2,
+        n_heads=2,
+        n_layers=2,
+        per_head_dim=4,
+        vocab_size=2,
+        use_per_dim_scale=False,
+        output_layer_use_bias=False,
+    )
 
   def setUp(self):
     super().setUp()
     self.expected_state = load_state('ckpt_expected_format.json')
-    model = model_lib.TransformerLM(self.TestTransformerConfig())
+    model = model_lib.TransformerLM(self.lm_test_config())
     self.expected_abstract_state = model.config.optimizer.init(
         ckpt_lib.get_abstract_params(model)
     )
@@ -148,19 +150,21 @@ class CheckpointFormatTest(absltest.TestCase):
 
 class Qwen2FormatTest(absltest.TestCase):
 
-  @dataclasses.dataclass(frozen=True)
-  class TestQwen2Config(config_lib.DeepSeekQwen1p5BV2):
-    model_dim: int = 4
-    ffn_expand_dim: int = 8
-    n_heads: int = 2
-    n_layers: int = 2
-    per_head_dim: int = 2
-    vocab_size: int = 2
+  def qwen2_test_config(self):
+    return dataclasses.replace(
+        config_lib.deepseek_qwen2_1p5b(),
+        model_dim=4,
+        ffn_expand_dim=8,
+        n_heads=2,
+        n_layers=2,
+        per_head_dim=2,
+        vocab_size=2,
+    )
 
   def setUp(self):
     super().setUp()
     self.expected_state = load_state('ckpt_expected_qwen2_format.json')
-    model = model_lib.TransformerLM(self.TestQwen2Config())
+    model = model_lib.TransformerLM(self.qwen2_test_config())
     self.expected_abstract_state = {
         'params': ckpt_lib.get_abstract_params(model)
     }

@@ -460,17 +460,24 @@ def load_checkpoint_from_path(
       state = ckpt_format.transforms(stored_state, target_abstract_state)
 
       def _get_regularized_value(
-          path: jax.tree_util.KeyPath, abstract: jax.ShapeDtypeStruct
+          path: jax.tree_util.KeyPath,
+          abstract: jax.ShapeDtypeStruct | jax.Array,
       ):
-        value = pytree.tree_value(state, path)
-        if value.shape != abstract.shape:
-          raise ValueError(
-              f'Shape mismatch for {path}: restored is {value.shape} while '
-              f'target is {abstract.shape}'
+        try:
+          value = pytree.tree_value(state, path)
+          if value.shape != abstract.shape:
+            raise ValueError(
+                f'Shape mismatch for {path}: restored is {value.shape} while '
+                f'target is {abstract.shape}'
+            )
+          return sharding_lib.with_sharding_constraint(
+              jnp.astype(value, abstract.dtype), abstract.sharding
           )
-        return sharding_lib.with_sharding_constraint(
-            jnp.astype(value, abstract.dtype), abstract.sharding
-        )
+        except KeyError as e:
+          logging.warning(
+              'Value at %s is not loaded from checkpoint: %s', path, e
+          )
+          return abstract
 
       state = jax.tree_util.tree_map_with_path(
           _get_regularized_value, target_abstract_state
@@ -481,9 +488,12 @@ def load_checkpoint_from_path(
         transform_state_fn, restore_item
     )
     for unused_argpath in unused_argpaths:
-      pytree.set_tree_value(restore_item, unused_argpath, None)
+      pytree.set_tree_value(restore_item, unused_argpath, ocp.PLACEHOLDER)
 
-    pytree_restore = ocp.args.PyTreeRestore(restore_item)
+    pytree_restore = ocp.args.PyTreeRestore(
+        restore_item,
+        restore_args=ocp.checkpoint_utils.construct_restore_args(restore_item),
+    )
 
     if state_key:
       pytree_restore = ocp.args.Composite(**{state_key: pytree_restore})
@@ -495,6 +505,10 @@ def load_checkpoint_from_path(
       time.time() - start_time,
   )
   state = restored[state_key] if state_key else restored
+
+  for unused_argpath in unused_argpaths:
+    # Turn PLACEHOLDER to None to avoid feeding into jitted function.
+    pytree.set_tree_value(state, unused_argpath, None)
 
   state = jax.jit(transform_state_fn, donate_argnums=0)(state)
 

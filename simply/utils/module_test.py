@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
+import jax.numpy as jnp
 from simply.utils import initializer
 from simply.utils import module
 from simply.utils import pytree
@@ -231,6 +233,51 @@ class EinsumLinearTest(absltest.TestCase):
     params = layer.init(pk)
     output = layer.apply(params, jax.random.uniform(xk, (2, 1, 3, 3)))
     self.assertEqual(output.shape, (2, 1, 3, 3))
+
+
+class EmbeddingLinearTest(parameterized.TestCase):
+
+  def test_embedding_linear_tied_embedding(self):
+    embedding_linear = module.EmbeddingLinear(
+        vocab_size=10, dim=4, use_tied_embedding=True
+    )
+    prng_key = jax.random.PRNGKey(0)
+    params = embedding_linear.init(prng_key)
+    self.assertIn('w', params)
+    self.assertNotIn('embed', params)
+    self.assertEqual(params['w'].shape, (10, 4))
+
+  def test_embedding_linear_untied_embedding(self):
+    embedding_linear = module.EmbeddingLinear(
+        vocab_size=10, dim=4, use_tied_embedding=False
+    )
+    prng_key = jax.random.PRNGKey(0)
+    params = embedding_linear.init(prng_key)
+    self.assertIn('w', params)
+    self.assertIn('embed', params)
+    self.assertEqual(params['w'].shape, (10, 4))
+    self.assertEqual(params['embed'].shape, (10, 4))
+
+  @parameterized.parameters(True, False)
+  def test_embedding_linear_embed(self, use_lookup):
+    embedding_linear = module.EmbeddingLinear(
+        vocab_size=10, dim=4, use_lookup=use_lookup, use_tied_embedding=False
+    )
+    prng_key = jax.random.PRNGKey(0)
+    params = embedding_linear.init(prng_key)
+    inputs = jnp.array([[0, 1], [2, 3]])
+    outputs = embedding_linear.embed(params, inputs)
+    self.assertEqual(outputs.shape, (2, 2, 4))
+
+  def test_embedding_linear_apply(self):
+    embedding_linear = module.EmbeddingLinear(
+        vocab_size=10, dim=4, use_tied_embedding=True
+    )
+    prng_key = jax.random.PRNGKey(0)
+    params = embedding_linear.init(prng_key)
+    inputs = jnp.zeros((2, 2, 4))
+    outputs = embedding_linear.apply(params, inputs)
+    self.assertEqual(outputs.shape, (2, 2, 10))
 
 
 if __name__ == '__main__':

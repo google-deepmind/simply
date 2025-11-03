@@ -18,16 +18,18 @@ import dataclasses
 import functools
 import json
 import os
-import random
-from typing import Any, Callable, ClassVar, Mapping, MutableMapping, Optional, Protocol, Union
+from typing import Callable, ClassVar, Mapping, MutableMapping, Optional, Protocol, Union
 
 import einops
 from etils import epath
+import grain.python as grain
 import jax
 import jax.numpy as jnp
 import numpy as np
 import seqio
+from simply.utils import common
 from simply.utils import registry
+from simply.utils import seqio_wrapper
 from simply.utils import tokenization
 import t5.data.preprocessors
 import tensorflow as tf
@@ -640,241 +642,86 @@ class GPQADiamondJSON(SimpleDataSource):
     return new_examples[self.example_start_index:self.example_end_index]
 
 
-class Dataloader:
-  """Dataloader."""
-
-  def __iter__(self):
-    ...
-
-
-class SimpleDataloader(Dataloader):
-  """Simple dataloader."""
-
-  def __init__(
-      self, datasource: SimpleDataSource, batch_size: int, shuffle: bool = True,
-      num_epochs: int | None = None, seed: int | None = None,
-      num_past_examples: int = 0,
-      drop_remainder: bool = True):
-    assert batch_size > 0
-    self.datasource = datasource
-    self.batch_size = batch_size
-    self.shuffle = shuffle
-    self.seed = seed
-    self.num_past_examples = num_past_examples
-    self.num_epochs = num_epochs
-    self.drop_remainder = drop_remainder
-    self._start_new_epoch()
-
-  @property
-  def _cursor(self):
-    return self.num_past_examples % len(self.datasource)
-
-  @property
-  def current_epoch(self):
-    return self.num_past_examples // len(self.datasource)
-
-  def get_state(self) -> Mapping[str, Any]:
-    return dict(num_past_examples=self.num_past_examples)
-
-  def set_state(self, state: Mapping[str, Any]) -> None:
-    self.num_past_examples = state['num_past_examples']
-    self._start_new_epoch()
-
-  def _start_new_epoch(self):
-    self.indices = list(range(len(self.datasource)))
-    if self.shuffle:
-      # Hacky way to create a deterministic shuffle for each epoch that is also
-      # quick to recover from `num_past_examples`.
-      rng = random.Random(self.seed + self.current_epoch)
-      rng.shuffle(self.indices)
-
-  def __iter__(self):
-    while self.num_epochs is None or self.current_epoch < self.num_epochs:
-      batch = []
-      # Stop if the remaining examples in the current epoch are less than the
-      # batch size when `drop_remainder` is True, otherwise the batch will be
-      # filled with some examples coming from the next epoch.
-      if (self.num_epochs and
-          (self.num_past_examples + self.batch_size >
-           len(self.datasource) * self.num_epochs) and
-          self.drop_remainder):
-        break
-      for _ in range(self.batch_size):
-        batch.append(self.datasource[self.indices[self._cursor]])
-        self.num_past_examples += 1
-        if self._cursor == 0: self._start_new_epoch()
-      yield batch
-
-  def repeat(self, num_repeat=1):
-    if self.num_epochs is None:
-      num_epochs = None
-    else:
-      num_epochs = self.num_epochs * num_repeat
-    return SimpleDataloader(
-        datasource=self.datasource, batch_size=self.batch_size,
-        shuffle=self.shuffle, num_epochs=num_epochs, seed=self.seed,
-        num_past_examples=self.num_past_examples,
-        drop_remainder=self.drop_remainder)
-
-
 def create_simple_dataset(
     name: str, batch_size: int, seed: int, shuffle: bool, num_epochs: int | None
-):
+) -> grain.IterDataset[common.PyTree]:
   datasource = DataSourceRegistry.get_instance(name)
   data = datasource.load()
-  dataset = SimpleDataloader(
-      datasource=data,
-      batch_size=batch_size,
-      shuffle=shuffle,
-      num_epochs=num_epochs,
-      seed=seed,
-      drop_remainder=False,
+  dataset = grain.MapDataset.source(data)
+  if shuffle:
+    dataset = dataset.shuffle(seed=seed)
+  return (
+      dataset.repeat(num_epochs)
+      .batch(batch_size, batch_fn=lambda x: x)
+      .to_iter_dataset()
   )
-  return dataset
 
 
-class Dataset:
-  """A wrapper of tf.data.Dataset to add processors with numpy and jax."""
-
-  def __init__(
-      self, tf_dataset: tf.data.Dataset,
-      processors: Optional[list[Processor]] = None):
-    self._tf_dataset = tf_dataset
-    if processors is None:
-      processors = []
-    self._processors = processors
-
-  def add_processor(self, processor: Processor):
-    self._processors.append(processor)
-    return self._processors
-
-  def repeat(self, num_repeat):
-    return self.copy(tf_dataset=self._tf_dataset.repeat(num_repeat))
-
-  def copy(self, tf_dataset: Optional[tf.data.Dataset] = None,
-           processors: Optional[list[Processor]] = None):
-    if tf_dataset is None:
-      tf_dataset = self._tf_dataset
-    if processors is None:
-      processors = self._processors
-    return Dataset(tf_dataset, processors)
-
-  def __iter__(self):
-    def generator():
-      for batch in self._tf_dataset.as_numpy_iterator():
-        for processor in self._processors:
-          batch = processor(batch)
-        yield batch
-    return generator()
-
-
-def get_local_batch_size(batch_size: int):
-  if batch_size % jax.device_count() == 0:
-    local_batch_size = batch_size // jax.process_count()
-  else:
-    raise ValueError(f'Batch size {batch_size} must be divisible'
-                     f' by total number of cores {jax.device_count()}.')
-  return local_batch_size
-
-
-def create_dataset_split(
-    config, num_past_examples: int = 0, training: bool = True
-):
-  if config.feature_converter_name == 'LMFeatureConverter':
-    task_feature_lengths = {'targets': config.seq_len}
-    feature_converter_kwargs = {
-        'pack': config.use_packing
-    }
-    if hasattr(config, 'bos_id'):
-      feature_converter_kwargs['bos_id'] = config.bos_id
-    feature_converter = seqio.LMFeatureConverter(**feature_converter_kwargs)
-  elif config.feature_converter_name == 'PrefixLMFeatureConverter':
-    task_feature_lengths = {
-        'inputs': config.seq_len // 2, 'targets': config.seq_len // 2}
-    feature_converter = seqio.PrefixLMFeatureConverter(
-        pack=config.use_packing,
-    )
-  else:
-    raise ValueError(
-        f'Unsupported feature converter type: {config.feature_converter_name}'
-    )
+def create_iter_dataset(
+    config, training: bool = True
+) -> grain.IterDataset[common.PyTree]:
   dataset_name = config.dataset_name
-  if not training and config.validation_dataset_name:
-    dataset_name = config.validation_dataset_name
-  if ':' in dataset_name:
-    dataset_spec, dataset_name = dataset_name.split(':', maxsplit=1)
-  else:
-    dataset_spec = ''
-
   batch_size = config.batch_size
-  if not training and config.validation_eval_batch_size > 0:
-    batch_size = config.validation_eval_batch_size
 
-  num_epochs = None
-  if not training:
+  if training:
+    split = 'train'
+    shuffle = True
+    num_epochs = None
+  else:
+    split = 'validation'
+    if config.validation_dataset_name:
+      dataset_name = config.validation_dataset_name
+    if config.validation_eval_batch_size > 0:
+      batch_size = config.validation_eval_batch_size
+    shuffle = False
     num_epochs = config.validation_eval_epochs
 
-  if dataset_spec == 'simply_json':
+  if dataset_name.startswith('simply_json:'):
     return create_simple_dataset(
-        name=f'{dataset_spec}:{dataset_name}',
+        dataset_name, batch_size, config.dataset_seed, shuffle, num_epochs
+    )
+
+  if dataset_name.startswith('simply_det:'):
+    seqio_config = seqio_wrapper.SeqIOConfig(
+        dataset_name=dataset_name,
+        feature_converter_name=config.feature_converter_name,
         batch_size=batch_size,
-        seed=config.dataset_seed,
-        shuffle=training,
+        seq_len=config.seq_len,
+        split=split,
+        use_packing=config.use_packing,
+        bos_id=getattr(config, 'bos_id', 0),
+        use_cached=True,
+        shuffle=False,
+        num_epochs=1,
+        seed=None,
+    )
+  else:
+    seqio_config = seqio_wrapper.SeqIOConfig(
+        dataset_name=dataset_name,
+        feature_converter_name=config.feature_converter_name,
+        batch_size=batch_size,
+        seq_len=config.seq_len,
+        split=split,
+        use_packing=False,
+        bos_id=getattr(config, 'bos_id', 0),
+        use_cached=False,
+        shuffle=shuffle,
         num_epochs=num_epochs,
+        seed=config.dataset_seed,
     )
-
-  # TFDS datasets.
-  dataset = seqio.get_dataset(
-      f'{dataset_name}',
-      task_feature_lengths=task_feature_lengths,
-      dataset_split='train' if training else 'validation',
-      shuffle=not training,
-      num_epochs=num_epochs,
-      use_cached=False,
-      seed=config.dataset_seed,
-      batch_size=batch_size,
-      feature_converter=feature_converter,
+  return seqio_wrapper.SeqIODataset(seqio_config).mp_prefetch(
+      grain.MultiprocessingOptions(
+          num_workers=config.prefetch_num_workers,
+          per_worker_buffer_size=config.prefetch_per_worker_buffer_size,
+      )
   )
-  return Dataset(dataset, [select_local_batch])
-
-
-def create_dataset(config, num_past_examples: int = 0):
-  train_set = create_dataset_split(config, num_past_examples, training=True)
-  validation_set = None
-  if config.use_validation_set:
-    validation_set = create_dataset_split(
-        config, num_past_examples, training=False
-    )
-  return train_set, validation_set
-
-
-def select_local_batch(batch: Batch) -> Batch:
-  """Selects the batch for the given process."""
-  select_local_array_fn = functools.partial(
-      select_local_array,
-      process_index=jax.process_index(),
-      num_processes=jax.process_count())
-  new_batch = jax.tree_util.tree_map(select_local_array_fn, batch)
-  return new_batch
-
-
-def select_local_array(
-    array: np.ndarray,
-    process_index: int,
-    num_processes: int) -> np.ndarray:
-  """Selects the batch for the given process."""
-  batch_size = array.shape[0]
-  assert batch_size % num_processes == 0
-  local_batch_size = batch_size // num_processes
-  start_index = process_index * local_batch_size
-  end_index = start_index + local_batch_size
-  return array[start_index:end_index]
 
 
 def create_chat_loss_mask(token_ids, mask_start_id, mask_end_id):
   def f(carry, a):
     new_carry = jnp.where(
-        a == mask_end_id, -2, jnp.where(a == mask_start_id, -1, carry))
+        a == mask_end_id, -2, jnp.where(a == mask_start_id, -1, carry)
+    )
     return new_carry, carry
 
   token_ids = einops.rearrange(token_ids, 'b t -> t b')

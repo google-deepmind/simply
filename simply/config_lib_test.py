@@ -24,7 +24,7 @@ class ConfigLibTest(absltest.TestCase):
 
   def test_dump_load_baseline_config(self):
     config = config_lib.ExperimentConfigRegistry.get_config(
-        'TransformerLMTest'
+        'lm_test'
     )
     sharding_config = config_lib.ShardingConfigRegistry.get_config(
         'GSPMDSharding'

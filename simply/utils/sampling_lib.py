@@ -2,6 +2,7 @@
 
 import dataclasses
 import enum
+import functools
 from typing import ClassVar, Mapping, Protocol, Sequence
 
 import einops
@@ -9,6 +10,12 @@ import jax
 import numpy as np
 from simply.utils import common
 from simply.utils import registry
+
+
+class SamplingRegistry(registry.RootRegistry):
+  """Registry for Sampling related data structures."""
+
+  namespace: ClassVar[str] = 'Sampling'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -217,10 +224,12 @@ class ProcessedInputBatch:
     )
 
 
-@dataclasses.dataclass
+@SamplingRegistry.register
+@dataclasses.dataclass(frozen=True)
 class Chunk:
 
-  class Type(enum.Enum):
+  @functools.partial(SamplingRegistry.register, name='Chunk.Type')
+  class Type(enum.StrEnum):
     TEXT = 'text'
     ARRAY = 'array'
 
@@ -236,7 +245,7 @@ ChunkSequence = Sequence[Chunk]
 SamplingInput = str | ChunkSequence
 
 
-def input_as_chunks(sampling_input: SamplingInput):
+def input_as_chunks(sampling_input: SamplingInput) -> ChunkSequence:
   if isinstance(sampling_input, str):
     return [Chunk(type=Chunk.Type.TEXT, content=sampling_input)]
   return sampling_input
