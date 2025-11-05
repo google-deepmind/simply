@@ -26,32 +26,38 @@ class DummyClassRegistry(registry.RootRegistry):
 class RegistryTest(absltest.TestCase):
 
   def test_dummy_registry(self):
-    registry.RootRegistry.reset()
-    @registry.FunctionRegistry.register
-    def _dummy_fn():
-      return 'hello'
+    # Save the current registry state
+    saved_registry = registry.RootRegistry.registry.copy()
+    try:
+      registry.RootRegistry.reset()
+      @registry.FunctionRegistry.register
+      def _dummy_fn():
+        return 'hello'
 
-    @DummyClassRegistry.register
-    class _DummyClass:
-      pass
+      @DummyClassRegistry.register
+      class _DummyClass:
+        pass
 
-    self.assertEqual(
-        DummyClassRegistry.get('_DummyClass').__name__,
-        '_DummyClass',
-    )
-    self.assertEqual(
-        registry.FunctionRegistry.get('_dummy_fn')(), _dummy_fn()
-    )
-    self.assertSetEqual(
-        set(registry.RootRegistry.registry.keys()),
-        set(['Dummy:_DummyClass', 'Function:_dummy_fn']),
-    )
-    self.assertEqual(
-        getattr(_DummyClass, '__registered_name__'), 'Dummy:_DummyClass'
-    )
-    self.assertEqual(
-        getattr(_dummy_fn, '__registered_name__'), 'Function:_dummy_fn'
-    )
+      self.assertEqual(
+          DummyClassRegistry.get('_DummyClass').__name__,
+          '_DummyClass',
+      )
+      self.assertEqual(
+          registry.FunctionRegistry.get('_dummy_fn')(), _dummy_fn()
+      )
+      self.assertSetEqual(
+          set(registry.RootRegistry.registry.keys()),
+          set(['Dummy:_DummyClass', 'Function:_dummy_fn']),
+      )
+      self.assertEqual(
+          getattr(_DummyClass, '__registered_name__'), 'Dummy:_DummyClass'
+      )
+      self.assertEqual(
+          getattr(_dummy_fn, '__registered_name__'), 'Function:_dummy_fn'
+      )
+    finally:
+      # Restore the original registry state
+      registry.RootRegistry.registry = saved_registry
 
 
 if __name__ == '__main__':

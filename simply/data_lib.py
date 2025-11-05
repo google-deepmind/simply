@@ -214,7 +214,7 @@ add_pile_tasks()
 # Add redpajama_1t datasets.
 def add_redpajama_1t_task():
   for cat in ['arxiv', 'wikipedia', 'book', 'stackexchange']:
-    path = os.path.join(DATASETS_DIR, 'redpajama_1t/tfrecord/{cat}.tfrecord*')
+    path = os.path.join(DATASETS_DIR, f'redpajama_1t/tfrecord/{cat}.tfrecord*')
     source = seqio.TFExampleDataSource(
         split_to_filepattern={'train': path},
         feature_description={

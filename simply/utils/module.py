@@ -16,6 +16,7 @@
 import abc
 from collections.abc import Sequence
 import dataclasses
+import math
 from typing import Any, cast, ClassVar, final
 import einops
 import jax
@@ -351,8 +352,8 @@ class EmbeddingLinear(SimplyModule):
   Attributes:
     vocab_size: Vocabulary size.
     dim: Embedding dimension.
-    embedding_scale: scalar rescaling factor for embeddings. Embeddings are
-      scaled by `sqrt(dim) * embedding_scale` after lookup.
+    embedding_scale_by_sqrt_dim: scalar rescaling factor for embeddings.
+      Embeddings are scaled by `sqrt(dim) * embedding_scale` after lookup.
     use_lookup: Whether to use table lookup for embedding. If False, use
       one-hot encoding and einsum.
     weight_init: Initializer for weight tensor of linear layer.
@@ -376,7 +377,7 @@ class EmbeddingLinear(SimplyModule):
   vocab_size: int
   dim: int
   use_lookup: bool = True
-  embedding_scale: float = 1.0
+  embedding_scale_by_sqrt_dim: float | None = 1.0  # If None, no scaling.
   weight_init: initializer.Initializer = initializer.LecunNormalInit()
   use_bias: bool = True
   # Only used when `use_bias` is True.
@@ -453,8 +454,12 @@ class EmbeddingLinear(SimplyModule):
     # (scale=1/sqrt(dim)), so the output is scaled by
     # sqrt(dim) * embedding_scale to have variance of
     # embedding_scale (default to 1.0).
+    if not self.embedding_scale_by_sqrt_dim:
+      return output
     scaling_factor = jnp.asarray(
-        jnp.sqrt(self.dim) * self.embedding_scale, self.activation_dtype)
+        math.sqrt(self.dim) * self.embedding_scale_by_sqrt_dim,
+        self.activation_dtype,
+    )
     return output * scaling_factor
 
   def apply(self, params: PyTree, x: Array) -> Array:

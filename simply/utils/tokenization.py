@@ -13,7 +13,8 @@
 # limitations under the License.
 """Tokenizers."""
 
-from typing import ClassVar, Generic, Protocol
+import functools
+from typing import Any, ClassVar, Generic, Protocol
 
 import seqio
 
@@ -78,6 +79,11 @@ class HuggingFaceVocab(SimplyVocab[str]):
   """Generic class for HuggingFace vocab."""
 
   def __init__(self, vocab_path: str):
+    self.vocab_path = vocab_path
+
+  @functools.cached_property
+  def tokenizer(self) -> Any:
+    # TODO: Test if we can use tokenizers lib instead of transformers.
     try:
       import transformers  # pylint: disable=g-import-not-at-top # pytype: disable=import-error
     except ImportError as exc:
@@ -86,10 +92,19 @@ class HuggingFaceVocab(SimplyVocab[str]):
           ' is not included. Please include transformers library and try'
           ' again.'
       ) from exc
-    self.tokenizer = transformers.AutoTokenizer.from_pretrained(vocab_path)
-    self.pad_id = self.tokenizer.pad_token_id
-    self.bos_id = self.tokenizer.bos_token_id
-    self.eos_id = self.tokenizer.eos_token_id
+    return transformers.AutoTokenizer.from_pretrained(self.vocab_path)
+
+  @property
+  def bos_id(self) -> int:
+    return self.tokenizer.bos_token_id
+
+  @property
+  def eos_id(self) -> int:
+    return self.tokenizer.eos_token_id
+
+  @property
+  def pad_id(self) -> int:
+    return self.tokenizer.pad_token_id
 
   def encode(self, text: str) -> list[int]:
     return self.tokenizer.encode(text, add_special_tokens=False)

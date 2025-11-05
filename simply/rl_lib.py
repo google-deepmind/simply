@@ -998,7 +998,7 @@ def run_experiment(
           break
 
         sampling_inputs: list[RewardedSample] = []
-        for i, example in enumerate(next(train_iter)):
+        for example in next(train_iter):
           sampling_inputs.append(
               RewardedSample(
                   raw_example=example,
@@ -1247,6 +1247,9 @@ def run_experiment(
             assert eval_iter is not None
             eval_iter.set_state(eval_iter_init_state)
             eval_steps = 0
+            eval_batch_size = (
+                config.validation_eval_batch_size or config.batch_size
+            )
             for eval_batch in eval_iter:
               if (
                   config.validation_num_eval_steps > 0
@@ -1288,6 +1291,7 @@ def run_experiment(
                     params=decoding_params,
                     sampling_params=eval_sampling_params,
                     prefill_size=config.sampling_prefill_size,
+                    batch_size=eval_batch_size,
                 )
               for example, eval_so in zip(
                   eval_batch, eval_sampling_outputs, strict=True

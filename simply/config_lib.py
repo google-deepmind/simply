@@ -40,12 +40,12 @@ GEMMA2_2B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-2B-IT-ORBAX')
 GEMMA2_9B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-9B-IT-ORBAX')
 GEMMA2_27B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-2.0-27B-IT-ORBAX')
 
-GEMMA3_270M_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA3_270M_PT_ORBAX')
+GEMMA3_270M_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-270M-PT-ORBAX')
 GEMMA3_1B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-1B-PT-ORBAX')
 GEMMA3_4B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-4B-PT-ORBAX')
 GEMMA3_12B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-12B-PT-ORBAX')
 GEMMA3_27B_PT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-27B-PT-ORBAX')
-GEMMA3_270M_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA3_270M_IT_ORBAX')
+GEMMA3_270M_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-270M-IT-ORBAX')
 GEMMA3_1B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-1B-IT-ORBAX')
 GEMMA3_4B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-4B-IT-ORBAX')
 GEMMA3_12B_IT_CKPT_DIR = os.path.join(MODELS_DIR, 'GEMMA-3.0-12B-IT-ORBAX')
@@ -286,7 +286,7 @@ class BaseExperimentConfig(ExperimentConfig):
   # pygrain's multi-processing prefetching, this is the number of processes.
   # Set to 0 to disable multi-processing. Note that changing
   # prefetch_num_workers will change the order of the data loading.
-  prefetch_num_workers: int = 16
+  prefetch_num_workers: int = 8
   prefetch_per_worker_buffer_size: int = 2
 
   # Training config
@@ -585,9 +585,9 @@ def flops2e16_tfm15m_c4_l2048():
       model_dim=128,  # 2048 // 16
       per_head_dim=16,  # 256 // 16
       n_layers=4,  # 18 => 4
-      # 14.066880 * 16 / 2048 / 64 = 1717 steps
+      # 14.857408 * 15.15 / 2048 / 64 = 1717 steps
       batch_size=64,
-      num_train_steps=1717,  # TODO: update the number of steps.
+      num_train_steps=1717,
       weight_decay=0.1,
       lr=opt_lib.LinearWarmupCosineDecay(
           value=0.01,

@@ -74,7 +74,7 @@ If you find *Simply* helpful, please cite the following BibTeX:
 ```
 
 Contributors list:
-Alex Zhai, [Xingjian Zhang](https://github.com/xingjian-zhang), [Jiaxi Tang](https://github.com/graytowne), [Lizhang Chen](https://github.com/L-z-Chen)
+Alex Zhai, [Xingjian Zhang](https://github.com/xingjian-zhang), [Jiaxi Tang](https://github.com/graytowne), [Lizhang Chen](https://github.com/L-z-Chen), [Ran Tian](https://github.com/tianran)
 
 ## License
 
