@@ -29,6 +29,7 @@ from simply.utils import common
 from simply.utils import masked
 from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
+from simply.utils import registry
 from simply.utils import tokenization
 
 
@@ -95,108 +96,36 @@ class ModelLibTest(parameterized.TestCase):
     )
     logits, _ = model.apply(params, batch)
     logits = np.array(logits)
+    print(f'config: {config}')
+    print(f'params: {params}')
+    # Ensure same behavior as the previous version
+    # with `use_combined_qkv=False`.
     expected_logits = [
         [
-            [
-                2.7519984245300293,
-                -0.2155388593673706,
-                -0.21683339774608612,
-                1.0551955699920654,
-            ],
-            [
-                2.75199818611145,
-                -0.2155388742685318,
-                -0.2168334424495697,
-                1.0551949739456177,
-            ],
-            [
-                2.75199818611145,
-                -0.21553881466388702,
-                -0.21683336794376373,
-                1.0551953315734863,
-            ],
-            [
-                2.751997947692871,
-                -0.21553891897201538,
-                -0.21683350205421448,
-                1.0551954507827759,
-            ],
-            [
-                0.06351777166128159,
-                1.5503135919570923,
-                -1.1891260147094727,
-                0.8147411346435547,
-            ],
-            [
-                0.5395821928977966,
-                0.028114307671785355,
-                0.3171342611312866,
-                2.6201274394989014,
-            ],
-            [
-                -0.7307804822921753,
-                1.5626051425933838,
-                -1.6585614681243896,
-                0.4315919876098633,
-            ],
-            [
-                -0.4943885803222656,
-                -1.399471402168274,
-                1.7614712715148926,
-                1.8116846084594727,
-            ],
+            [2.3079278, 0.1556056, -1.5357848, 0.41470128],
+            [2.307928, 0.15560551, -1.5357848, 0.41470116],
+            [2.3079278, 0.15560555, -1.5357842, 0.41470134],
+            [2.3079276, 0.15560544, -1.5357848, 0.41470134],
+            [0.47243598, 0.7662277, -1.5105368, -0.16814126],
+            [0.5188375, -1.5030693, -2.1286428, 0.19518685],
+            [0.35362136, 0.6417981, -1.5894638, -0.29224548],
+            [0.8483894, 0.42836407, 0.18231091, 0.42470744]
         ],
         [
-            [
-                0.5078861713409424,
-                -1.2493711709976196,
-                2.3632442951202393,
-                1.254542350769043,
-            ],
-            [
-                0.5078865885734558,
-                -1.2493711709976196,
-                2.363243818283081,
-                1.2545422315597534,
-            ],
-            [
-                2.8932785987854004,
-                -0.7085745334625244,
-                0.521935760974884,
-                1.2472620010375977,
-            ],
-            [
-                0.6895977258682251,
-                -0.4795836806297302,
-                0.8725722432136536,
-                2.448836088180542,
-            ],
-            [
-                2.8496932983398438,
-                -0.8699660897254944,
-                0.2777295410633087,
-                1.549817681312561,
-            ],
-            [
-                2.7562153339385986,
-                -0.6204763054847717,
-                -0.2111501842737198,
-                1.4128155708312988,
-            ],
-            [
-                1.1002166271209717,
-                0.8060446381568909,
-                -0.527627170085907,
-                1.3561891317367554,
-            ],
-            [
-                0.6698483228683472,
-                -1.1773743629455566,
-                1.478686809539795,
-                2.4011504650115967,
-            ],
-        ],
+            [-0.89131826, -0.3329473, 0.5497832, -0.16565481],
+            [-0.8913184, -0.33294758, 0.5497832, -0.1656549],
+            [0.5598074, 0.40017155, -1.3329586, -0.5925414],
+            [-1.2523335, -2.1327658, -0.42040733, 0.64368564],
+            [1.018697, -0.5962016, -1.3819861, -0.28444785],
+            [1.18975, -0.5388045, -1.4259155, -0.28062773],
+            [-0.23136477, 1.4716903, -0.66726977, -0.95534205],
+            [0.0925856, -0.13153964, 0.85055715, -0.10545513]
+        ]
     ]
+    print(
+        f'logits-np.array(expected_logits): {logits-np.array(expected_logits)}')
+    print(f'logits: {logits}')
+    print(f'expected_logits: {expected_logits}')
     self.assertTrue(
         np.allclose(np.array(expected_logits), logits, atol=1e-5))
 
@@ -243,108 +172,27 @@ class ModelLibTest(parameterized.TestCase):
     logits = np.array(logits)
     expected_logits = [
         [
-            [
-                2.694333076477051,
-                -0.2943641245365143,
-                -0.1179223582148552,
-                1.0545716285705566,
-            ],
-            [
-                2.694333076477051,
-                -0.29436421394348145,
-                -0.11792253702878952,
-                1.054571509361267,
-            ],
-            [
-                2.694333076477051,
-                -0.29436415433883667,
-                -0.11792244017124176,
-                1.054571509361267,
-            ],
-            [
-                2.694333076477051,
-                -0.29436418414115906,
-                -0.11792242527008057,
-                1.0545717477798462,
-            ],
-            [
-                0.4579642713069916,
-                1.3849267959594727,
-                -1.1025311946868896,
-                0.6992211937904358,
-            ],
-            [
-                0.6853991150856018,
-                -0.047158315777778625,
-                0.3695349097251892,
-                2.5992767810821533,
-            ],
-            [
-                -0.3630373477935791,
-                1.4172710180282593,
-                -1.5797486305236816,
-                0.313672810792923,
-            ],
-            [
-                -0.39001917839050293,
-                -1.4826804399490356,
-                1.8424708843231201,
-                1.7501987218856812,
-            ],
+            [2.2992256, 0.12030537, -1.4335514, 0.4669848],
+            [2.2992253, 0.12030543, -1.4335512, 0.46698487],
+            [2.2992256, 0.12030561, -1.4335513, 0.46698487],
+            [2.2992246, 0.12030512, -1.4335514, 0.46698463],
+            [0.5527477, 0.7296491, -1.3306446, -0.20080139],
+            [0.5500062, -1.5798444, -2.0209923, 0.16794905],
+            [0.39745516, 0.63439167, -1.4578781, -0.32599187],
+            [0.7003035, 0.3446952, 0.46150324, 0.44432324]
         ],
         [
-            [
-                0.4981890916824341,
-                -1.2542948722839355,
-                2.372939109802246,
-                1.250625729560852,
-            ],
-            [
-                0.49818921089172363,
-                -1.254294753074646,
-                2.372939109802246,
-                1.250625729560852,
-            ],
-            [
-                2.869960069656372,
-                -0.7210258841514587,
-                0.5573416948318481,
-                1.2652201652526855,
-            ],
-            [
-                0.7159809470176697,
-                -0.5081028938293457,
-                0.9096092581748962,
-                2.4309475421905518,
-            ],
-            [
-                2.833054304122925,
-                -0.8901601433753967,
-                0.32386356592178345,
-                1.5564500093460083,
-            ],
-            [
-                2.7338998317718506,
-                -0.6527514457702637,
-                -0.14567126333713531,
-                1.418534278869629,
-            ],
-            [
-                1.1498193740844727,
-                0.779076099395752,
-                -0.47674769163131714,
-                1.340635061264038,
-            ],
-            [
-                0.7024662494659424,
-                -1.1868096590042114,
-                1.5199283361434937,
-                2.3696625232696533,
-            ],
-        ],
+            [-0.8991864, -0.3413272, 0.5727337, -0.18962501],
+            [-0.8991866, -0.34132737, 0.57273364, -0.18962495],
+            [0.5205872, 0.37674674, -1.2782695, -0.5897207],
+            [-1.2450306, -2.1522186, -0.40919983, 0.620265],
+            [0.9932629, -0.6255955, -1.2935325, -0.2830235],
+            [1.1882919, -0.5988288, -1.340022, -0.2543603],
+            [-0.24534938, 1.4544814, -0.6483614, -0.99232906],
+            [-0.00745952, -0.23477697, 0.95938516, -0.10769912]
+        ]
     ]
-    self.assertTrue(
-        np.allclose(np.array(expected_logits), logits, atol=1e-5))
+    self.assertTrue(np.allclose(np.array(expected_logits), logits, atol=1e-5))
 
   def test_grad_accumulation(self):
     # Generate test data
@@ -445,18 +293,24 @@ class ModelLibTest(parameterized.TestCase):
     )
     params = model.init(prng_key)
     dim_annotations = jax.tree.map(
-        lambda x: x.metadata['dim_annotation'], params,
-        is_leaf=lambda x: isinstance(x, common.AnnotatedArray))
+        lambda x: x.metadata['dim_annotation'],
+        params,
+        is_leaf=lambda x: isinstance(x, common.AnnotatedArray),
+    )
     expected_dim_annotations = {
         'block_0': {
             'attn': {
-                'o_proj': 'oii',
+                'k_proj': {'w': 'ioo'},
+                'o_proj': {'w': 'oii'},
                 'per_dim_scale': {'scale': 'h'},
-                'qkv_proj': '.ioo',
+                'q_proj': {'w': 'ioo'},
+                'v_proj': {'w': 'ioo'},
             },
-            'ffn_0': {'b': 'h', 'w': 'io'},
-            'ffn_0_gate': {'b': 'h', 'w': 'io'},
-            'ffn_1': {'b': 'h', 'w': 'io'},
+            'ffn': {
+                'ffn_0': {'b': 'h', 'w': 'io'},
+                'ffn_0_gate': {'b': 'h', 'w': 'io'},
+                'ffn_1': {'b': 'h', 'w': 'io'},
+            },
             'post_ln_0': {'scale': 'h'},
             'post_ln_1': {'scale': 'h'},
             'pre_ln_0': {'scale': 'h'},
@@ -464,21 +318,24 @@ class ModelLibTest(parameterized.TestCase):
         },
         'block_1': {
             'attn': {
-                'o_proj': 'oii',
+                'k_proj': {'w': 'ioo'},
+                'o_proj': {'w': 'oii'},
                 'per_dim_scale': {'scale': 'h'},
-                'qkv_proj': '.ioo',
+                'q_proj': {'w': 'ioo'},
+                'v_proj': {'w': 'ioo'},
             },
-            'ffn_0': {'b': 'h', 'w': 'io'},
-            'ffn_0_gate': {'b': 'h', 'w': 'io'},
-            'ffn_1': {'b': 'h', 'w': 'io'},
+            'ffn': {
+                'ffn_0': {'b': 'h', 'w': 'io'},
+                'ffn_0_gate': {'b': 'h', 'w': 'io'},
+                'ffn_1': {'b': 'h', 'w': 'io'},
+            },
             'post_ln_0': {'scale': 'h'},
             'post_ln_1': {'scale': 'h'},
             'pre_ln_0': {'scale': 'h'},
             'pre_ln_1': {'scale': 'h'},
         },
-        'embed': 'io',
+        'embed_linear': {'b': '.', 'w': '.i'},
         'final_ln': {'scale': 'h'},
-        'output_layer': {'b': 'h'},
     }
     print('=' * 50)
     print(dim_annotations)
@@ -1368,6 +1225,173 @@ class TestNpArrayQuantizer(tokenization.SimplyVocab[np.ndarray]):
     output_raw = np.array(output_raw, dtype=np.int32)[None, :]
     output_raw = np.repeat(output_raw, self.feature_dim, axis=1)
     return output_raw
+
+
+class MockShardingConfig:
+  ffn0_partition = None
+  ffn1_partition = None
+  ffn0_activation_partition = None
+  activation_partition = None
+
+
+def simple_moe(
+    params, inputs, inputs_mask,
+    num_experts_per_token, num_experts,
+    ffn_activation,
+    use_gated_activation_in_ffn,
+    activation_dtype):
+  # Use a naive dense MoE implementation to check equivalence.
+  params = model_lib.get_raw_arrays(params)
+  router_w = jnp.asarray(params['router']['w'], activation_dtype)
+  router_logits = jnp.einsum('ie,bsi->bse', router_w, inputs)
+  router_probs = jax.nn.softmax(router_logits, axis=-1)
+  _, selected_indices = jax.lax.top_k(
+      router_probs, k=num_experts_per_token
+  )
+  mask = jnp.sum(
+      jax.nn.one_hot(selected_indices, num_experts, dtype=router_probs.dtype),
+      axis=-2,
+  )
+  effective_router_probs = router_probs * mask
+  if num_experts_per_token > 1:
+    # Re-normalize the effective router probs.
+    effective_router_probs = effective_router_probs / jnp.sum(
+        effective_router_probs, axis=-1, keepdims=True)
+  effective_router_probs = jnp.asarray(
+      effective_router_probs, dtype=activation_dtype)
+  ffn0_w = jnp.asarray(params['ffn_0']['w'], activation_dtype)
+  projected_inputs = jnp.einsum('eio,bsi->ebso', ffn0_w, inputs)
+  activation_fn = registry.FunctionRegistry.get(ffn_activation)
+  if use_gated_activation_in_ffn:
+    ffn0_gate_w = jnp.asarray(
+        params['ffn_0_gate']['w'], activation_dtype)
+    gate = jnp.einsum('eio,bsi->ebso', ffn0_gate_w, inputs)
+    middle = (
+        jnp.asarray(activation_fn(gate), activation_dtype)
+        * projected_inputs
+    )
+  else:
+    middle = jnp.asarray(
+        activation_fn(projected_inputs), activation_dtype
+    )
+  ffn1_w = jnp.asarray(params['ffn_1']['w'], activation_dtype)
+  expert_outputs = jnp.einsum('eio,ebsi->ebso', ffn1_w, middle)
+  outputs = jnp.einsum(
+      'ebsd,bse->bsd', expert_outputs, effective_router_probs
+  )
+  outputs = outputs * inputs_mask[..., None]
+  return outputs
+
+
+class MoETest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='_no_gate_dropless',
+          use_gated_activation_in_ffn=False,
+          num_experts=8,
+          expert_capacity_factor=None,
+          num_experts_per_token=2,
+      ),
+      dict(
+          testcase_name='_gate_dropless',
+          use_gated_activation_in_ffn=True,
+          num_experts=6,
+          expert_capacity_factor=None,
+          num_experts_per_token=2,
+      ),
+      dict(
+          testcase_name='_gate_dropless_single_expert',
+          use_gated_activation_in_ffn=True,
+          num_experts=1,
+          expert_capacity_factor=None,
+          num_experts_per_token=1,
+      ),
+      dict(
+          testcase_name='_gate_dropless_all_experts',
+          use_gated_activation_in_ffn=True,
+          num_experts=4,
+          expert_capacity_factor=None,
+          num_experts_per_token=4,
+      ),
+      dict(
+          testcase_name='_no_gate',
+          use_gated_activation_in_ffn=False,
+          num_experts=8,
+          expert_capacity_factor=5,
+          num_experts_per_token=2,
+      ),
+      dict(
+          testcase_name='_gate',
+          use_gated_activation_in_ffn=True,
+          num_experts=6,
+          expert_capacity_factor=5,
+          num_experts_per_token=2,
+      ),
+      dict(
+          testcase_name='_gate_single_expert',
+          use_gated_activation_in_ffn=True,
+          num_experts=1,
+          expert_capacity_factor=5,
+          num_experts_per_token=1,
+      ),
+  )
+  def test_moe_feed_forward_equivalence(
+      self, use_gated_activation_in_ffn, num_experts, expert_capacity_factor,
+      num_experts_per_token=2, activation_dtype='bfloat16',
+  ):
+    batch_size, seq_len, model_dim, expand_factor = 2, 4, 4, 2
+    segment_ids = jnp.array([[1, 2, 3, 0], [1, 0, 0, 1]])
+    sharding_config = MockShardingConfig()
+    key = jax.random.PRNGKey(0)
+    input_key, prng_key = jax.random.split(key)
+    inputs = jax.random.normal(
+        input_key, shape=(batch_size, seq_len, model_dim),
+        dtype=activation_dtype
+    )
+    inputs_mask = segment_ids != 0
+
+    moe_ffn = model_lib.MoEFeedForward(
+        model_dim=model_dim,
+        expand_factor=expand_factor,
+        sharding_config=sharding_config,
+        num_experts=num_experts,
+        num_experts_per_token=num_experts_per_token,
+        expert_capacity_factor=expert_capacity_factor,
+        ffn_use_bias=False,
+        use_gated_activation_in_ffn=use_gated_activation_in_ffn,
+        activation_dtype=activation_dtype,
+    )
+
+    params = moe_ffn.init(prng_key)
+    moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
+    simple_moe_fn = functools.partial(
+        simple_moe,
+        num_experts_per_token=num_experts_per_token,
+        num_experts=num_experts,
+        ffn_activation=moe_ffn.ffn_activation,
+        use_gated_activation_in_ffn=use_gated_activation_in_ffn,
+        activation_dtype=activation_dtype,
+    )
+    simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
+    self.assertEqual(moe_output.shape, simple_moe_output.shape)
+    self.assertEqual(moe_output.dtype, simple_moe_output.dtype)
+    np.testing.assert_allclose(
+        moe_output, simple_moe_output, rtol=1e-2, atol=1e-2)
+
+    def loss1(params, inputs, inputs_mask):
+      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(moe_output) / (batch_size * seq_len)
+
+    def loss2(params, inputs, inputs_mask):
+      simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(simple_moe_output) / (batch_size * seq_len)
+
+    grad1 = jax.grad(loss1)(params, inputs, inputs_mask)
+    grad2 = jax.grad(loss2)(params, inputs, inputs_mask)
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2),
+        grad1, grad2)
 
 
 if __name__ == '__main__':

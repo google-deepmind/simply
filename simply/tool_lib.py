@@ -543,6 +543,6 @@ def repeat_elements(input_list, n):
 def create_tool_executor(
     config: config_lib.ExperimentConfig,
 ) -> ToolExecutor | None:
-  if hasattr(config, "tool_manager_name"):
-    return ToolRegistry.get(config.tool_manager_name)()
+  if tool_manager_name := getattr(config, "tool_manager_name", None):
+    return ToolRegistry.get(tool_manager_name)()
   return None

@@ -95,7 +95,7 @@ class HuggingFaceVocab(SimplyVocab[str]):
     return transformers.AutoTokenizer.from_pretrained(self.vocab_path)
 
   @property
-  def bos_id(self) -> int:
+  def bos_id(self) -> int | None:
     return self.tokenizer.bos_token_id
 
   @property

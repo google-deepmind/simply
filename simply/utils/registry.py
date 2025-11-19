@@ -13,6 +13,7 @@
 # limitations under the License.
 """Registry."""
 
+from collections.abc import Collection
 import importlib
 import traceback
 from typing import Any, ClassVar
@@ -41,12 +42,27 @@ class RootRegistry:
   namespace: ClassVar[str] = ''
 
   @classmethod
+  def _get_namespace_prefix(cls) -> str:
+    """Returns the namespace prefix with a colon, or an empty string."""
+    return f'{cls.namespace}:' if cls.namespace else ''
+
+  @classmethod
+  def keys(cls) -> Collection[str]:
+    """Returns all keys registered under the class namespace."""
+    prefix = cls._get_namespace_prefix()
+    return [
+        fullname.removeprefix(prefix)
+        for fullname in cls.registry
+        if fullname.startswith(prefix)
+    ]
+
+  @classmethod
   def reset(cls) -> None:
     cls.registry = {}
 
   @classmethod
   def fullname(cls, name: str) -> str:
-    return f'{cls.namespace}:{name}' if cls.namespace else name
+    return cls._get_namespace_prefix() + name
 
   @classmethod
   def register(cls, fn_or_cls: Any, name: str = '') -> Any:

@@ -36,7 +36,7 @@ PRNGKey = jax.typing.ArrayLike
 
 
 class SimplyModule(abc.ABC):
-  """An untra-simplified version of `flax.nn.Module`."""
+  """An ultra-simplified version of `flax.nn.Module`."""
 
   @final
   def __post_init__(self):

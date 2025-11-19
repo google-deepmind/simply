@@ -14,6 +14,7 @@
 """Unit test for config_lib.py."""
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from simply import config_lib
 from simply import model_lib
 from simply.utils import module
@@ -36,6 +37,20 @@ class ConfigLibTest(absltest.TestCase):
     loaded_model = pytree.load_dataclasses(py)
     loaded_py = pytree.dump_dataclasses(loaded_model)
     self.assertEqual(py, loaded_py)
+
+
+def _get_all_config_names():
+  return [
+      dict(testcase_name=name, config_name=name)
+      for name in config_lib.ExperimentConfigRegistry.keys()
+  ]
+
+
+class ConfigRegistryInstantiationTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(_get_all_config_names())
+  def test_instantiate_config(self, config_name: str):
+    config_lib.ExperimentConfigRegistry.get(config_name)()
 
 
 if __name__ == '__main__':

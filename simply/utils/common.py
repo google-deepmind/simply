@@ -263,10 +263,16 @@ def find_unused_argpaths(
   used_invars = set()
   for var in closed_jaxpr.jaxpr.outvars:
     if var in invars:
-      used_invars.add(var)
+      try:
+        used_invars.add(var)
+      except TypeError:
+        pass
   for eqn in closed_jaxpr.jaxpr.eqns:
     for var in eqn.invars:
-      used_invars.add(var)
+      try:
+        used_invars.add(var)
+      except TypeError:
+        pass
 
   unused_argpaths = []
   for argpath, var in zip(argpaths, closed_jaxpr.jaxpr.invars, strict=True):

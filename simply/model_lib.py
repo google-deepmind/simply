@@ -19,18 +19,19 @@ import copy
 import dataclasses
 import functools
 import time
-from typing import Any, ClassVar, Self, Tuple, cast
+from typing import Any, cast, ClassVar, Self, Tuple
 import warnings
 
 from absl import logging
 import einops
 import jax
 from jax.experimental import shard_map
+from jax.experimental import xla_metadata
+from jax.experimental.pallas.ops.tpu import megablox
 from jax.experimental.pallas.ops.tpu import splash_attention
 import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
-
 from simply import config_lib
 from simply import data_lib
 from simply.utils import checkpoint_lib as ckpt_lib
@@ -45,7 +46,6 @@ from simply.utils import registry
 from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
-
 
 ################################################################################
 ## Type aliases.
@@ -64,6 +64,7 @@ mesh_sharding = sharding_lib.mesh_sharding
 ExperimentHelper = exp_helper.ExperimentHelper
 create_lr_schedule = opt_lib.create_lr_schedule
 SamplingParams = sampling_lib.SamplingParams
+EinsumLinear = module.EinsumLinear
 
 # All the model parameters are wrapped into AnnotatedArray dataclass.
 # Its `array` field holds the raw array and its `metadata` field
@@ -115,111 +116,6 @@ registry.FunctionRegistry.register(jax.nn.silu, 'silu')
 def soft_cap(x: Array, cap: float):
   cap = jnp.asarray(cap, x.dtype)
   return jnp.asarray(cap * jnp.tanh(x / cap), x.dtype)
-
-
-@module.ModuleRegistry.register
-@dataclasses.dataclass
-class Embedding(module.SimplyModule):
-  """Embedding layer."""
-  vocab_size: int
-  dim: int
-  var_scale: float = 1.0
-  lookup_scale: float | None = 1.0  # If None, no lookup scaling.
-  use_lookup: bool = True
-  # Mixed precision related.
-  weight_dtype: DTypeLike = 'float32'
-  activation_dtype: DTypeLike = 'bfloat16'
-  # Sharding related.
-  partition: PartitionAnnotation = None
-
-  def init(self, prng_key: PRNGKey) -> PyTree:
-    scaling_factor = (self.var_scale / jnp.sqrt(self.dim)).astype(
-        self.weight_dtype)
-    result = jax.random.normal(
-        prng_key, shape=[self.vocab_size, self.dim],
-        dtype=self.weight_dtype) * scaling_factor
-    result = sharding_lib.with_sharding_constraint(result, self.partition)
-    result = AnnotatedArray.create(result, dim_annotation='io')
-    return result
-
-  def apply(self, params: PyTree, x: Array) -> Array:
-    params = get_raw_arrays(params)
-    # Make the variance of the lookup value to be lookup_scale.
-    # This is added so that the value has different scale when used as inputs
-    # versus softmax weights.
-    params = cast(Array, params)
-    params = common.convert_or_dequantize(params, dtype=self.activation_dtype)
-    if self.use_lookup:
-      output = jnp.take(params, x, axis=0)
-    else:
-      onehot_x = jax.nn.one_hot(x, self.vocab_size, dtype=self.activation_dtype)
-      output = jnp.einsum('ij,...i->...j', params, onehot_x)
-    if self.lookup_scale is None:
-      return output
-    scaling_factor = (
-        self.lookup_scale / self.var_scale * jnp.sqrt(self.dim)
-        ).astype(self.activation_dtype)
-    return output * scaling_factor
-
-
-@module.ModuleRegistry.register
-@dataclasses.dataclass
-class Linear(module.SimplyModule):
-  """Linear layer."""
-  input_dim: int
-  output_dim: int
-  use_bias: bool = True
-  weight_init: initializer.Initializer = initializer.XavierUniformInit()
-  # Mixed precision related.
-  weight_dtype: DTypeLike = 'float32'
-  activation_dtype: DTypeLike = 'bfloat16'
-  # Sharding related.
-  weight_partition: PartitionAnnotation = None
-  output_partition: PartitionAnnotation = None
-  # Others.
-  weight_name: str = 'w'
-  bias_name: str = 'b'
-  use_external_weights: bool = False
-
-  def init(self, prng_key: PRNGKey) -> PyTree:
-    params = {}
-    if not self.use_external_weights:
-      params[self.weight_name] = self.weight_init(
-          prng_key,
-          shape=[self.input_dim, self.output_dim],
-          dim_annotation='io',
-          dtype=self.weight_dtype,
-      )
-      params[self.weight_name] = sharding_lib.with_sharding_constraint(
-          params[self.weight_name], self.weight_partition
-      )
-      params[self.weight_name] = AnnotatedArray.create(
-          params[self.weight_name], dim_annotation='io')
-
-    if self.use_bias:
-      params[self.bias_name] = jnp.zeros(
-          shape=[self.output_dim], dtype=self.weight_dtype)
-      params[self.bias_name] = sharding_lib.with_sharding_constraint(
-          params[self.bias_name],
-          (self.weight_partition[-1],) if self.weight_partition else None,
-      )
-      params[self.bias_name] = AnnotatedArray.create(
-          params[self.bias_name], dim_annotation='h')
-    return params
-
-  def apply(self, params: PyTree, x: Array) -> Array:
-    params = get_raw_arrays(params)
-    w = common.convert_or_dequantize(
-        params[self.weight_name], dtype=self.activation_dtype)
-    output = jnp.einsum('ij,...i->...j', w, x)
-    if self.use_bias:
-      b = common.convert_or_dequantize(
-          params[self.bias_name], dtype=self.activation_dtype)
-      output += b
-    output = sharding_lib.with_sharding_constraint(
-        output, self.output_partition
-    )
-    return output
 
 
 @module.ModuleRegistry.register
@@ -618,8 +514,521 @@ def attn(q, k, v, mask, *, attn_soft_cap=50.0, dtype='bfloat16'):
 
 @module.ModuleRegistry.register
 @dataclasses.dataclass
+class FeedForward(module.SimplyModule):
+  """The FeedForward block in Transformer."""
+
+  model_dim: int
+  expand_factor: int
+  sharding_config: SimplyConfig
+  use_gated_activation_in_ffn: bool = False
+  # Mixed precision related.
+  activation_dtype: DTypeLike = 'bfloat16'
+  # Below are for experimental usage.
+  ffn_expand_dim: int | None = None
+  ffn_use_bias: bool = True
+  ffn_activation: str = 'gelu'
+
+  @property
+  def expand_dim(self) -> int:
+    if self.ffn_expand_dim is not None:
+      return self.ffn_expand_dim
+    return self.expand_factor * self.model_dim
+
+  def setup(self) -> None:
+    self.ffn_0 = EinsumLinear(
+        eqn='io,...i->...o',
+        weight_shape=[self.model_dim, self.expand_dim],
+        bias_term='o' if self.ffn_use_bias else '',
+        # Mixed precision related.
+        activation_dtype=self.activation_dtype,
+        # Sharding related.
+        weight_partition=self.sharding_config.ffn0_partition,
+        output_partition=self.sharding_config.ffn0_activation_partition,
+    )
+    if self.use_gated_activation_in_ffn:
+      self.ffn_0_gate = EinsumLinear(
+          eqn='io,...i->...o',
+          weight_shape=[self.model_dim, self.expand_dim],
+          bias_term='o' if self.ffn_use_bias else '',
+          # Mixed precision related.
+          activation_dtype=self.activation_dtype,
+          # Sharding related.
+          weight_partition=self.sharding_config.ffn0_partition,
+          output_partition=self.sharding_config.ffn0_activation_partition,
+      )
+    self.ffn_1 = EinsumLinear(
+        eqn='io,...i->...o',
+        weight_shape=[self.expand_dim, self.model_dim],
+        bias_term='o' if self.ffn_use_bias else '',
+        # Mixed precision related.
+        activation_dtype=self.activation_dtype,
+        # Sharding related.
+        weight_partition=self.sharding_config.ffn1_partition,
+        output_partition=self.sharding_config.activation_partition,
+    )
+
+  def init(self, prng_key: PRNGKey) -> PyTree:
+    params = {}
+    ffn0_key, ffn0gate_key, ffn1_key = jax.random.split(prng_key, num=3)
+    params['ffn_0'] = self.ffn_0.init(ffn0_key)
+    if self.use_gated_activation_in_ffn:
+      params['ffn_0_gate'] = self.ffn_0_gate.init(ffn0gate_key)
+    params['ffn_1'] = self.ffn_1.init(ffn1_key)
+    return params
+
+  def apply(
+      self,
+      params: PyTree,
+      x: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    del inputs_mask
+    extra_output = {}
+    projected_x = self.ffn_0.apply(params['ffn_0'], x)
+    activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
+    if self.use_gated_activation_in_ffn:
+      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], x)
+      x = jnp.asarray(activation_fn(gate), self.activation_dtype) * projected_x
+    else:
+      x = jnp.asarray(activation_fn(projected_x), self.activation_dtype)
+    x = self.ffn_1.apply(params['ffn_1'], x)
+    return x, extra_output
+
+
+@module.ModuleRegistry.register
+@dataclasses.dataclass
+class MoEFeedForward(FeedForward):
+  """A Mixture-of-Experts FeedForward block."""
+  num_experts: int = 8
+  num_experts_per_token: int = 2
+  expert_capacity_factor: float | None = 1.0
+  router_z_loss_weight: float = 0.0
+  lbl_loss_weight: float = 0.0
+  tile_batch_seq: int = 128
+  tile_model_dim: int = 128
+  tile_expand_dim: int = 128
+  gmm_impl: str = 'ragged_dot'
+
+  def setup(self):
+    if self.ffn_use_bias:
+      raise ValueError('MoEFeedForward does not support bias in FFN.')
+    if self.sharding_config.activation_partition is None:
+      router_output_partition = None
+    else:
+      router_output_partition = (
+          self.sharding_config.activation_partition[0],
+          self.sharding_config.activation_partition[1],
+          None,
+      )
+    self.router = EinsumLinear(
+        eqn='ie,...i->...e',
+        weight_shape=[self.model_dim, self.num_experts],
+        # Use float32 for router to avoid numerical issues.
+        weight_dtype='float32',
+        activation_dtype='float32',
+        # Sharding related.
+        weight_partition=(None, None),
+        output_partition=router_output_partition,
+    )
+    self.ffn0_partition = (
+        (None, *self.sharding_config.ffn0_partition)
+        if self.sharding_config.ffn0_partition is not None else None
+    )
+    self.ffn_0 = EinsumLinear(
+        eqn='eio,e...i->e...o',
+        weight_shape=[self.num_experts, self.model_dim, self.expand_dim],
+        weight_dim_annotation='.io',
+        # Mixed precision related.
+        activation_dtype=self.activation_dtype,
+        # Sharding related.
+        weight_partition=self.ffn0_partition,
+    )
+    self.ffn1_partition = (
+        (None, *self.sharding_config.ffn1_partition)
+        if self.sharding_config.ffn1_partition is not None else None
+    )
+    if self.use_gated_activation_in_ffn:
+      self.ffn_0_gate = EinsumLinear(
+          eqn='eio,e...i->e...o',
+          weight_dim_annotation='.io',
+          weight_shape=[self.num_experts, self.model_dim, self.expand_dim],
+          # Mixed precision related.
+          activation_dtype=self.activation_dtype,
+          # Sharding related.
+          weight_partition=self.ffn0_partition,
+      )
+    self.ffn_1 = EinsumLinear(
+        eqn='eio,e...i->e...o',
+        weight_dim_annotation='.io',
+        weight_shape=[self.num_experts, self.expand_dim, self.model_dim],
+        # Mixed precision related.
+        activation_dtype=self.activation_dtype,
+        # Sharding related.
+        weight_partition=self.ffn1_partition,
+    )
+
+  def init(self, prng_key: PRNGKey) -> PyTree:
+    params = {}
+    router_key, ffn0_key, ffn0gate_key, ffn1_key = jax.random.split(
+        prng_key, num=4
+    )
+    params['router'] = self.router.init(prng_key=router_key)
+    params['ffn_0'] = self.ffn_0.init(ffn0_key)
+    if self.use_gated_activation_in_ffn:
+      params['ffn_0_gate'] = self.ffn_0_gate.init(ffn0gate_key)
+    params['ffn_1'] = self.ffn_1.init(ffn1_key)
+    return params
+
+  def apply(
+      self, params: PyTree, x: Array, inputs_mask: Array | None = None
+  ) -> PyTree:
+    inputs = x
+    extra_output = {'loss': {}, 'metric': {}}
+    params = get_raw_arrays(params)
+    inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
+    # router_logits: [batch_size, seq_len, num_experts]
+    router_logits = self.router.apply(params['router'], inputs)
+    router_logits = router_logits.astype(jnp.float32)
+    # router_probs: [batch_size, seq_len, num_experts]
+    router_probs = jax.nn.softmax(router_logits, axis=-1)
+    if self.num_experts_per_token == 1:
+      # Apply `softmax => topk` when k == 1 to avoid zero gradient
+      # on the router logits.
+      # selected_router_probs, selected_indices:
+      # [batch_size, seq_len, num_experts_per_token]
+      selected_router_probs, selected_indices = jax.lax.top_k(
+          router_probs, k=self.num_experts_per_token
+      )
+    else:
+      # Perform `topk => softmax` to get a normalized probability distribution.
+      # selected_router_logits, selected_indices:
+      # [batch_size, seq_len, num_experts_per_token]
+      selected_router_logits, selected_indices = jax.lax.top_k(
+          router_logits, k=self.num_experts_per_token
+      )
+      selected_router_probs = jax.nn.softmax(selected_router_logits, axis=-1)
+    selected_router_probs = jnp.asarray(
+        selected_router_probs, self.activation_dtype
+    )
+    router_probs = jnp.asarray(router_probs, self.activation_dtype)
+    if self.expert_capacity_factor is None:
+      outputs, ffn_extra_output = self._apply_sparse_moe(
+          params,
+          inputs,
+          selected_indices=selected_indices,
+          selected_weights=selected_router_probs,
+          inputs_mask=inputs_mask,
+      )
+    else:
+      outputs, ffn_extra_output = self._apply_dense_moe(
+          params,
+          inputs,
+          selected_indices=selected_indices,
+          selected_weights=selected_router_probs,
+          inputs_mask=inputs_mask,
+      )
+    load = ffn_extra_output['load']
+    extra_output.update(ffn_extra_output)
+    router_entropy = - jnp.sum(router_probs * jnp.where(
+        router_probs > 0, jnp.log(router_probs), 0.0), axis=-1)
+    extra_output['metric'].update({
+        'max_load': jnp.max(load),
+        'min_load': jnp.min(load),
+        'router_entropy': (
+            jnp.mean(router_entropy, where=inputs_mask)
+        ),
+        'gini': jnp.sum(load ** 2) * self.num_experts - 1,
+    })
+    if self.lbl_loss_weight > 0:
+      if inputs_mask is None:
+        inputs_mask = jnp.ones(shape=x.shape[:2], dtype=self.activation_dtype)
+      else:
+        inputs_mask = jnp.asarray(inputs_mask, dtype=self.activation_dtype)
+      importance = jnp.einsum(
+          'bse,bs->e', router_probs, inputs_mask
+      ) / jnp.sum(inputs_mask)
+      lbl_loss = (
+          jnp.einsum('i,i->', jax.lax.stop_gradient(load), importance)
+          * self.num_experts
+      )
+      extra_output['metric']['lbl_loss'] = lbl_loss
+      extra_output['loss']['lbl_loss'] = lbl_loss * self.lbl_loss_weight
+    if self.router_z_loss_weight > 0:
+      z_loss = jnp.mean(
+          jax.nn.logsumexp(router_logits, axis=-1) ** 2, where=inputs_mask)
+      extra_output['metric']['z_loss'] = z_loss
+      extra_output['loss']['z_loss'] = z_loss * self.router_z_loss_weight
+    outputs = jnp.where(inputs_mask[..., None], outputs, 0.0)
+    outputs = sharding_lib.with_sharding_constraint(
+        outputs, self.sharding_config.activation_partition
+    )
+    return outputs, extra_output
+
+  def _apply_sparse_moe(
+      self,
+      params: PyTree,
+      inputs: Array,
+      selected_indices: Array,
+      selected_weights: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    """Apply sparse MoE."""
+    logging.info('using sparse moe!')
+    if inputs_mask is not None:
+      # Mask out the padded tokens by assigning them to an expert that
+      # does not exist so that they will be skipped in the sparse matmul.
+      selected_indices = jnp.where(
+          inputs_mask[..., None], selected_indices, self.num_experts
+      )
+
+    @jax.named_scope('gmm')
+    def gmm(lhs, rhs, group_sizes, tiling):
+      if self.gmm_impl == 'megablox':
+        output = megablox.gmm(
+            lhs,
+            rhs,
+            group_sizes=group_sizes,
+            tiling=tiling,
+            preferred_element_type=self.activation_dtype,
+        )
+      elif self.gmm_impl == 'ragged_dot':
+        with xla_metadata.set_xla_metadata(
+            ragged_dot_tiling=','.join([str(t) for t in tiling])):
+          output = jax.lax.ragged_dot(
+              lhs=lhs,
+              rhs=rhs,
+              group_sizes=group_sizes,
+              preferred_element_type=self.activation_dtype,
+          )
+      else:
+        raise ValueError(f'Unsupported gmm impl: {self.gmm_impl}')
+      return output
+
+    if self.sharding_config.activation_partition is None:
+      selected_indices_partition = None
+    else:
+      selected_indices_partition = js.PartitionSpec(
+          self.sharding_config.activation_partition[0],
+          self.sharding_config.activation_partition[1],
+          None)
+    selected_weights_partition = selected_indices_partition
+
+    # ffn0_w: [num_experts, model_dim, expand_dim]
+    ffn0_w = params['ffn_0']['w']
+    ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)
+    ffn0_partition = (
+        js.PartitionSpec(*self.ffn0_partition)
+        if self.ffn0_partition is not None
+        else js.PartitionSpec()
+    )
+
+    if self.use_gated_activation_in_ffn:
+      # ffn0_gate_w: [num_experts, model_dim, expand_dim]
+      ffn0_gate_w = params['ffn_0_gate']['w']
+      ffn0_gate_w = common.convert_or_dequantize(
+          ffn0_gate_w, dtype=self.activation_dtype
+      )
+      ffn0_gate_partition = ffn0_partition
+    else:
+      ffn0_gate_w = None
+      ffn0_gate_partition = None
+
+    # ffn1_w: [num_experts, expand_dim, model_dim]
+    ffn1_w = params['ffn_1']['w']
+    ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)
+    ffn1_partition = (
+        js.PartitionSpec(*self.ffn1_partition)
+        if self.ffn1_partition is not None
+        else js.PartitionSpec()
+    )
+
+    if self.sharding_config.activation_partition is None:
+      activation_partition = js.PartitionSpec()
+    else:
+      activation_partition = js.PartitionSpec(
+          *self.sharding_config.activation_partition)
+
+    @jax.shard_map(
+        mesh=sharding_lib.get_default_mesh(),
+        in_specs=(
+            activation_partition,
+            ffn0_partition,
+            ffn0_gate_partition,
+            ffn1_partition,
+            selected_indices_partition,
+            selected_weights_partition
+        ),
+        out_specs=(
+            activation_partition,
+            js.PartitionSpec()),
+        # Needed when using megablox.
+        check_vma=False)
+    def moe_ffn(
+        inputs, ffn0_w, ffn0_gate_w, ffn1_w,
+        selected_indices, selected_weights):
+      batch_size, seq_len, _ = inputs.shape
+      # flat_repeated_inputs:
+      # [batch_size * seq_len * num_experts_per_token, model_dim]
+      flat_repeated_inputs = einops.repeat(
+          inputs, 'b s d -> (b s r) d', r=self.num_experts_per_token
+      )
+      flat_repeated_inputs = jnp.asarray(
+          flat_repeated_inputs, self.activation_dtype)
+      # flat_selected_indices: [batch_size * seq_len * num_experts_per_token]
+      flat_selected_indices = jnp.ravel(selected_indices)
+      sort_indices = jnp.argsort(flat_selected_indices)
+      unsort_indices = jnp.argsort(sort_indices)
+      sorted_inputs = flat_repeated_inputs[sort_indices]
+      sorted_expert_indices = flat_selected_indices[sort_indices]
+      group_sizes = jnp.bincount(sorted_expert_indices, length=self.num_experts)
+      load = jnp.asarray(
+          group_sizes / jnp.sum(group_sizes), self.activation_dtype
+      )
+      load = (
+          jax.lax.psum(
+              load, axis_name=('replica', 'data', 'model')) /
+          jax.lax.psum(
+              1, axis_name=('replica', 'data', 'model')))
+      m, k = sorted_inputs.shape
+      n = ffn0_w.shape[-1]
+      ffn0_w = jax.lax.all_gather(ffn0_w, axis_name='data', tiled=True, axis=1)
+      ffn0_tiling = (
+          min(self.tile_batch_seq, m),
+          min(self.tile_model_dim, k),
+          min(self.tile_expand_dim, n),
+      )
+      ffn1_tiling = (ffn0_tiling[0], ffn0_tiling[2], ffn0_tiling[1])
+      projected_inputs = gmm(sorted_inputs, ffn0_w, group_sizes, ffn0_tiling)
+      activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
+      if self.use_gated_activation_in_ffn:
+        ffn0_gate_w = jax.lax.all_gather(
+            ffn0_gate_w, axis_name='data', tiled=True, axis=1)
+        gate = gmm(sorted_inputs, ffn0_gate_w, group_sizes, ffn0_tiling)
+        gate = activation_fn(gate)
+        middle = jnp.asarray(gate, self.activation_dtype) * projected_inputs
+      else:
+        middle = jnp.asarray(
+            activation_fn(projected_inputs), self.activation_dtype
+        )
+      ffn1_w = jax.lax.all_gather(ffn1_w, axis_name='data', tiled=True, axis=2)
+      sorted_outputs = gmm(middle, ffn1_w, group_sizes, ffn1_tiling)
+      outputs = sorted_outputs[unsort_indices]
+      # outputs: [batch_size, seq_len, model_dim, num_experts_per_token]
+      outputs = einops.rearrange(
+          outputs,
+          '(b s r) d -> b s d r',
+          b=batch_size,
+          s=seq_len,
+          r=self.num_experts_per_token,
+      )
+      outputs = jnp.einsum('bsk,bstk->bst', selected_weights, outputs)
+      return outputs, load
+
+    outputs, load = moe_ffn(
+        inputs,
+        ffn0_w,
+        ffn0_gate_w,
+        ffn1_w,
+        selected_indices,
+        selected_weights,
+    )
+    return outputs, {'load': load}
+
+  def _apply_dense_moe(
+      self,
+      params: PyTree,
+      inputs: Array,
+      selected_indices: Array,
+      selected_weights: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    extra_outputs = {}
+    batch_size, seq_len, _ = inputs.shape
+    num_tokens = batch_size * seq_len
+    expert_capacity = max(
+        1, int(num_tokens / self.num_experts * self.expert_capacity_factor)
+    )
+    logging.info('expert_capacity=%s', expert_capacity)
+    # selected_indices: [batch_size * seq_len, num_experts_per_token]
+    selected_indices = einops.rearrange(selected_indices, 'b s k -> (b s) k')
+    selected_weights = einops.rearrange(selected_weights, 'b s k -> (b s) k')
+    # inputs: [batch_size * seq_len, model_dim]
+    inputs = einops.rearrange(inputs, 'b s d -> (b s) d')
+
+    # selected_onehot: [num_tokens, num_experts_per_token, num_experts]
+    selected_onehot = jax.nn.one_hot(
+        selected_indices, self.num_experts, dtype=jnp.int32
+    )
+    if inputs_mask is not None:
+      selected_onehot *= einops.rearrange(inputs_mask, 'b s -> (b s) 1 1')
+
+    # dispatch_mask: [num_tokens, num_experts]
+    dispatch_mask = jnp.sum(selected_onehot, axis=1)
+
+    # dispatch_position: [num_tokens, num_experts]
+    dispatch_position = jnp.cumsum(dispatch_mask, axis=0) * dispatch_mask
+
+    # Mask out the tokens that are out of the expert capacity.
+    # position_mask: [num_tokens, num_experts]
+    position_mask = jnp.asarray(
+        (dispatch_position > 0) & (dispatch_position <= expert_capacity),
+        dtype=self.activation_dtype,
+    )
+
+    # dispatch_onehot: [num_tokens, num_experts, expert_capacity]
+    dispatch_onehot = (
+        jax.nn.one_hot(
+            dispatch_position - 1, expert_capacity, dtype=self.activation_dtype)
+        * position_mask[..., None]
+    )
+    extra_outputs['load'] = jnp.sum(dispatch_onehot, axis=[0, 2]) / jnp.sum(
+        dispatch_onehot
+    )
+
+    # selected_weights: [num_tokens, num_experts]
+    selected_weights = jnp.einsum(
+        'tk,tke->te', selected_weights, selected_onehot
+    )
+
+    # dispatch_weights: [num_tokens, num_experts, expert_capacity]
+    dispatch_weights = jnp.einsum(
+        'te,tec->tec', selected_weights, dispatch_onehot
+    )
+
+    # expert_inputs: [num_experts, expert_capacity, model_dim]
+    expert_inputs = jnp.einsum('tec,ti->eci', dispatch_onehot, inputs)
+
+    # projected_inputs:
+    # [num_experts, expert_capacity, model_dim * expand_factor]
+    expert_inputs = jnp.asarray(expert_inputs, self.activation_dtype)
+    projected_inputs = self.ffn_0.apply(params['ffn_0'], expert_inputs)
+    activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
+    if self.use_gated_activation_in_ffn:
+      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], expert_inputs)
+      gate = jnp.asarray(activation_fn(gate), self.activation_dtype)
+      middle = gate * projected_inputs
+    else:
+      middle = jnp.asarray(
+          activation_fn(projected_inputs), self.activation_dtype
+      )
+    # outputs: [num_experts, expert_capacity, model_dim]
+    outputs = self.ffn_1.apply(params['ffn_1'], middle)
+
+    # outputs: [num_tokens, model_dim]
+    outputs = jnp.einsum('ecd,tec->td', outputs, dispatch_weights)
+
+    # output: [batch_size, seq_len, model_dim, num_experts_per_token]
+    outputs = einops.rearrange(
+        outputs, '(b s) d -> b s d', b=batch_size, s=seq_len
+    )
+    return outputs, extra_outputs
+
+
+@module.ModuleRegistry.register
+@dataclasses.dataclass
 class Attention(module.SimplyModule):
   """Standard Multi-head Attention layer."""
+
   model_dim: int
   n_heads: int
   per_head_dim: int
@@ -627,7 +1036,6 @@ class Attention(module.SimplyModule):
   add_extra_output: bool = False
   qk_norm: LayerNorm | None = None
   use_per_dim_scale: bool = False
-  use_combined_qkv: bool = True
   weight_init: initializer.Initializer = initializer.XavierUniformInit()
   # Mixed precision related.
   activation_dtype: DTypeLike = 'bfloat16'
@@ -657,7 +1065,8 @@ class Attention(module.SimplyModule):
       self.per_dim_scale = PerDimScale(
           self.per_head_dim,
           weight_dtype=self.weight_dtype,
-          activation_dtype=self.activation_dtype)
+          activation_dtype=self.activation_dtype,
+      )
 
     if self.n_kv_heads <= 0:
       self.n_kv_heads = self.n_heads
@@ -666,122 +1075,50 @@ class Attention(module.SimplyModule):
           f'n_heads ({self.n_heads}) must be a multiple of n_kv_heads'
           f'({self.n_kv_heads}).'
       )
-
-  def init(self, prng_key: PRNGKey) -> PyTree:
-    qkey, kkey, vkey, okey = jax.random.split(prng_key, num=4)
-    params = {}
     q_shape = [self.model_dim, self.n_heads, self.per_head_dim]
     kv_shape = [self.model_dim, self.n_kv_heads, self.per_head_dim]
-    if self.use_combined_qkv:
-      if self.n_heads == self.n_kv_heads:
-        params['qkv_proj'] = self.weight_init(
-            qkey,
-            shape=[3, *q_shape],
-            dim_annotation='.ioo',
-            dtype=self.weight_dtype,
-        )
-        params['qkv_proj'] = sharding_lib.with_sharding_constraint(
-            params['qkv_proj'],
-            (None, *self.qkv_partition) if self.qkv_partition else None,
-        )
-        params['qkv_proj'] = AnnotatedArray.create(
-            params['qkv_proj'], dim_annotation='.ioo')
-        if self.qkv_use_bias:
-          params['qkv_bias'] = sharding_lib.with_sharding_constraint(
-              jnp.zeros(
-                  shape=[3, 1, 1, self.n_heads, self.per_head_dim],
-                  dtype=self.weight_dtype,
-              ),
-              (None, None, None, *self.qkv_partition[-2:])
-              if self.qkv_partition
-              else None,
-          )
-          params['qkv_bias'] = AnnotatedArray.create(
-              params['qkv_bias'], dim_annotation='...hh')
-      else:
-        params['q_proj'] = self.weight_init(
-            qkey, shape=q_shape, dim_annotation='ioo', dtype=self.weight_dtype
-        )
-        params['q_proj'] = sharding_lib.with_sharding_constraint(
-            params['q_proj'], self.qkv_partition
-        )
-        params['q_proj'] = AnnotatedArray.create(
-            params['q_proj'], dim_annotation='ioo')
-        params['kv_proj'] = self.weight_init(
-            kkey,
-            shape=[2, *kv_shape],
-            dim_annotation='.ioo',
-            dtype=self.weight_dtype,
-        )
-        params['kv_proj'] = sharding_lib.with_sharding_constraint(
-            params['kv_proj'],
-            (None, *self.qkv_partition) if self.qkv_partition else None,
-        )
-        params['kv_proj'] = AnnotatedArray.create(
-            params['kv_proj'], dim_annotation='.ioo')
-
-        if self.qkv_use_bias:
-          params['q_bias'] = sharding_lib.with_sharding_constraint(
-              jnp.zeros(
-                  shape=(self.n_heads, self.per_head_dim),
-                  dtype=self.weight_dtype,
-              ),
-              self.qkv_partition[-2:] if self.qkv_partition else None,
-          )
-          params['q_bias'] = AnnotatedArray.create(
-              params['q_bias'], dim_annotation='hh')
-          params['kv_bias'] = sharding_lib.with_sharding_constraint(
-              jnp.zeros(
-                  shape=[2, 1, 1, self.n_kv_heads, self.per_head_dim],
-                  dtype=self.weight_dtype,
-              ),
-              (None, None, None, *self.qkv_partition[-2:])
-              if self.qkv_partition
-              else None,
-          )
-          params['kv_bias'] = AnnotatedArray.create(
-              params['kv_bias'], dim_annotation='...hh')
-    else:
-      params['q_proj'] = self.weight_init(
-          qkey, shape=q_shape, dim_annotation='ioo', dtype=self.weight_dtype)
-      params['k_proj'] = self.weight_init(
-          kkey, shape=kv_shape, dim_annotation='ioo', dtype=self.weight_dtype)
-      params['v_proj'] = self.weight_init(
-          vkey, shape=kv_shape, dim_annotation='ioo', dtype=self.weight_dtype)
-
-      for k in ['q_proj', 'k_proj', 'v_proj']:
-        params[k] = sharding_lib.with_sharding_constraint(
-            params[k], self.qkv_partition
-        )
-        params[k] = AnnotatedArray.create(
-            params[k], dim_annotation='ioo')
-
-      if self.qkv_use_bias:
-        for name in ['q', 'k', 'v']:
-          params[f'{name}_bias'] = sharding_lib.with_sharding_constraint(
-              jnp.zeros(
-                  shape=params[f'{name}_proj'].shape[-2:],
-                  dtype=self.weight_dtype,
-              ),
-              self.qkv_partition[-2:] if self.qkv_partition else None,
-          )
-          params[f'{name}_bias'] = AnnotatedArray.create(
-              params[f'{name}_bias'], dim_annotation='hh')
-
-    params['o_proj'] = self.weight_init(
-        okey, shape=q_shape, dim_annotation='oii', dtype=self.weight_dtype)
-    params['o_proj'] = sharding_lib.with_sharding_constraint(
-        params['o_proj'], self.o_partition
+    qkv_kwargs = {
+        'bias_term': 'hd' if self.qkv_use_bias else '',
+        'weight_init': self.weight_init,
+        'weight_dtype': self.weight_dtype,
+        'activation_dtype': self.activation_dtype,
+        'output_partition': self.attn_activation_partition,
+    }
+    self.q_proj = module.EinsumLinear(
+        eqn='ihd,...i->...hd',
+        weight_shape=q_shape,
+        weight_partition=self.qkv_partition,
+        **qkv_kwargs,
     )
-    params['o_proj'] = AnnotatedArray.create(
-        params['o_proj'], dim_annotation='oii')
-    if self.o_use_bias:
-      params['o_bias'] = sharding_lib.with_sharding_constraint(
-          jnp.zeros(shape=params['o_proj'].shape[:1], dtype=self.weight_dtype),
-          self.o_partition[:1] if self.o_partition else None,
-      )
-      params['o_bias'] = AnnotatedArray.create(
-          params['o_bias'], dim_annotation='.')
+    self.k_proj = module.EinsumLinear(
+        eqn='ihd,...i->...hd',
+        weight_shape=kv_shape,
+        weight_partition=self.qkv_partition,
+        **qkv_kwargs,
+    )
+    self.v_proj = module.EinsumLinear(
+        eqn='ihd,...i->...hd',
+        weight_shape=kv_shape,
+        weight_partition=self.qkv_partition,
+        **qkv_kwargs,
+    )
+    o_kwargs = qkv_kwargs.copy()
+    o_kwargs['bias_term'] = 'i' if self.o_use_bias else ''
+    o_kwargs['output_partition'] = self.output_partition
+    self.o_proj = module.EinsumLinear(
+        eqn='ihd,...hd->...i',
+        weight_shape=q_shape,
+        weight_partition=self.o_partition,
+        **o_kwargs,
+    )
+
+  def init(self, prng_key: PRNGKey) -> PyTree:
+    q_key, k_key, v_key, o_key = jax.random.split(prng_key, num=4)
+    params = {}
+    params['q_proj'] = self.q_proj.init(q_key)
+    params['k_proj'] = self.k_proj.init(k_key)
+    params['v_proj'] = self.v_proj.init(v_key)
+    params['o_proj'] = self.o_proj.init(o_key)
 
     if self.qk_norm:
       params['q_norm'] = self.qk_norm.init()
@@ -794,7 +1131,8 @@ class Attention(module.SimplyModule):
 
   def apply(
       self,
-      params: PyTree, x: Array,
+      params: PyTree,
+      x: Array,
       *,
       segment_ids: Array,
       segment_positions: Array,
@@ -804,72 +1142,12 @@ class Attention(module.SimplyModule):
     # x: [batch_size, seq_len, model_dim]
     assert len(x.shape) == 3
     assert x.shape[-1] == self.model_dim
-    if self.use_combined_qkv:
-      if self.n_heads == self.n_kv_heads:
-        # qkv_proj: [3, model_dim, n_heads, per_head_dim]
-        qkv = jnp.einsum(
-            'cijk,bsi->cbsjk',
-            common.convert_or_dequantize(
-                params['qkv_proj'], dtype=self.activation_dtype),
-            x).astype(self.activation_dtype)
-        if self.qkv_use_bias:
-          qkv += common.convert_or_dequantize(
-              params['qkv_bias'], dtype=self.activation_dtype
-          )
-        qkv = sharding_lib.with_sharding_constraint(
-            qkv,
-            (None, *self.attn_activation_partition)
-            if self.attn_activation_partition
-            else None,
-        )
-        q, k, v = qkv
-      else:
-        # q: [model_dim, n_heads, per_head_dim]
-        q = jnp.einsum(
-            'ijk,...i->...jk',
-            common.convert_or_dequantize(
-                params['q_proj'], dtype=self.activation_dtype),
-            x).astype(self.activation_dtype)
-        # kv: [2, model_dim, n_kv_heads, per_head_dim]
-        kv = jnp.einsum(
-            'cijk,...i->c...jk',
-            common.convert_or_dequantize(
-                params['kv_proj'], dtype=self.activation_dtype),
-            x).astype(self.activation_dtype)
-        if self.qkv_use_bias:
-          q += common.convert_or_dequantize(
-              params['q_bias'], dtype=self.activation_dtype
-          )
-          kv += common.convert_or_dequantize(
-              params['kv_bias'], dtype=self.activation_dtype
-          )
-        kv = sharding_lib.with_sharding_constraint(
-            kv,
-            (None, *self.attn_activation_partition)
-            if self.attn_activation_partition
-            else None,
-        )
-        k, v = kv
-    else:
-      qkv = []
-      for key in ['q', 'k', 'v']:
-        y = jnp.einsum(
-            'ijk,...i->...jk',
-            common.convert_or_dequantize(
-                params[f'{key}_proj'], dtype=self.activation_dtype
-            ),
-            x,
-        ).astype(self.activation_dtype)
-        if self.qkv_use_bias:
-          y += common.convert_or_dequantize(
-              params[f'{key}_bias'], dtype=self.activation_dtype
-          )
-        qkv.append(y)
-      q, k, v = qkv  # pylint: disable=unbalanced-tuple-unpacking
-
-    q = sharding_lib.with_sharding_constraint(q, self.attn_activation_partition)
-    k = sharding_lib.with_sharding_constraint(k, self.attn_activation_partition)
-    v = sharding_lib.with_sharding_constraint(v, self.attn_activation_partition)
+    # q: [batch_size, seq_len, n_heads, per_head_dim]
+    q = self.q_proj.apply(params['q_proj'], x)
+    # k: [batch_size, seq_len, n_heads, per_head_dim]
+    k = self.k_proj.apply(params['k_proj'], x)
+    # v: [batch_size, seq_len, n_heads, per_head_dim]
+    v = self.v_proj.apply(params['v_proj'], x)
 
     if self.qk_norm:
       q = self.qk_norm.apply(params['q_norm'], q)
@@ -933,9 +1211,11 @@ class Attention(module.SimplyModule):
     # At decoding time (q.shape[1] == 1), we don't use flash attention.
     if self.use_flash_attention and q_seq_len > 1:
       batch_size_axis, seq_len_axis, num_heads_axis, per_head_size_axis = (
-          self.attn_activation_partition)
+          self.attn_activation_partition
+      )
       bnlh = js.PartitionSpec(
-          batch_size_axis, num_heads_axis, seq_len_axis, per_head_size_axis)
+          batch_size_axis, num_heads_axis, seq_len_axis, per_head_size_axis
+      )
       bl = js.PartitionSpec(batch_size_axis, seq_len_axis)
 
       q = einops.rearrange(
@@ -1067,18 +1347,7 @@ class Attention(module.SimplyModule):
     output = sharding_lib.with_sharding_constraint(
         output, self.attn_activation_partition
     )
-    output = jnp.einsum(
-        'jhi,bthi->btj',
-        common.convert_or_dequantize(
-            params['o_proj'], dtype=self.activation_dtype), output)
-    if self.o_use_bias:
-      output += common.convert_or_dequantize(
-          params['o_bias'], dtype=self.activation_dtype
-      )
-
-    output = sharding_lib.with_sharding_constraint(
-        output, self.output_partition
-    )
+    output = self.o_proj.apply(params['o_proj'], output)
     return output, extra_output
 
 
@@ -1086,6 +1355,7 @@ class Attention(module.SimplyModule):
 @dataclasses.dataclass
 class TransformerBlock(module.SimplyModule):
   """A single transformer block."""
+
   model_dim: int
   n_heads: int
   per_head_dim: int
@@ -1098,6 +1368,13 @@ class TransformerBlock(module.SimplyModule):
   use_qk_norm: bool = False
   use_gated_activation_in_ffn: bool = False
   use_per_dim_scale: bool = False
+  # MoE.
+  use_moe: bool = False
+  num_experts: int = 0
+  num_experts_per_token: int = 0
+  expert_capacity_factor: float | None = 0.0
+  lbl_loss_weight: float = 0.0
+  router_z_loss_weight: float = 0.0
   # Mixed precision related.
   activation_dtype: DTypeLike = 'bfloat16'
   # Below are for experimental usage.
@@ -1106,7 +1383,6 @@ class TransformerBlock(module.SimplyModule):
   flash_attention_block_size: int = 512
   window_size: int = 0
   use_window_chunk: bool = False
-  use_combined_qkv: bool = True
   n_kv_heads: int = 0
   ffn_use_bias: bool = True
   qkv_use_bias: bool = False
@@ -1118,6 +1394,12 @@ class TransformerBlock(module.SimplyModule):
   rope_max_timescale: int = 10_000
   rope_scale_factor: float = 1.0
   query_scale: float = -1.0
+  # tile sizes for gmm.
+  tile_batch_seq: int = 128
+  tile_model_dim: int = 128
+  tile_expand_dim: int = 128
+  # Implementation of gmm.
+  gmm_impl: str = 'ragged_dot'
 
   @property
   def expand_dim(self) -> int:
@@ -1200,7 +1482,6 @@ class TransformerBlock(module.SimplyModule):
         flash_attention_block_size=self.flash_attention_block_size,
         window_size=self.window_size,
         use_window_chunk=self.use_window_chunk,
-        use_combined_qkv=self.use_combined_qkv,
         n_kv_heads=self.n_kv_heads,
         qkv_use_bias=self.qkv_use_bias,
         o_use_bias=self.o_use_bias,
@@ -1209,37 +1490,50 @@ class TransformerBlock(module.SimplyModule):
         rope_scale_factor=self.rope_scale_factor,
         query_scale=self.query_scale,
     )
-    self.ffn_0 = Linear(
-        self.model_dim, self.expand_dim, use_bias=self.ffn_use_bias,
-        # Mixed precision related.
-        activation_dtype=self.activation_dtype,
-        # Sharding related.
-        weight_partition=self.sharding_config.ffn0_partition,
-        output_partition=self.sharding_config.ffn0_activation_partition)
-    self.ffn_1 = Linear(
-        self.expand_dim, self.model_dim, use_bias=self.ffn_use_bias,
-        # Mixed precision related.
-        activation_dtype=self.activation_dtype,
-        # Sharding related.
-        weight_partition=self.sharding_config.ffn1_partition,
-        output_partition=self.sharding_config.activation_partition)
-    if self.use_gated_activation_in_ffn:
-      self.ffn_0_gate = Linear(
-          self.model_dim, self.expand_dim, use_bias=self.ffn_use_bias,
+    if self.use_moe:
+      self.ffn = MoEFeedForward(
+          num_experts=self.num_experts,
+          num_experts_per_token=self.num_experts_per_token,
+          expert_capacity_factor=self.expert_capacity_factor,
+          router_z_loss_weight=self.router_z_loss_weight,
+          lbl_loss_weight=self.lbl_loss_weight,
+          model_dim=self.model_dim,
+          expand_factor=self.expand_factor,
+          use_gated_activation_in_ffn=self.use_gated_activation_in_ffn,
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
           # Sharding related.
-          weight_partition=self.sharding_config.ffn0_partition,
-          output_partition=self.sharding_config.ffn0_activation_partition)
+          sharding_config=self.sharding_config,
+          # Below are for experimental usage.
+          ffn_expand_dim=self.ffn_expand_dim,
+          ffn_use_bias=self.ffn_use_bias,
+          ffn_activation=self.ffn_activation,
+          # tile sizes for gmm.
+          tile_batch_seq=self.tile_batch_seq,
+          tile_model_dim=self.tile_model_dim,
+          tile_expand_dim=self.tile_expand_dim,
+          # Implementation of gmm.
+          gmm_impl=self.gmm_impl,
+      )
+    else:
+      self.ffn = FeedForward(
+          model_dim=self.model_dim,
+          expand_factor=self.expand_factor,
+          use_gated_activation_in_ffn=self.use_gated_activation_in_ffn,
+          # Mixed precision related.
+          activation_dtype=self.activation_dtype,
+          # Sharding related.
+          sharding_config=self.sharding_config,
+          # Below are for experimental usage.
+          ffn_expand_dim=self.ffn_expand_dim,
+          ffn_use_bias=self.ffn_use_bias,
+          ffn_activation=self.ffn_activation,
+      )
 
   def init(self, prng_key: PRNGKey) -> PyTree:
     params = {}
-    ffn0_key, ffn0gate_key, ffn1_key, attn_key = jax.random.split(
-        prng_key, num=4)
-    params['ffn_0'] = self.ffn_0.init(ffn0_key)
-    if self.use_gated_activation_in_ffn:
-      params['ffn_0_gate'] = self.ffn_0_gate.init(ffn0gate_key)
-    params['ffn_1'] = self.ffn_1.init(ffn1_key)
+    ffn_key, attn_key = jax.random.split(prng_key, num=2)
+    params['ffn'] = self.ffn.init(ffn_key)
     params['attn'] = self.attn.init(attn_key)
     if self.use_pre_ln:
       params['pre_ln_0'] = self.pre_ln_0.init()
@@ -1255,7 +1549,8 @@ class TransformerBlock(module.SimplyModule):
 
   def apply(
       self,
-      params: PyTree, x: Array,
+      params: PyTree,
+      x: Array,
       *,
       segment_ids: Array,
       segment_positions: Array,
@@ -1266,44 +1561,40 @@ class TransformerBlock(module.SimplyModule):
     if self.use_pre_ln:
       x = self.pre_ln_0.apply(params['pre_ln_0'], x)
     x, attn_extra_output = self.attn.apply(
-        params['attn'], x,
+        params['attn'],
+        x,
         segment_ids=segment_ids,
         segment_positions=segment_positions,
-        decode_state=decode_state)
+        decode_state=decode_state,
+    )
     if self.use_post_ln:
       x = self.post_ln_0.apply(params['post_ln_0'], x)
     x += x_res
     if self.use_post_skip_ln:
       x = self.post_skip_ln_0.apply(params['post_skip_ln_0'], x)
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.activation_partition)
+        x, self.sharding_config.activation_partition
+    )
 
     x_res = x
     if self.use_pre_ln:
       x = self.pre_ln_1.apply(params['pre_ln_1'], x)
-    projected_x = self.ffn_0.apply(params['ffn_0'], x)
-    if self.use_gated_activation_in_ffn:
-      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], x)
-      x = (
-          jnp.asarray(
-              registry.FunctionRegistry.get(self.ffn_activation)(gate),
-              self.activation_dtype,
-          )
-          * projected_x
-      )
-    else:
-      x = jnp.asarray(gelu(projected_x), self.activation_dtype)
-    x = self.ffn_1.apply(params['ffn_1'], x)
+    # Assumes pad id for segment_ids is 0.
+    x, ffn_extra_output = self.ffn.apply(
+        params['ffn'], x, inputs_mask=segment_ids != 0)
     if self.use_post_ln:
       x = self.post_ln_1.apply(params['post_ln_1'], x)
     x += x_res
     if self.use_post_skip_ln:
       x = self.post_skip_ln_1.apply(params['post_skip_ln_1'], x)
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.activation_partition)
+        x, self.sharding_config.activation_partition
+    )
 
     if decode_state is not None:
       extra_output['decode_state'] = attn_extra_output['decode_state']
+    if self.use_moe:
+      extra_output['ffn'] = ffn_extra_output
     return x, extra_output
 
 
@@ -1345,6 +1636,7 @@ class InputEncoderInterface(module.SimplyModule):
 @dataclasses.dataclass
 class TransformerLM(module.SimplyModule):
   """A decoder-only Transformer."""
+
   config: SimplyConfig
   sharding_config: SimplyConfig | None = None
 
@@ -1355,12 +1647,14 @@ class TransformerLM(module.SimplyModule):
     sharding_config = self.sharding_config
     self.activation_dtype = config.activation_dtype_name
 
-    self.embed = Embedding(
+    self.embed_linear = module.EmbeddingLinear(
         vocab_size=config.vocab_size,
         dim=config.model_dim,
-        partition=sharding_config.embed_partition,
+        weight_partition=sharding_config.embed_partition,
         activation_dtype=self.activation_dtype,
-        lookup_scale=config.embedding_lookup_scale,
+        embedding_scale_by_sqrt_dim=config.embedding_lookup_scale,
+        use_tied_embedding=config.use_tied_embedding,
+        use_bias=config.output_layer_use_bias,
     )
     self.input_encoders: list[InputEncoderInterface] = config.input_encoders
     names = [x.name for x in self.input_encoders]
@@ -1389,6 +1683,17 @@ class TransformerLM(module.SimplyModule):
           use_gated_activation_in_ffn=config.use_gated_activation_in_ffn,
           ffn_use_bias=config.ffn_use_bias,
           ffn_expand_dim=getattr(config, 'ffn_expand_dim', None),
+          # MoE related.
+          use_moe=config.use_moe,
+          num_experts=config.num_experts,
+          expert_capacity_factor=config.expert_capacity_factor,
+          num_experts_per_token=config.num_experts_per_token,
+          lbl_loss_weight=config.lbl_loss_weight,
+          router_z_loss_weight=config.router_z_loss_weight,
+          tile_batch_seq=config.tile_batch_seq,
+          tile_model_dim=config.tile_model_dim,
+          tile_expand_dim=config.tile_expand_dim,
+          gmm_impl=config.gmm_impl,
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
           sharding_config=sharding_config,
@@ -1397,7 +1702,6 @@ class TransformerLM(module.SimplyModule):
           flash_attention_block_size=config.flash_attention_block_size,
           window_size=config.window_size if pattern == 'local' else 0,
           use_window_chunk=config.use_window_chunk,
-          use_combined_qkv=config.use_combined_qkv,
           n_kv_heads=config.n_kv_heads,
           qkv_use_bias=config.qkv_use_bias,
           ffn_activation=config.ffn_activation,
@@ -1423,22 +1727,11 @@ class TransformerLM(module.SimplyModule):
         scale_plus_one=config.norm_scale_plus_one,
         epsilon=config.rms_norm_epsilon,
     )
-    self.output_layer = Linear(
-        config.model_dim,
-        config.vocab_size,
-        use_bias=config.output_layer_use_bias,
-        use_external_weights=config.use_tied_embedding,
-        # Mixed precision related.
-        activation_dtype=self.activation_dtype,
-        # Sharding related.
-        weight_partition=sharding_config.embed_partition[::-1],
-        output_partition=sharding_config.logits_partition,
-    )
 
   def init(self, prng_key: PRNGKey) -> PyTree:
     params = {}
-    prng_key, embed_key, output_layer_key = jax.random.split(prng_key, num=3)
-    params['embed'] = self.embed.init(embed_key)
+    prng_key, embed_linear_key = jax.random.split(prng_key, num=2)
+    params['embed_linear'] = self.embed_linear.init(embed_linear_key)
 
     input_encoder_params = {}
     for input_encoder in self.input_encoders:
@@ -1453,7 +1746,6 @@ class TransformerLM(module.SimplyModule):
       prng_key, block_key = jax.random.split(prng_key, num=2)
       params[f'block_{i}'] = block.init(block_key)
     params['final_ln'] = self.final_ln.init()
-    params['output_layer'] = self.output_layer.init(output_layer_key)
     return params
 
   def _replace_embeddings(
@@ -1527,11 +1819,14 @@ class TransformerLM(module.SimplyModule):
     self.sharding_config = cast(SimplyConfig, self.sharding_config)
     # Add sharding constraints to the inputs.
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.data_partition)
+        x, self.sharding_config.data_partition
+    )
     segment_ids = sharding_lib.with_sharding_constraint(
-        segment_ids, self.sharding_config.data_partition)
+        segment_ids, self.sharding_config.data_partition
+    )
     segment_positions = sharding_lib.with_sharding_constraint(
-        segment_positions, self.sharding_config.data_partition)
+        segment_positions, self.sharding_config.data_partition
+    )
 
     # TODO: Consider removing this conversion. In theory, in can result
     # in larger HBM usage when params.dtype=float32, activation_dtype=bfloat16,
@@ -1544,12 +1839,15 @@ class TransformerLM(module.SimplyModule):
         return jnp.asarray(x, dtype=activation_dtype)
       else:
         return x
+
     params = jax.tree_util.tree_map(
         functools.partial(
-            convert_to_lower_bits, activation_dtype=self.activation_dtype),
-        params)
+            convert_to_lower_bits, activation_dtype=self.activation_dtype
+        ),
+        params,
+    )
 
-    x = self.embed.apply(params['embed'], x)
+    x = self.embed_linear.embed(params['embed_linear'], x)
 
     for input_encoder in self.input_encoders:
       missing_keys = [
@@ -1645,8 +1943,11 @@ class TransformerLM(module.SimplyModule):
           apply_fn = self.blocks[i].apply
           if self.config.use_remat:
             apply_fn = jax.remat(
-                apply_fn, policy=getattr(
-                    jax.checkpoint_policies, self.config.remat_policy, None))
+                apply_fn,
+                policy=getattr(
+                    jax.checkpoint_policies, self.config.remat_policy, None
+                ),
+            )
           block_decode_state = _completed_block_decode_state(
               block_decode_state_list[i]
           )
@@ -1737,27 +2038,13 @@ class TransformerLM(module.SimplyModule):
         extra_output[k][f'block_{i}'] = v
 
     x = self.final_ln.apply(params['final_ln'], x)
-    if self.config.use_tied_embedding:
-      output_layer_params = {
-          self.output_layer.weight_name:
-              jax.tree.map(jnp.transpose, params['embed']),
-      }
-      if self.output_layer.use_bias:
-        output_layer_params[self.output_layer.bias_name] = params[
-            'output_layer'
-        ][self.output_layer.bias_name]
-    else:
-      output_layer_params = params['output_layer']
-    logits = self.output_layer.apply(output_layer_params, x)
+    logits = self.embed_linear.apply(params['embed_linear'], x)
     if self.config.output_logits_soft_cap > 0:
       logits = soft_cap(logits, self.config.output_logits_soft_cap)
     return logits, extra_output
 
   def predict_probs(
-      self,
-      params: PyTree,
-      x: Array,
-      temperature: float = 1.0
+      self, params: PyTree, x: Array, temperature: float = 1.0
   ) -> Array:
     logits, _ = self.apply(params, x)
     logits = logits.astype(jnp.float32)
@@ -1846,7 +2133,31 @@ def compute_eval_loss(model, params, batch):
   return compute_loss(model, params, batch)
 
 
-def compute_distill_loss(model, params, teacher_model, teacher_params, batch):
+def compute_distill_loss(
+    model,
+    params,
+    teacher_model,
+    teacher_params,
+    batch,
+    temperature=1.0,
+    alpha: float = 1.0,
+):
+  """Computes the distillation loss between a student and teacher model.
+
+  Args:
+    model: The student model.
+    params: The student model parameters.
+    teacher_model: The teacher model.
+    teacher_params: The teacher model parameters.
+    batch: The input batch.
+    temperature: The temperature scaling factor for the logits. Higher values
+      soften the probability distributions, while lower values sharpen them.
+    alpha: The weight of the soft loss (KL divergence). The hard loss weight is
+      (1 - alpha). alpha = 1.0 means only soft loss is used.
+
+  Returns:
+    The distillation loss and a dictionary of extra outputs.
+  """
   inputs = batch['decoder_input_tokens']
   loss_weights = batch['decoder_loss_weights']
   segment_ids = batch.get('decoder_segment_ids', None)
@@ -1861,12 +2172,32 @@ def compute_distill_loss(model, params, teacher_model, teacher_params, batch):
   logits = logits.astype(jnp.float32)
   teacher_logits = teacher_logits.astype(jnp.float32)
   teacher_logits = jax.lax.stop_gradient(teacher_logits)
-  token_loss = jnp.einsum(
+  # Apply temperature scaling to soften the distributions.
+  scaled_teacher_logits = teacher_logits / temperature
+  scaled_student_logits = logits / temperature
+  # Compute KL divergence: KL(teacher || student) with temp scaling.
+  # Scale by temperature^2 to maintain gradient magnitude.
+  soft_token_loss = (temperature**2) * jnp.einsum(
       'blv,blv->bl',
-      jax.nn.softmax(teacher_logits),
-      jax.nn.log_softmax(teacher_logits) - jax.nn.log_softmax(logits))
-  total_loss = jnp.sum(token_loss * loss_weights)
-  loss = total_loss / jnp.sum(loss_weights)
+      jax.nn.softmax(scaled_teacher_logits),
+      jax.nn.log_softmax(scaled_teacher_logits)
+      - jax.nn.log_softmax(scaled_student_logits),
+  )
+
+  soft_loss = jnp.sum(soft_token_loss * loss_weights) / jnp.sum(loss_weights)
+  soft_loss = sharding_lib.with_sharding_constraint(soft_loss, None)
+
+  # Calculate Hard Loss
+  targets = batch['decoder_target_tokens']
+  targets_one_hot = jax.nn.one_hot(targets, logits.shape[-1], axis=-1)
+  hard_token_loss = -jnp.einsum(
+      'blv,blv->bl', targets_one_hot, jax.nn.log_softmax(logits)
+  )
+  hard_loss = jnp.sum(hard_token_loss * loss_weights) / jnp.sum(loss_weights)
+  hard_loss = sharding_lib.with_sharding_constraint(hard_loss, None)
+
+  # Combine soft and hard losses
+  loss = alpha * soft_loss + (1.0 - alpha) * hard_loss
   loss = sharding_lib.with_sharding_constraint(loss, None)
   # Compute accuracy.
   pred = jnp.argmax(logits, axis=-1)
@@ -1877,15 +2208,24 @@ def compute_distill_loss(model, params, teacher_model, teacher_params, batch):
   return loss, {'accuracy': accuracy}
 
 
-def train_one_step(state, batch, model, opt,
-                   teacher_model=None,
-                   lr=1e-4, grad_accum_steps=-1,
-                   clip_grad_norm=-1, clip_update_norm=-1,
-                   clip_update_rms=-1,
-                   clip_local_update_rms=-1,
-                   weight_decay=-1,
-                   custom_loss_fn=None,
-                   add_log_info=False):
+def train_one_step(
+    state,
+    batch,
+    model,
+    opt,
+    teacher_model=None,
+    lr=1e-4,
+    grad_accum_steps=-1,
+    clip_grad_norm=-1,
+    clip_update_norm=-1,
+    clip_update_rms=-1,
+    clip_local_update_rms=-1,
+    weight_decay=-1,
+    custom_loss_fn=None,
+    add_log_info=False,
+    distill_temperature: float = 1.0,
+    distill_alpha: float = 1.0,
+):
   clip_norm_fn = functools.partial(
       clip_tree_fn, fn=tree_norm, fn_name='norm')
   clip_rms_fn = functools.partial(
@@ -1911,8 +2251,14 @@ def train_one_step(state, batch, model, opt,
       (loss, extra_output), grad = jax.value_and_grad(
           loss_fn, argnums=1, has_aux=True)(model, state['params'], batch)
     else:
-      loss_fn = (
-          compute_distill_loss if custom_loss_fn is None else custom_loss_fn)
+      if custom_loss_fn is None:
+        loss_fn = functools.partial(
+            compute_distill_loss,
+            temperature=distill_temperature,
+            alpha=distill_alpha,
+        )
+      else:
+        loss_fn = custom_loss_fn
       (loss, extra_output), grad = jax.value_and_grad(
           loss_fn, argnums=1, has_aux=True)(
               model, state['params'],
@@ -2062,29 +2408,6 @@ def compute_tree_info_fn(tree, name, fn, fn_name):
 
 
 ################################################################################
-# Evaluation.
-
-
-def evaluate(loss_fn, params, dataset, print_debug_info=False):
-  loss_sum = 0.0
-  for batch in dataset.as_numpy_iterator():
-    batch_loss = loss_fn(params=params, batch=batch)
-    if print_debug_info:
-      print(f'batch_loss.sharding: {batch_loss.sharding}')
-      print(f'batch_loss: {batch_loss.addressable_data(0)}')
-      print(f'batch_loss.is_fully_addressable '
-            f'{batch_loss.is_fully_addressable}')
-      print(f'batch_loss.is_fully_replicated {batch_loss.is_fully_replicated}')
-      print(f'batch_loss.sharding.device_set {batch_loss.sharding.device_set}')
-    loss_sum += batch_loss.addressable_data(0)
-  return loss_sum
-
-
-def is_primary_process():
-  return jax.process_index() == 0
-
-
-################################################################################
 # Experiment.
 
 
@@ -2131,7 +2454,9 @@ def run_experiment(
   helper.save_state_info(state)
 
   # Compile loss, train and learning rate functions.
-  @functools.partial(jax.jit, static_argnames=['add_log_info'])
+  @functools.partial(
+      jax.jit, donate_argnames=['state'], static_argnames=['add_log_info']
+  )
   def train_one_step_fn(state, batch, lr, add_log_info=False):
     return train_one_step(
         state=state,
@@ -2146,6 +2471,8 @@ def run_experiment(
         clip_local_update_rms=config.clip_local_update_rms,
         weight_decay=config.weight_decay,
         add_log_info=add_log_info,
+        distill_temperature=config.distill_temperature,
+        distill_alpha=config.distill_alpha,
     )
   lr_fn = common.named_jit(opt_lib.create_lr_schedule(config), 'lr_fn')
 
@@ -2210,10 +2537,6 @@ def run_experiment(
 
       batch = build_global_array_from_replicated(
           batch, data_partition=(('replica', 'data'),)
-      )
-      logging.info(
-          'batch.addressable_shards=%s',
-          batch['decoder_target_tokens'].addressable_shards,
       )
       data_generation_step_time = time.time() - t1
 
@@ -2296,19 +2619,19 @@ def create_model(config, sharding_config):
     model_cls = module.ModuleRegistry.get(config.model_name)
     model = model_cls(config, sharding_config=sharding_config)
   teacher_model = None
-  if hasattr(config, 'teacher'):
-    teacher_model_cls = module.ModuleRegistry.get(config.teacher.model_name)
+  if teacher_config := getattr(config, 'teacher', None):
+    teacher_model_cls = module.ModuleRegistry.get(teacher_config.model_name)
     teacher_model = teacher_model_cls(
-        config.teacher, sharding_config=sharding_config)
+        teacher_config, sharding_config=sharding_config)
   return model, {'teacher': teacher_model}
 
 
 def build_global_array_from_replicated(
     batch: PyTree, data_partition: PartitionAnnotation = None
-):
+) -> PyTree:
   return jax.tree_util.tree_map(
       lambda x: jax.lax.with_sharding_constraint(
-          x, sharding_lib.mesh_sharding(data_partition)
+          jnp.asarray(x), sharding_lib.mesh_sharding(data_partition)
       ),
       batch,
   )
@@ -2316,7 +2639,7 @@ def build_global_array_from_replicated(
 
 def build_global_batch_from_sharded(
     batch: PyTree, data_partition: PartitionAnnotation = None
-):
+) -> PyTree:
   data_sharding = sharding_lib.mesh_sharding(data_partition)
 
   def _build_global_array_from_sharded(array: np.ndarray):
@@ -2374,12 +2697,11 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
     abstract_teacher_state = {
         'params': ckpt_lib.get_abstract_params(teacher_model)
     }
-    # TODO: Separate the teacher init config and regular init config.
     teacher_state = ckpt_lib.load_checkpoint_from_dir(
-        config.init_ckpt_dir,
+        config.teacher_ckpt_dir,
         abstract_teacher_state,
-        config.init_ckpt_step,
-        ckpt_format=config.init_ckpt_format,
+        config.teacher_ckpt_step,
+        ckpt_format=config.teacher_ckpt_format,
     )
     state['teacher_params'] = teacher_state['params']
   return state
@@ -2464,31 +2786,32 @@ def compute_batch_stats_info(
   seq_len = batch['decoder_target_tokens'].shape[1]
   result['seq_len'] = seq_len
 
-  tokens_per_seq = np.sum(
-      batch['decoder_target_tokens'] != pad_id, axis=-1).astype(np.int32)
-  result['num_tokens'] = tokens_per_seq.sum()
-  result['avg_num_tokens_per_seq'] = tokens_per_seq.mean()
-  result['std_num_tokens_per_seq'] = tokens_per_seq.std()
+  tokens_per_seq = jnp.sum(
+      batch['decoder_target_tokens'] != pad_id, axis=-1, dtype=jnp.float32
+  )
+  result['num_tokens'] = jnp.sum(tokens_per_seq)
+  result['avg_num_tokens_per_seq'] = jnp.mean(tokens_per_seq)
+  result['std_num_tokens_per_seq'] = jnp.std(tokens_per_seq)
 
   ratio_of_nonpad_tokens = tokens_per_seq / seq_len
-  result['avg_ratio_nonpad_tokens_per_seq'] = ratio_of_nonpad_tokens.mean()
-  result['std_ratio_nonpad_tokens_per_seq'] = ratio_of_nonpad_tokens.std()
+  result['avg_ratio_nonpad_tokens_per_seq'] = jnp.mean(ratio_of_nonpad_tokens)
+  result['std_ratio_nonpad_tokens_per_seq'] = jnp.std(ratio_of_nonpad_tokens)
 
   loss_weights = batch.get('decoder_loss_weights', None)
   if loss_weights is None:
     loss_weights = jnp.ones((batch_size, seq_len), dtype='bool')
 
-  loss_weights_per_seq = np.sum(loss_weights, axis=-1)
-  result['total_weights'] = loss_weights_per_seq.sum()
-  result['avg_weights_per_seq'] = loss_weights_per_seq.mean()
-  result['std_weights_per_seq'] = loss_weights_per_seq.std()
+  loss_weights_per_seq = jnp.sum(loss_weights, axis=-1, dtype=jnp.float32)
+  result['total_weights'] = jnp.sum(loss_weights_per_seq)
+  result['avg_weights_per_seq'] = jnp.mean(loss_weights_per_seq)
+  result['std_weights_per_seq'] = jnp.std(loss_weights_per_seq)
 
   if 'decoder_segment_ids' in batch:
-    num_segments = np.max(batch['decoder_segment_ids'], axis=-1)
-    result['num_segments'] = num_segments.sum()
-    result['avg_num_segments_per_seq'] = num_segments.mean()
-    result['std_num_segments_per_seq'] = num_segments.std()
-    result['avg_segment_length'] = tokens_per_seq.sum() / num_segments.sum()
+    num_segments = jnp.max(batch['decoder_segment_ids'], axis=-1)
+    result['num_segments'] = jnp.sum(num_segments)
+    result['avg_num_segments_per_seq'] = jnp.mean(num_segments)
+    result['std_num_segments_per_seq'] = jnp.std(num_segments)
+    result['avg_segment_length'] = result['num_tokens'] / result['num_segments']
   return result
 
 
@@ -3521,48 +3844,40 @@ def get_scaling_info(config, also_print=False, add_attn_flops=False):
   return info_dict
 
 
-def quantize_tfm_params(params, symmetric=False, repeated=False):
+def quantize_tfm_params(params, symmetric=False):
   params = get_raw_arrays(params)
   if isinstance(params, jnp.ndarray):
     return params
   quant_params = {}
   for key in params:
-    if key.startswith('repeated'):
+    if key.startswith('block'):
       quant_params[key] = quantize_tfm_params(
-          params[key], symmetric=symmetric, repeated=True
+          params[key], symmetric=symmetric
       )
-    elif key == 'attn' or key.startswith('ffn_'):
+    elif key == 'attn':
       subparams = copy.copy(params[key])
-      for subkey in [
-          'w',
-          'b',
-          'o_proj',
-          'q_proj',
-          'k_proj',
-          'v_proj',
-          'qkv_proj',
-          'kv_proj',
-      ]:
-        if subkey in subparams:
-          if repeated:
-            unstacked = [
-                common.quantize_array(
-                    p,
-                    symmetric=symmetric,
-                )
-                for p in jnp.unstack(subparams[subkey])
-            ]
-            subparams[subkey] = jax.tree_util.tree_map(
-                lambda *xs: jnp.stack(xs), *unstacked
-            )
-          else:
-            subparams[subkey] = common.quantize_array(
-                subparams[subkey],
-                symmetric=symmetric,
-            )
+      for subkey in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+        subparams[subkey]['w'] = common.quantize_array(
+            subparams[subkey]['w'],
+            symmetric=symmetric,
+        )
       quant_params[key] = subparams
+    elif key == 'ffn':
+      subparams = copy.copy(params[key])
+      for subkey in ['ffn_0', 'ffn_0_gate', 'ffn_1']:
+        subparams[subkey]['w'] = common.quantize_array(
+            subparams[subkey]['w'],
+            symmetric=symmetric,
+        )
+      quant_params[key] = subparams
+    elif (
+        key.startswith('embed_linear')
+        or key.startswith('final_ln')
+        or key.startswith('pre_ln')
+        or key.startswith('post_ln')
+    ):
+      # Leave the embedding linear and layer norm layer unquantized.
+      quant_params[key] = params[key]
     else:
-      quant_params[key] = quantize_tfm_params(
-          params[key], symmetric=symmetric, repeated=repeated
-      )
+      raise ValueError(f'Unknown key: {key}!')
   return quant_params

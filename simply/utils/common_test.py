@@ -85,7 +85,7 @@ class CommonTest(absltest.TestCase):
 
   def test_find_unused_argpaths(self):
     def _func(tree):
-      return tree['a']['x'] + tree['b'][1], tree['d']
+      return tree['a']['x'] + tree['b'][1], tree['d'], jnp.zeros((1,))
 
     tree = {
         'a': {'x': jnp.array([1, 2]), 'y': jnp.array(0)},

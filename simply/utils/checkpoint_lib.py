@@ -81,6 +81,47 @@ class CheckpointFormatRegistry(registry.FunctionRegistry):
 class LegacyFormat(CheckpointFormat):
   """The legacy checkpoint format this project is using at the beginning."""
 
+  def transforms(
+      self, stored_state: PyTree, target_abstract_state: PyTree = None
+  ) -> PyTree:
+    flatten_stored_state = ocp.tree.to_flat_dict(stored_state, sep='/')
+    transformed_state = {}
+    for k, v in flatten_stored_state.items():
+      if m := re.fullmatch(r'(\w+)/output_layer/(\w+)', k):
+        suffix = m.group(2)
+        new_k = f'{m.group(1)}/embed_linear/{suffix}'
+        if suffix == 'w':
+          v = jnp.transpose(v)  # dv -> vd
+        transformed_state[new_k] = v
+      elif m := re.fullmatch(r'(\w+)/embed', k):
+        if 'params/output_layer/w' in flatten_stored_state:
+          new_k = f'{m.group(1)}/embed_linear/embed'
+        else:
+          new_k = f'{m.group(1)}/embed_linear/w'
+        transformed_state[new_k] = v
+      elif m := re.fullmatch(r'(\w+/block_\d+/attn)/(\w+_(?:proj|bias))', k):
+        term, suffix = m.group(2).split('_', maxsplit=1)
+        new_suffix = dict(proj='w', bias='b')[suffix]
+        new_ks = [f'{m.group(1)}/{x}_proj/{new_suffix}' for x in term]
+        new_vs = [v] if len(term) == 1 else jnp.unstack(v)
+        for new_k, new_v in zip(new_ks, new_vs):
+          transformed_state[new_k] = new_v
+      elif m := re.fullmatch(r'(\w+/block_\d+/attn)/(\w+_bias)', k):
+        new_k = f'{m.group(1)}/{m.group(2)}/b'
+        transformed_state[new_k] = v
+      elif m := re.fullmatch(r'(\w+/block_\d+)/(ffn.*)', k):
+        new_k = f'{m.group(1)}/ffn/{m.group(2)}'
+        transformed_state[new_k] = v
+      else:
+        transformed_state[k] = v
+    return ocp.tree.from_flat_dict(transformed_state, sep='/')
+
+
+@CheckpointFormatRegistry.register
+@dataclasses.dataclass(frozen=True)
+class V2Format(CheckpointFormat):
+  """Current format that modulizes a lot of model components."""
+
 
 @CheckpointFormatRegistry.register
 @dataclasses.dataclass(frozen=True)
@@ -180,6 +221,7 @@ class Gemma3pFormat(CheckpointFormat):
         transformed_state['steps'] = v
       else:
         logging.warning('stored_state[%s] is ignored by %s', k, self.__class__)
+    transformed_state = LegacyFormat.transforms(self, transformed_state)
     return ocp.tree.from_flat_dict(transformed_state, sep='/')
 
 
@@ -228,9 +270,9 @@ class Qwen2Format(CheckpointFormat):
       self, stored_state: PyTree, target_abstract_state: PyTree = None
   ) -> PyTree:
     flatten_stored_state = ocp.tree.to_flat_dict(stored_state, sep='/')
-    per_head_dim = target_abstract_state['params']['block_0']['attn'][
-        'q_proj'
-    ].shape[-1]
+    per_head_dim = pytree.tree_value(
+        target_abstract_state, 'params/block_0/attn/q_proj/w'
+    ).shape[-1]
     transformed_state = {}
     for k, v in flatten_stored_state.items():
       if k == 'model.embed_tokens.weight':
@@ -278,6 +320,7 @@ class Qwen2Format(CheckpointFormat):
         transformed_state[f'params/block_{m.group(1)}/pre_ln_1/scale'] = v
       else:
         logging.warning('stored_state[%s] is ignored by %s', k, self.__class__)
+    transformed_state = LegacyFormat.transforms(self, transformed_state)
     return ocp.tree.from_flat_dict(transformed_state, sep='/')
 
 
@@ -534,7 +577,7 @@ def save_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     state: PyTree,
     ckpt_step: int,
-    ckpt_format: CheckpointFormat = LegacyFormat(),
+    ckpt_format: CheckpointFormat = V2Format(),
     data: PyTree | None = None,
     **kwargs: Any,
 ):

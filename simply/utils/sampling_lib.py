@@ -245,15 +245,21 @@ ChunkSequence = Sequence[Chunk]
 SamplingInput = str | ChunkSequence
 
 
+def chunks_as_text(chunks: ChunkSequence):
+  texts = [c.content for c in chunks if c.type == Chunk.Type.TEXT]
+  return ''.join(texts)
+
+
 def input_as_chunks(sampling_input: SamplingInput) -> ChunkSequence:
   if isinstance(sampling_input, str):
     return [Chunk(type=Chunk.Type.TEXT, content=sampling_input)]
   return sampling_input
 
 
-def chunks_as_text(chunks: ChunkSequence):
-  texts = [c.content for c in chunks if c.type == Chunk.Type.TEXT]
-  return ''.join(texts)
+def input_as_text(sampling_input: SamplingInput) -> str:
+  if isinstance(sampling_input, str):
+    return sampling_input
+  return chunks_as_text(sampling_input)
 
 
 class InputProcessorRegistry(registry.RootRegistry):
@@ -327,7 +333,9 @@ class BasicTextInputProcessor(InputProcessorInterface):
   def encode(
       self, chunks: ChunkSequence,
       max_input_len: int | None = None) -> ProcessedInput:
-    tokens = [self.bos_id]
+    tokens = []
+    if self.bos_id is not None:
+      tokens.append(self.bos_id)
     for c in chunks:
       if c.type == Chunk.Type.TEXT:
         tokens += self.vocab.encode(c.content)

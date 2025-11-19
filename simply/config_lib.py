@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import math
 import os
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 import jax
 
@@ -194,6 +194,21 @@ class DataParallelSharding:
 class ExperimentConfig:
   """Base experiment config for others to inherit."""
 
+  def override_from(
+      self, config: 'ExperimentConfig', error_on_extra: bool = True
+  ) -> Self:
+    """Override fields with the corresponding values in the given `config`."""
+    source_names = {f.name for f in dataclasses.fields(config)}
+    target_names = {f.name for f in dataclasses.fields(self)}
+
+    extras = source_names - target_names
+    if extras and error_on_extra:
+      raise ValueError(
+          f'The given config has extra fields: {sorted(extras)}')
+    updates = {name: getattr(config, name)
+               for name in source_names & target_names}
+    return dataclasses.replace(self, **updates)
+
 
 @ExperimentConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
@@ -229,7 +244,6 @@ class BaseExperimentConfig(ExperimentConfig):
   flash_attention_block_size: int = 512
   window_size: int = 0
   use_window_chunk: bool = False
-  use_combined_qkv: bool = True
   qkv_use_bias: bool = False
   n_kv_heads: int = 0
   block_attn_pattern: tuple[str, ...] = ('global',)
@@ -349,22 +363,32 @@ class BaseExperimentConfig(ExperimentConfig):
   # Early stopping threshold.
   early_stop: opt_lib.EarlyStop | None = None
 
+  # Teacher model for distillation.
+  teacher: ExperimentConfig | None = None
+  # Config for init from loading checkpoint for teacher model.
+  teacher_ckpt_dir: str = ''
+  teacher_ckpt_step: int = -1
+  teacher_ckpt_format: str = ''
+
+  # Distillation parameters
+  distill_temperature: float = 1.0
+  distill_alpha: float = 1.0
+
 
 @ExperimentConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
 class RLExperimentConfig(BaseExperimentConfig):
   train_loop_name: str = 'rl'
+
+  # New fields for training.
   evaluation: evaluation_lib.Evaluation = (
       evaluation_lib.ZeroShotBoxedInQuestionEvaluation()
   )
-  dataset_name: str = 'simply_json:gsm8k_train'
-  num_train_steps: int = 1_000_000
-  use_validation_set: bool = False
-  validation_num_eval_steps: int = 8
-  validation_eval_interval: int = 100
-  validation_dataset_name: str | None = 'simply_json:gsm8k_test'
-  validation_eval_batch_size: int = -1
-  validation_eval_epochs: int = 1
+
+  # New fields for eval on validation set.
+  validation_evaluation: evaluation_lib.Evaluation | None = None
+  validation_lm_format_name: str = ''
+  validation_max_decode_steps: int | None = None
 
   # We need to define the format for sampling.
   lm_format_name: str = 'Pretrain'
@@ -383,25 +407,91 @@ class RLExperimentConfig(BaseExperimentConfig):
   sampling_prefill_size: int = 1024
   sampling_max_input_len: int = 1024
   sampling_intermediate_decode_steps: int = 1024
-  # How many steps to run given one batch of samples for training.
-  num_train_steps_per_batch: int = 4
+  sampling_max_tool_response_len: int = 1024
+
+  # How many training steps to run given one batch of samples.
+  num_train_steps_per_batch: int = 1
   max_num_samples_per_train_batch: int | None = None
 
+  # Extra EOS tokens to use during sampling.
   extra_eos_tokens: tuple[str, ...] = ()
 
   # RL algorithm configs.
   gamma: float = 1.0
-  kl_coeff: float = 0.001
+  kl_coeff: float = 0.0
   use_grpo: bool = True
   ppo_clip_eps: float = 0.2
   ppo_clip_eps_high: float | None = None
   ppo_clip_eps_low: float | None = None
-  policy_ratio_cap: float | None = 10.0
+  policy_ratio_cap: float | None = None
   normalize_reward_method: str = 'ByGroup'
   normalize_advantage: bool = False
-  max_abs_advantage: float | None = 10.0
+  max_abs_advantage: float | None = None
   filter_truncated: bool = False
   use_policy_logp_as_sampler_logp: bool = False
+
+  # New fields for decoding.
+  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
+  # New fields for quantization.
+  decoding_quant_scheme: str = 'bfloat16'
+  ref_params_dtype: str = 'bfloat16'
+
+  # Tool config.
+  tool_manager_name: str = ''
+  max_turns: int = 3
+  filter_throttled: bool = True
+
+
+def apply_simple_rl(config):
+  """Utility function to apply a simple RL config."""
+  return dataclasses.replace(
+      config,
+      train_loop_name='rl',
+      num_train_steps=1_000_000,
+      train_batch_size=16 * 8,
+      batch_size=16,
+      num_samples_per_example=8,
+      sampling_temperature=1.0,
+      num_train_steps_per_batch=1,
+      # RL algorithm configs.
+      gamma=1.0,
+      kl_coeff=0.001,
+      use_grpo=True,
+      ppo_clip_eps=0.2,
+      ppo_clip_eps_high=None,
+      ppo_clip_eps_low=None,
+      policy_ratio_cap=None,
+      normalize_reward_method='ByGroup',
+      normalize_advantage=False,
+      max_abs_advantage=None,
+      use_policy_logp_as_sampler_logp=False,
+      filter_truncated=False,
+      max_num_samples_per_train_batch=None,
+      # Optimizer configs.
+      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
+      weight_decay=0.0,
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-6,
+          warmup_steps=1,
+      ),
+      # Set sampling_max_decode_steps to a large enough value since we
+      # also use `train_max_seq_len` to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=9 * 1024,
+      sampling_prefill_size=1024,
+      sampling_max_input_len=1024,
+      sampling_intermediate_decode_steps=1024,
+      # Checkpoint and tensorboard configs.
+      init_ckpt_opt_state=False,
+      ckpt_max_to_keep=1,
+      tb_log_interval=4,
+      ckpt_interval=4,
+      # Sharding config.
+      decoding_sharding_config=DecodeGSPMDSharding(),
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+  )
 
 
 ################################################################################
@@ -512,6 +602,7 @@ def flops1e18_tfm111m_c4_l2048():
   # num_flops: 1.2609846180147364e+18
   # Predicted optimal ratio for 1.3e18: 17.2
   config = flops6e20_tfm2b_c4_l2048()
+  num_train_steps = 7252
   config = dataclasses.replace(
       config,
       model_dim=512,
@@ -519,11 +610,11 @@ def flops1e18_tfm111m_c4_l2048():
       n_layers=8,
       # 110550528 * 17.2 / 2048 / 128 = 7252 steps
       batch_size=128,
-      num_train_steps=7252,
+      num_train_steps=num_train_steps,
       weight_decay=0.261,
       lr=opt_lib.LinearWarmupCosineDecay(
           value=0.0016486710944803309,
-          warmup_steps=1_000,
+          warmup_steps=int(num_train_steps * 0.1),
           steps_after_decay=0,
           end_decay=0.1,
       ),
@@ -546,6 +637,7 @@ def flops2e17_tfm41m_c4_l2048():
   # num_flops: 1.6545097284216422e+17
   # Fitted optimal ratio for 1.7e17: 16.69
   config = flops6e20_tfm2b_c4_l2048()
+  num_train_steps = 4140
   config = dataclasses.replace(
       config,
       model_dim=256,  # 2048 // 8
@@ -553,11 +645,11 @@ def flops2e17_tfm41m_c4_l2048():
       n_layers=8,  # 18 // 2 - 1
       # 40645632 * 16.69 / 2048 / 80 = 4140 steps
       batch_size=80,
-      num_train_steps=4140,
+      num_train_steps=num_train_steps,
       weight_decay=0.248,
       lr=opt_lib.LinearWarmupCosineDecay(
           value=0.0019495171900601506,
-          warmup_steps=1_000,
+          warmup_steps=int(num_train_steps * 0.1),
           steps_after_decay=0,
           end_decay=0.1,
       ),
@@ -580,6 +672,7 @@ def flops2e16_tfm15m_c4_l2048():
   # num_flops: 2.006201364854e+16
   # Data / model ratio for 2.0e16: 15.15
   config = flops6e20_tfm2b_c4_l2048()
+  num_train_steps = 1717
   config = dataclasses.replace(
       config,
       model_dim=128,  # 2048 // 16
@@ -587,11 +680,11 @@ def flops2e16_tfm15m_c4_l2048():
       n_layers=4,  # 18 => 4
       # 14.857408 * 15.15 / 2048 / 64 = 1717 steps
       batch_size=64,
-      num_train_steps=1717,
+      num_train_steps=num_train_steps,
       weight_decay=0.1,
       lr=opt_lib.LinearWarmupCosineDecay(
           value=0.01,
-          warmup_steps=1_000,
+          warmup_steps=int(num_train_steps * 0.1),
           steps_after_decay=0,
           end_decay=0.1,
       ),
@@ -648,8 +741,6 @@ def gemma2_2b():
       init_ckpt_format='Gemma3pLegacyFormat',
       reset_steps=True,
       activation_dtype_name='bfloat16',
-      decoding_quant_scheme='bfloat16',
-      ref_params_dtype='bfloat16',
   )
 
 
@@ -890,12 +981,11 @@ def gemma3_27b_it_dsr40k_b2k_l10k_rl():  # VF_4x4x8
 
 @ExperimentConfigRegistry.register
 def gemma2_2b_gsm8k_0shot_rl():
-  config = gemma2_2b()
+  config = RLExperimentConfig().override_from(gemma2_2b())
+  config = apply_simple_rl(config)
   return dataclasses.replace(
       config,
       dataset_name='simply_json:gsm8k_train',
-      num_train_steps=1_000_000,
-      train_loop_name='rl',
       evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
       use_validation_set=True,
       validation_num_eval_steps=8,
@@ -918,19 +1008,6 @@ def gemma2_2b_gsm8k_0shot_rl():
       max_num_samples_per_train_batch=None,
       # TODO: Change the extra_eos_tokens when the prompt is improved.
       extra_eos_tokens=newlines_from_counts(range(3, 6)),
-      # RL algorithm configs.
-      gamma=1.0,
-      kl_coeff=0.001,
-      use_grpo=True,
-      ppo_clip_eps=0.2,
-      ppo_clip_eps_high=None,
-      ppo_clip_eps_low=None,
-      policy_ratio_cap=10.0,
-      normalize_reward_method='ByGroup',
-      normalize_advantage=False,
-      max_abs_advantage=10.0,
-      filter_truncated=False,
-      use_policy_logp_as_sampler_logp=False,
       # Optimizer configs.
       optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
       weight_decay=0.0,
@@ -943,8 +1020,6 @@ def gemma2_2b_gsm8k_0shot_rl():
       ckpt_max_to_keep=1,
       tb_log_interval=20,
       ckpt_interval=100,
-      # Sharding config.
-      decoding_sharding_config=DecodeGSPMDSharding(),
   )
 
 
@@ -1079,7 +1154,8 @@ def gemma2_2b_it_dsr40k_cot_0shot_rl():
 
 @ExperimentConfigRegistry.register
 def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
-  config = gemma3_4b()
+  config = RLExperimentConfig().override_from(gemma3_4b())
+  config = apply_simple_rl(config)
   return dataclasses.replace(
       config,
       # Model config.
@@ -1112,31 +1188,13 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       batch_size=32,
       grad_accum_steps=8,
       num_samples_per_example=4,
-      gamma=1.0,
-      kl_coeff=0.001,
-      use_grpo=True,
-      ppo_clip_eps=0.2,
-      ppo_clip_eps_high=None,
-      ppo_clip_eps_low=None,
-      policy_ratio_cap=10.0,
-      normalize_reward_method='ByGroup',
-      normalize_advantage=False,
-      max_abs_advantage=10.0,
-      use_kl_correction=True,
-      filter_zero_variance=True,
-      filter_truncated=False,
-      use_policy_logp_as_sampler_logp=False,
-      soft_ppo_forward_kl_coeff=0.0,
-      soft_ppo_reverse_kl_coeff=0.0,
       # Optimizer configs.
       optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
       weight_decay=0.0,
-      lr_schedule_name='constant',
-      lr_schedule_config=(
-          ('lr', 1e-6),
-          ('warmup_steps', 100),
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-7,
+          warmup_steps=100,
       ),
-      # bf16 config from Gemma2BV2.
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
@@ -1177,7 +1235,6 @@ def deepseek_qwen2_1p5b():
       qkv_use_bias=True,
       output_layer_use_bias=False,
       use_tied_embedding=False,
-      use_combined_qkv=False,
       embedding_lookup_scale=None,
       norm_scale_plus_one=False,
       attn_soft_cap=-1.0,
@@ -1190,176 +1247,6 @@ def deepseek_qwen2_1p5b():
       init_ckpt_step=-1,
       init_ckpt_opt_state=False,
       reset_steps=True,
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
-  config = deepseek_qwen2_1p5b()
-  return dataclasses.replace(
-      config,
-      dataset_name='simply_json:dsr40k_train',
-      num_train_steps=1_000_000,
-      train_loop_name='rl',
-      train_batch_size=16 * 8,
-      batch_size=16,
-      num_samples_per_example=8,
-      sampling_temperature=1.0,
-      num_train_steps_per_batch=4,
-      # RL algorithm configs.
-      gamma=1.0,
-      kl_coeff=0.001,
-      use_grpo=True,
-      ppo_clip_eps=0.2,
-      ppo_clip_eps_high=None,
-      ppo_clip_eps_low=None,
-      policy_ratio_cap=10.0,
-      normalize_reward_method='ByGroup',
-      normalize_advantage=False,
-      max_abs_advantage=10.0,
-      use_policy_logp_as_sampler_logp=False,
-      filter_truncated=False,
-      max_num_samples_per_train_batch=None,
-      # Optimizer configs.
-      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
-      weight_decay=0.0,
-      lr_schedule_name='constant',
-      lr_schedule_config=(
-          ('lr', 1e-6),
-          ('warmup_steps', 1),
-      ),
-      # Checkpoint and tensorboard configs.
-      init_ckpt_opt_state=False,
-      ckpt_max_to_keep=1,
-      tb_log_interval=4,
-      ckpt_interval=4,
-      # Sharding config.
-      decoding_sharding_config=DecodeGSPMDSharding(),
-      # Use train_max_seq_len to control the max decode steps.
-      sampling_max_decode_steps=32768,
-      train_max_seq_len=9 * 1024,
-      sampling_prefill_size=1024,
-      sampling_max_input_len=1024,
-      sampling_intermediate_decode_steps=1024,
-      lm_format_name='DeepSeekQwenR1DistillChat',
-      evaluation=evaluation_lib.ZeroShotDeepSeekQwenR1CoTBoxed(),
-      extra_eos_tokens=(),
-      activation_dtype_name='bfloat16',
-      decoding_quant_scheme='bfloat16',
-      ref_params_dtype='bfloat16',
-      use_flash_attention=True,
-      flash_attention_block_size=512,
-      use_validation_set=True,
-      validation_eval_interval=50,
-      validation_dataset_name='simply_json:aime24',
-      validation_eval_batch_size=64,
-      validation_eval_epochs=5,
-      validation_evaluation=None,
-      validation_lm_format_name='',
-      validation_max_decode_steps=None,
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
-  return dataclasses.replace(
-      config,
-      activation_dtype_name='float32',
-      decoding_quant_scheme='float32',
-      ref_params_dtype='float32',
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32()
-  return dataclasses.replace(
-      config,
-      # Batch size and gradient accumulation configs.
-      train_batch_size=64 * 8,
-      batch_size=64,
-      num_samples_per_example=8,
-      grad_accum_steps=4,
-      # Checkpoint and tensorboard logging configs.
-      tb_log_interval=1,
-      ckpt_interval=20,
-      ckpt_max_to_keep=1,
-      # Flash attention configs.
-      use_flash_attention=True,
-      flash_attention_block_size=512,
-      # RL algorithm configs.
-      num_train_steps_per_batch=1,
-      normalize_reward_method='ByGroup',
-      policy_ratio_cap=None,
-      max_abs_advantage=None,
-      lr_schedule_name='constant',
-      lr_schedule_config=(
-          ('lr', 1e-6),
-          ('warmup_steps', 1),
-      ),
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_v2():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
-  return dataclasses.replace(
-      config,
-      activation_dtype_name='bfloat16',
-      decoding_quant_scheme='bfloat16',
-      ref_params_dtype='bfloat16',
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
-  return dataclasses.replace(
-      config,
-      lr_schedule_config=(
-          ('lr', 3e-6),
-          ('warmup_steps', 1),
-      ),
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
-  return dataclasses.replace(
-      config,
-      activation_dtype_name='bfloat16',
-      decoding_quant_scheme='bfloat16',
-      ref_params_dtype='bfloat16',
-      use_validation_set=True,
-      validation_eval_batch_size=64,
-      validation_eval_interval=50,
-      use_policy_logp_as_sampler_logp=True,
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v4():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
-  return dataclasses.replace(
-      config,
-      lr_schedule_config=(
-          ('lr', 1e-5),
-          ('warmup_steps', 1),
-      ),
-  )
-
-
-@ExperimentConfigRegistry.register
-def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_t0p6():
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
-  return dataclasses.replace(
-      config,
-      activation_dtype_name='float32',
-      decoding_quant_scheme='float32',
-      ref_params_dtype='float32',
-      sampling_temperature=0.6,
   )
 
 
@@ -1409,6 +1296,158 @@ def deepseek_qwen2_32b():
       global_rope_max_timescale=1_000_000,
       rms_norm_epsilon=1e-5,
       init_ckpt_dir=DEEPSEEK_QWEN_32B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
+  config = RLExperimentConfig().override_from(deepseek_qwen2_1p5b())
+  config = apply_simple_rl(config)
+  return dataclasses.replace(
+      config,
+      dataset_name='simply_json:dsr40k_train',
+      num_train_steps=1_000_000,
+      train_loop_name='rl',
+      train_batch_size=16 * 8,
+      batch_size=16,
+      num_samples_per_example=8,
+      sampling_temperature=1.0,
+      num_train_steps_per_batch=4,
+      # Optimizer configs.
+      optimizer=opt_lib.Adam(beta1=0.9, beta2=0.95, epsilon=1e-8),
+      weight_decay=0.0,
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-6,
+          warmup_steps=1,
+      ),
+      # Checkpoint and tensorboard configs.
+      init_ckpt_opt_state=False,
+      ckpt_max_to_keep=1,
+      tb_log_interval=4,
+      ckpt_interval=4,
+      # Sharding config.
+      decoding_sharding_config=DecodeGSPMDSharding(),
+      # Use train_max_seq_len to control the max decode steps.
+      sampling_max_decode_steps=32768,
+      train_max_seq_len=9 * 1024,
+      sampling_prefill_size=1024,
+      sampling_max_input_len=1024,
+      sampling_intermediate_decode_steps=1024,
+      lm_format_name='DeepSeekQwenR1DistillChat',
+      evaluation=evaluation_lib.ZeroShotDeepSeekQwenR1CoTBoxed(),
+      extra_eos_tokens=(),
+      use_flash_attention=True,
+      flash_attention_block_size=512,
+      use_validation_set=True,
+      validation_eval_interval=50,
+      validation_dataset_name='simply_json:aime24',
+      validation_eval_batch_size=64,
+      validation_eval_epochs=5,
+      validation_evaluation=None,
+      validation_lm_format_name='',
+      validation_max_decode_steps=None,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='float32',
+      decoding_quant_scheme='float32',
+      ref_params_dtype='float32',
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32()
+  return dataclasses.replace(
+      config,
+      # Batch size and gradient accumulation configs.
+      train_batch_size=64 * 8,
+      batch_size=64,
+      num_samples_per_example=8,
+      grad_accum_steps=4,
+      # Checkpoint and tensorboard logging configs.
+      tb_log_interval=1,
+      ckpt_interval=20,
+      ckpt_max_to_keep=1,
+      # Flash attention configs.
+      use_flash_attention=True,
+      flash_attention_block_size=512,
+      # RL algorithm configs.
+      num_train_steps_per_batch=1,
+      normalize_reward_method='ByGroup',
+      policy_ratio_cap=None,
+      max_abs_advantage=None,
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-6,
+          warmup_steps=1,
+      ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      lr=opt_lib.LinearWarmupConstant(
+          value=3e-6,
+          warmup_steps=1,
+      ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='bfloat16',
+      decoding_quant_scheme='bfloat16',
+      ref_params_dtype='bfloat16',
+      use_validation_set=True,
+      validation_eval_batch_size=64,
+      validation_eval_interval=50,
+      use_policy_logp_as_sampler_logp=True,
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v4():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
+  return dataclasses.replace(
+      config,
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-5,
+          warmup_steps=1,
+      ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_t0p6():
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl()
+  return dataclasses.replace(
+      config,
+      activation_dtype_name='float32',
+      decoding_quant_scheme='float32',
+      ref_params_dtype='float32',
+      sampling_temperature=0.6,
   )
 
 
@@ -1502,9 +1541,9 @@ def deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3():
   config = deepseek_qwen2_7b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
   config = dataclasses.replace(
       config,
-      lr_schedule_config=(
-          ('lr', 3e-6),
-          ('warmup_steps', 1),
+      lr=opt_lib.LinearWarmupConstant(
+          value=3e-6,
+          warmup_steps=1,
       ),
   )
   return config
@@ -1548,9 +1587,9 @@ def deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl_v3():
   config = deepseek_qwen2_14b_it_dsr40k_r1_distill_cot_0shot_rl_v2()
   config = dataclasses.replace(
       config,
-      lr_schedule_config=(
-          ('lr', 3e-6),
-          ('warmup_steps', 1),
+      lr=opt_lib.LinearWarmupConstant(
+          value=3e-6,
+          warmup_steps=1,
       ),
   )
   return config
@@ -1579,9 +1618,9 @@ def deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl_v3():
   config = deepseek_qwen2_32b_it_dsr40k_r1_distill_cot_0shot_rl_v2()
   config = dataclasses.replace(
       config,
-      lr_schedule_config=(
-          ('lr', 3e-6),
-          ('warmup_steps', 1),
+      lr=opt_lib.LinearWarmupConstant(
+          value=3e-6,
+          warmup_steps=1,
       ),
   )
   return config
@@ -1614,7 +1653,6 @@ def qwen3_0p6b():
       qkv_use_bias=False,
       output_layer_use_bias=False,
       use_tied_embedding=True,
-      use_combined_qkv=False,
       embedding_lookup_scale=None,
       norm_scale_plus_one=False,
       attn_soft_cap=-1.0,
@@ -1768,11 +1806,11 @@ def lm_sft_test():
   return dataclasses.replace(
       config,
       num_train_steps=2000,
-      lr_schedule_config=(
-          ('lr', 1e-4),
-          ('warmup_steps', 100),
-          ('steps_after_decay', 10),
-          ('end_decay', 0.1),
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-4,
+          warmup_steps=100,
+          steps_after_decay=10,
+          end_decay=0.1,
       ),
       dataset_name='tulu_v2_sft.vb100864_openmix_v1',
       # Config for init from existing checkpoint.
@@ -1788,7 +1826,7 @@ def lm_sft_test():
 
 @ExperimentConfigRegistry.register
 def lm_rl_test():
-  config = lm_test()
+  config = RLExperimentConfig().override_from(lm_test())
   return dataclasses.replace(
       config,
       dataset_name='simply_json:dsr40k_train',
@@ -1810,12 +1848,10 @@ def lm_rl_test():
       sampling_prefill_size=16,
       sampling_max_input_len=8,
       sampling_intermediate_decode_steps=-1,
-      sampling_microbatch_size=2,
       num_train_steps_per_batch=4,
-      lr_schedule_name='constant',
-      lr_schedule_config=(
-          ('lr', 1e-7),
-          ('warmup_steps', 100),
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-7,
+          warmup_steps=100,
       ),
       extra_eos_tokens=newlines_from_counts(range(1, 2)),
       decoding_sharding_config=DecodeGSPMDSharding(),

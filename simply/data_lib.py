@@ -657,6 +657,77 @@ def create_simple_dataset(
   )
 
 
+# class TokenizeTransform(grain.MapTransform):
+#   """Tokenizes text using a given tokenizer.
+
+#   This is a custom transform that can use any tokenizer (e.g., SentencePiece).
+#   """
+
+#   def __init__(self, tokenizer, text_key='text', output_key='tokens',):
+#     self.tokenizer = tokenizer
+#     self.text_key = text_key
+#     self.output_key = output_key
+
+#   def map(self, features):
+#     """Tokenize the text field."""
+#     text = features[self.text_key]
+#     if isinstance(text, bytes):
+#       text = text.decode('utf-8')
+
+#     # Tokenize using the provided tokenizer
+#     # For demo purposes, we'll use a simple split - replace with actual tokenizer
+#     tokens = self.tokenizer.encode(text)
+
+#     # Update features with tokenized output
+#     features = dict(features)  # Make a copy
+#     del features[self.text_key]
+#     features[self.output_key] = np.array(tokens, dtype=np.int32)
+#     return features
+
+
+# def create_grain_dataset(
+#   data_source, tokenizer, batch_size=4, seed=0, seq_len=50,
+#   # num_packing_bins=128,
+#   # mode='concat_then_split',
+#   add_eos=False, add_bos=False
+#   ):
+#   dataset = (
+#       grain.MapDataset.source(data_source)
+#       .shuffle(seed)
+#       .repeat()
+#       # Tokenize text
+#       .map(TokenizeTransform(tokenizer, text_key='text', output_key='tokens'))
+#   )
+#   def add_bos_eos(x):
+#     x = [tokenizer.bos_id] + x
+#     x = x + [tokenizer.eos_id]
+#     return x
+#   if add_eos or add_bos:
+#     dataset.map(lambda x: [tokenizer.bos_id] + x + [tokenizer.eos_id])
+#   dataset = grain.experimental.ConcatThenSplitIterDataset(
+#       parent=dataset,
+#       length_struct={'tokens': seq_len},
+#   )
+
+#   # [bos, a, b, c, eos, bos, b, c, eos]
+#   # [b, c, eos, bos, b,]
+#   # [bos, b, c, eos, b, c, eos]
+#   # # Apply FirstFit packing
+#   # dataset = grain.experimental.FirstFitPackIterDataset(
+#   #     parent=dataset,
+#   #     length_struct={'tokens': seq_len},
+#   #     num_packing_bins=num_packing_bins,
+#   #     shuffle_bins=True,
+#   # )
+
+#   # Batch and prefetch
+#   dataset = dataset.batch(batch_size, drop_remainder=True)
+#   dataset = dataset.mp_prefetch(
+#       grain.MultiprocessingOptions(num_workers=0, per_worker_buffer_size=10)
+#   )
+#   return dataset
+
+
 def create_iter_dataset(
     config, training: bool = True
 ) -> grain.IterDataset[common.PyTree]:

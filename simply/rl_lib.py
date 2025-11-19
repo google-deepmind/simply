@@ -796,7 +796,7 @@ def run_experiment(
     train_iter_state = data_state.get('train_iter_state', None)
 
   if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
-    # Continue training from lastest ckpt, so we load ref_params from init_ckpt.
+    # Continue training from latest ckpt, so we load ref_params from init_ckpt.
     abstract_params = ckpt_lib.get_abstract_params(model)
     abstract_state = {'params': abstract_params}
     ref_state = ckpt_lib.load_checkpoint_from_dir(
@@ -814,7 +814,9 @@ def run_experiment(
   # Compile loss, train and learning rate functions.
   t1 = time.time()
 
-  @functools.partial(jax.jit, static_argnames=['add_log_info'])
+  @functools.partial(
+      jax.jit, donate_argnames=['state'], static_argnames=['add_log_info']
+  )
   def train_one_step_fn(state, batch, lr, add_log_info=False):
     return model_lib.train_one_step(
         state=state,
@@ -1176,7 +1178,9 @@ def run_experiment(
                 reward=rewarded_per_response.reward,
                 correct=rewarded_per_response.correct,
                 lm_sampling_output_text=rewarded_per_response.sampling_output.output_text,
-                lm_request=rewarded_per_response.sampling_input,
+                lm_request=sampling_lib.input_as_text(
+                    rewarded_per_response.sampling_input
+                ),
             )
         )
     write_record_time = time.time() - write_record_start_time
@@ -1248,7 +1252,9 @@ def run_experiment(
             eval_iter.set_state(eval_iter_init_state)
             eval_steps = 0
             eval_batch_size = (
-                config.validation_eval_batch_size or config.batch_size
+                config.validation_eval_batch_size
+                if config.validation_eval_batch_size > 0
+                else config.batch_size
             )
             for eval_batch in eval_iter:
               if (
