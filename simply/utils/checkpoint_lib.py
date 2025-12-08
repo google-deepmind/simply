@@ -22,7 +22,7 @@ import os
 import pydoc
 import re
 import time
-from typing import Any, ClassVar, TypeAlias, final
+from typing import Any, ClassVar, final
 
 from etils import epath
 import jax
@@ -36,10 +36,6 @@ from simply.utils import registry
 from simply.utils import sharding as sharding_lib
 
 PyTree = common.PyTree
-
-ArgsTree: TypeAlias = Mapping[
-    str, ocp.args.CheckpointArgs | Mapping[str, 'ArgsTree']
-]
 
 CHECKPOINT_FORMAT_KEY = '__checkpoint_format__'
 DATA_ITEM_NAME = 'data'
@@ -109,7 +105,7 @@ class LegacyFormat(CheckpointFormat):
       elif m := re.fullmatch(r'(\w+/block_\d+/attn)/(\w+_bias)', k):
         new_k = f'{m.group(1)}/{m.group(2)}/b'
         transformed_state[new_k] = v
-      elif m := re.fullmatch(r'(\w+/block_\d+)/(ffn.*)', k):
+      elif m := re.fullmatch(r'(\w+/block_\d+)/(ffn_\w+/\w+)', k):
         new_k = f'{m.group(1)}/ffn/{m.group(2)}'
         transformed_state[new_k] = v
       else:
@@ -266,6 +262,16 @@ class Gemma2Format(Gemma3pLegacyFormat):
 class Qwen2Format(CheckpointFormat):
   """Qwen2 checkpoint format."""
 
+  def _gather_experts(
+      self, flatten_stored_state: Mapping[str, jax.Array], pattern: str
+  ) -> jax.Array:
+    experts = []
+    for k, v in flatten_stored_state.items():
+      if m := re.fullmatch(pattern, k):
+        experts.append((int(m.group(1)), v))
+    _, experts = zip(*sorted(experts, key=lambda x: x[0]))
+    return jnp.stack(experts, axis=0)
+
   def transforms(
       self, stored_state: PyTree, target_abstract_state: PyTree = None
   ) -> PyTree:
@@ -311,6 +317,39 @@ class Qwen2Format(CheckpointFormat):
         transformed_state[new_k] = jnp.transpose(v)
       elif m := re.fullmatch(r'model.layers.(\d+).mlp.down_proj.weight', k):
         new_k = f'params/block_{m.group(1)}/ffn_1/w'
+        transformed_state[new_k] = jnp.transpose(v)
+      elif m := re.fullmatch(
+          r'model.layers.(\d+).mlp.experts.(\d+).up_proj.weight', k
+      ):
+        if m.group(2) == '0':
+          v = self._gather_experts(
+              flatten_stored_state,
+              rf'model.layers.{m.group(1)}.mlp.experts.(\d+).up_proj.weight',
+          )
+          new_k = f'params/block_{m.group(1)}/ffn/ffn_0/w'
+          transformed_state[new_k] = jnp.einsum('eoi->eio', v)
+      elif m := re.fullmatch(
+          r'model.layers.(\d+).mlp.experts.(\d+).gate_proj.weight', k
+      ):
+        if m.group(2) == '0':
+          v = self._gather_experts(
+              flatten_stored_state,
+              rf'model.layers.{m.group(1)}.mlp.experts.(\d+).gate_proj.weight',
+          )
+          new_k = f'params/block_{m.group(1)}/ffn/ffn_0_gate/w'
+          transformed_state[new_k] = jnp.einsum('eoi->eio', v)
+      elif m := re.fullmatch(
+          r'model.layers.(\d+).mlp.experts.(\d+).down_proj.weight', k
+      ):
+        if m.group(2) == '0':
+          v = self._gather_experts(
+              flatten_stored_state,
+              rf'model.layers.{m.group(1)}.mlp.experts.(\d+).down_proj.weight',
+          )
+          new_k = f'params/block_{m.group(1)}/ffn/ffn_1/w'
+          transformed_state[new_k] = jnp.einsum('eoi->eio', v)
+      elif m := re.fullmatch(r'model.layers.(\d+).mlp.gate.weight', k):
+        new_k = f'params/block_{m.group(1)}/ffn/router/w'
         transformed_state[new_k] = jnp.transpose(v)
       elif m := re.fullmatch(r'model.layers.(\d+).input_layernorm.weight', k):
         transformed_state[f'params/block_{m.group(1)}/pre_ln_0/scale'] = v
@@ -552,9 +591,8 @@ def load_checkpoint_from_path(
   for unused_argpath in unused_argpaths:
     # Turn PLACEHOLDER to None to avoid feeding into jitted function.
     pytree.set_tree_value(state, unused_argpath, None)
-
-  state = jax.jit(transform_state_fn, donate_argnums=0)(state)
-
+  pytree.trim_none(state)
+  state = transform_state_fn(state)
   state = common.transfer_metadata(abstract_state, state)
   return state
 
@@ -599,4 +637,4 @@ def save_checkpoint(
 
 
 def get_abstract_params(model: module.SimplyModule) -> PyTree:
-  return common.eval_shape_with_sharding(model.init, jax.random.PRNGKey(0))
+  return common.eval_abstract_output(model.init, jax.random.key(0))

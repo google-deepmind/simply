@@ -13,7 +13,7 @@
 # limitations under the License.
 """Experiments and sharding configs."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 import dataclasses
 import functools
 import math
@@ -22,12 +22,14 @@ from typing import Any, ClassVar, Self
 
 import jax
 
+from simply.utils import common
 from simply.utils import evaluation_lib
 from simply.utils import optimizers as opt_lib
 from simply.utils import registry
 
 
 SimplyConfig = Any
+PartitionAnnotation = common.PartitionAnnotation
 
 ################################################################################
 # Checkpoint directories.
@@ -68,6 +70,9 @@ QWEN3_4B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-4B/ORBAX')
 QWEN3_8B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-8B/ORBAX')
 QWEN3_14B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-14B/ORBAX')
 QWEN3_32B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-32B/ORBAX')
+QWEN3_30B_A3B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-30B-A3B/ORBAX')
+QWEN3_4B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-4B-Thinking-2507/ORBAX')
+QWEN3_30B_A3B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-30B-A3B-Thinking-2507/ORBAX')
 
 
 ################################################################################
@@ -102,84 +107,118 @@ def newlines_from_counts(counts: Iterable[int]) -> tuple[str, ...]:
 # Sharding Configs.
 
 
+@dataclasses.dataclass(frozen=True)
+class ShardingConfig:
+  """Base sharding config for others to inherit."""
+
+
 @ShardingConfigRegistry.register
 @dataclasses.dataclass(frozen=True)
-class GSPMDSharding:
+class BaseSharding(ShardingConfig):
+
   # Shape (model_dim, model_dim * expansion_factor)
-  ffn0_partition: Any = ('data', 'model')
+  ffn0_partition: PartitionAnnotation = ('data', 'model')
 
   # Shape (model_dim * expansion_factor, model_dim)
-  ffn1_partition: Any = ('model', 'data')
+  ffn1_partition: PartitionAnnotation = ('model', 'data')
 
   # Shape (model_dim, num_heads, per_head_size)
-  attn_qkv_partition: Any = ('data', 'model', None)
+  attn_qkv_partition: PartitionAnnotation = ('data', 'model', None)
 
   # Shape (model_dim, num_heads, per_head_size)
-  attn_o_partition: Any = ('data', 'model', None)
+  attn_o_partition: PartitionAnnotation = ('data', 'model', None)
 
   # Shape (vocab_size, model_dim)
-  embed_partition: Any = ('model', 'data')
+  embed_partition: PartitionAnnotation = ('model', 'data')
 
   # Shape (batch_size, seq_len, num_heads, per_head_size)
-  attn_activation_partition: Any = (('replica', 'data'), None, 'model', None)
+  attn_activation_partition: PartitionAnnotation = (
+      ('replica', 'data'), None, 'model', None)
 
   # Shape (batch_size, seq_len, model_dim)
-  activation_partition: Any = (('replica', 'data'), None, 'model')
+  activation_partition: PartitionAnnotation = (
+      ('replica', 'data'), None, 'model')
 
   # Shape (batch_size, seq_len, model_dim * expansion_factor)
-  ffn0_activation_partition: Any = (('replica', 'data'), None, 'model')
+  ffn0_activation_partition: PartitionAnnotation = (
+      ('replica', 'data'), None, 'model')
 
   # Shape (batch_size, seq_len, vocab_size)
-  logits_partition: Any = (('replica', 'data'), None, 'model')
+  logits_partition: PartitionAnnotation = (
+      ('replica', 'data'), None, 'model')
 
   # Shape (batch_size, seq_len)
-  data_partition: Any = (('replica', 'data'), None)
+  data_partition: PartitionAnnotation = (
+      ('replica', 'data'), None)
+
+  # Name of all the mesh axes.
+  mesh_axis_names: PartitionAnnotation = ('replica', 'data', 'model')
+
+  # Utilities for collectives, needed to be updated to be consistent
+  # if you change the sharding config.
+  fsdp: PartitionAnnotation = ('replica', 'data')
+  ep: PartitionAnnotation = None
+  tp: PartitionAnnotation = ('model',)
 
 
 @ShardingConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DecodeGSPMDSharding(GSPMDSharding):
-  # Shape (batch_size, seq_len, model_dim)
-  activation_partition: Any = (('replica', 'data'), None, None)
+def gspmd_sharding():
+  return BaseSharding()
 
 
 @ShardingConfigRegistry.register
-@dataclasses.dataclass(frozen=True)
-class DataParallelSharding:
-  # Shape (model_dim, model_dim * expansion_factor)
-  ffn0_partition: Any = (None, None)
-
-  # Shape (model_dim * expansion_factor, model_dim)
-  ffn1_partition: Any = (None, None)
-
-  # Shape (model_dim, num_heads, per_head_size)
-  attn_qkv_partition: Any = (None, None, None)
-
-  # Shape (model_dim, num_heads, per_head_size)
-  attn_o_partition: Any = (None, None, None)
-
-  # Shape (vocab_size, model_dim)
-  embed_partition: Any = (None, None)
-
-  # Shape (b, l, num_heads, per_head_size)
-  attn_activation_partition: Any = (
-      ('replica', 'data', 'model'),
-      None,
-      None,
-      None,
+def decode_gspmd_sharding():
+  config = gspmd_sharding()
+  return dataclasses.replace(
+      config,
+      # Shape (batch_size, seq_len, model_dim)
+      activation_partition=(('replica', 'data'), None, None)
   )
 
-  # Shape (batch_size, seq_len, model_dim)
-  activation_partition: Any = (('replica', 'data', 'model'), None, None)
 
-  # Shape (batch_size, seq_len, model_dim * expansion_factor)
-  ffn0_activation_partition: Any = (('replica', 'data', 'model'), None, None)
+@ShardingConfigRegistry.register
+def moe_sharding():
+  return dataclasses.replace(
+      gspmd_sharding(),
+      ffn0_partition=('seq', 'data', 'model'),
+      ffn1_partition=('seq', 'model', 'data'),
+      attn_qkv_partition=(('data', 'seq'), 'model', None),
+      attn_o_partition=(('data', 'seq'), 'model', None),
+      embed_partition=('model', ('data', 'seq')),
+      attn_activation_partition=(('replica', 'data'), 'seq', 'model', None),
+      activation_partition=(('replica', 'data'), 'seq', 'model'),
+      ffn0_activation_partition=(('replica', 'data'), 'seq', 'model'),
+      logits_partition=(('replica', 'data'), 'seq', 'model'),
+      data_partition=(('replica', 'data'), 'seq'),
+      fsdp=('replica', 'data'),
+      ep='seq',
+      tp='model',
+      mesh_axis_names=('replica', 'data', 'seq', 'model'),
+  )
 
-  # Shape (batch_size, seq_len, vocab_size)
-  logits_partition: Any = (('replica', 'data', 'model'), None, None)
 
-  # Shape (batch_size, seq_len)
-  data_partition: Any = (('replica', 'data', 'model'), None)
+@ShardingConfigRegistry.register
+def moe_sharding_v1():
+  # Allocate 'seq' to batch dimension instead of `seq_len` dimension to avoid
+  # extra all-gather on the attention layer.
+  return dataclasses.replace(
+      moe_sharding(),
+      attn_activation_partition=(('replica', 'data', 'seq'), None, 'model', None),
+      activation_partition=(('replica', 'data', 'seq'), None, 'model'),
+      ffn0_activation_partition=(('replica', 'data', 'seq'), None, 'model'),
+      logits_partition=(('replica', 'data', 'seq'), None, 'model'),
+      data_partition=(('replica', 'data', 'seq', 'model'), None),
+  )
+
+
+@ShardingConfigRegistry.register
+def decode_moe_sharding_v1():
+  config = moe_sharding_v1()
+  return dataclasses.replace(
+      config,
+      # Shape (batch_size, seq_len, model_dim)
+      activation_partition=(('replica', 'data', 'seq'), None, None),
+  )
 
 
 ################################################################################
@@ -356,6 +395,8 @@ class BaseExperimentConfig(ExperimentConfig):
   # TODO: The type should be model_lib.InputEncoderInterface, but we
   # need to resolve some cyclic dependency issue.
   input_encoders: list[Any] = dataclasses.field(default_factory=list)
+  # Optional custom input processor (see sampling_lib.InputProcessorInterface).
+  input_processor_name: str | None = None
 
   # Utilities for patching code snippets before running an experiment.
   code_patch: tuple[tuple[str, str], ...] = ()
@@ -373,6 +414,12 @@ class BaseExperimentConfig(ExperimentConfig):
   # Distillation parameters
   distill_temperature: float = 1.0
   distill_alpha: float = 1.0
+
+  # mesh related:
+  mesh_shape: Mapping[str, int] | None = None
+  decoding_mesh_shape: Mapping[str, int] | None = None
+  dcn_mesh_shape: Mapping[str, int] | None = None
+  sharding_config: SimplyConfig = gspmd_sharding()
 
 
 @ExperimentConfigRegistry.register
@@ -431,7 +478,7 @@ class RLExperimentConfig(BaseExperimentConfig):
   use_policy_logp_as_sampler_logp: bool = False
 
   # New fields for decoding.
-  decoding_sharding_config: SimplyConfig = DecodeGSPMDSharding()
+  decoding_sharding_config: SimplyConfig = decode_gspmd_sharding()
   # New fields for quantization.
   decoding_quant_scheme: str = 'bfloat16'
   ref_params_dtype: str = 'bfloat16'
@@ -487,7 +534,7 @@ def apply_simple_rl(config):
       tb_log_interval=4,
       ckpt_interval=4,
       # Sharding config.
-      decoding_sharding_config=DecodeGSPMDSharding(),
+      decoding_sharding_config=decode_gspmd_sharding(),
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
@@ -1204,7 +1251,7 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       tb_log_interval=10,
       ckpt_interval=100,
       # Sharding config.
-      decoding_sharding_config=DecodeGSPMDSharding(),
+      decoding_sharding_config=decode_gspmd_sharding(),
   )
 
 
@@ -1326,7 +1373,7 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
       tb_log_interval=4,
       ckpt_interval=4,
       # Sharding config.
-      decoding_sharding_config=DecodeGSPMDSharding(),
+      decoding_sharding_config=decode_gspmd_sharding(),
       # Use train_max_seq_len to control the max decode steps.
       sampling_max_decode_steps=32768,
       train_max_seq_len=9 * 1024,
@@ -1694,6 +1741,16 @@ def qwen3_4b():
 
 
 @ExperimentConfigRegistry.register
+def qwen3_4b_thinking_2507():
+  config = qwen3_4b()
+  return dataclasses.replace(
+      config,
+      global_rope_max_timescale=5_000_000,
+      init_ckpt_dir=QWEN3_4B_THINKING_2507_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
 def qwen3_8b():
   config = qwen3_0p6b()
   return dataclasses.replace(
@@ -1732,6 +1789,43 @@ def qwen3_32b():
       n_layers=64,
       use_tied_embedding=False,
       init_ckpt_dir=QWEN3_32B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_30b_a3b():
+  config = qwen3_0p6b()
+  return dataclasses.replace(
+      config,
+      use_tied_embedding=False,
+      model_dim=2048,
+      ffn_expand_dim=768,
+      n_heads=32,
+      n_layers=48,
+      n_kv_heads=4,
+      # MoE configs
+      use_moe=True,
+      num_experts=128,
+      num_experts_per_token=8,
+      expert_capacity_factor=None,  # dropless
+      lbl_loss_weight=0.01,
+      router_z_loss_weight=0.0,
+      # Make it smaller to fit on PF as well.
+      tile_batch_seq=512,
+      tile_model_dim=512,
+      tile_expand_dim=512,
+      gmm_impl='megablox',
+      init_ckpt_dir=QWEN3_30B_A3B_CKPT_DIR,
+      sharding_config=moe_sharding_v1(),
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_30b_a3b_thinking_2507():
+  return dataclasses.replace(
+      qwen3_30b_a3b(),
+      global_rope_max_timescale=10_000_000,
+      init_ckpt_dir=QWEN3_30B_A3B_THINKING_2507_CKPT_DIR,
   )
 
 
@@ -1854,7 +1948,7 @@ def lm_rl_test():
           warmup_steps=100,
       ),
       extra_eos_tokens=newlines_from_counts(range(1, 2)),
-      decoding_sharding_config=DecodeGSPMDSharding(),
+      decoding_sharding_config=decode_gspmd_sharding(),
       # RL algorithm configs.
       gamma=1.0,
       kl_coeff=0.01,
@@ -1882,14 +1976,19 @@ def lm_rl_test():
 
 def get_default_mesh_shape(
     config: BaseExperimentConfig, mode: str = 'train',
-    dcn_mesh_shape=None) -> list[int]:
+    dcn_mesh_shape=None) -> Mapping[str, int]:
   """Returns the default mesh shape."""
+  mesh_axis_names = config.sharding_config.mesh_axis_names
+  if (set(['replica', 'data', 'model']) - set(mesh_axis_names)):
+    raise ValueError(
+        'We assume the mesh axis names contains'
+        f' `replica`, `data`, and `model`, but got {mesh_axis_names}.')
   if dcn_mesh_shape is None:
     num_slices = 1
   else:
-    num_slices = math.prod(dcn_mesh_shape)
+    num_slices = math.prod(dcn_mesh_shape.values())
     # DCN mesh should only be used for replica parallelism.
-    assert dcn_mesh_shape == [num_slices, 1, 1]
+    assert dcn_mesh_shape['replica'] == num_slices
   device_count = jax.device_count()
   device_count //= num_slices
   if mode == 'train':
@@ -1912,7 +2011,7 @@ def get_default_mesh_shape(
           f'Training requires {train_batch_size=} to be divisible by '
           f'{data_parallel=} * {replica_parallel=}.'
       )
-    return [replica_parallel, data_parallel, 1]
+    return {'replica': replica_parallel, 'data': data_parallel, 'model': 1}
   elif mode == 'decode':
     # Do model parallelism as much as possible and replica parallelism for the
     # rest.
@@ -1927,6 +2026,6 @@ def get_default_mesh_shape(
           f'Decoding requires {decode_batch_size=} to be divisible by '
           f'{replica_parallel=}.'
       )
-    return [replica_parallel, 1, model_parallel]
+    return {'replica': replica_parallel, 'data': 1, 'model': model_parallel}
   else:
     raise ValueError(f'Unsupported mode: {mode}')

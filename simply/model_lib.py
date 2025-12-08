@@ -21,7 +21,6 @@ import functools
 import time
 from typing import Any, cast, ClassVar, Self, Tuple
 import warnings
-
 from absl import logging
 import einops
 import jax
@@ -32,7 +31,7 @@ from jax.experimental.pallas.ops.tpu import splash_attention
 import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
-from simply import config_lib
+
 from simply import data_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
@@ -59,6 +58,7 @@ SimplyModule = module.SimplyModule
 Array = common.Array
 RawT = common.RawT
 get_default_mesh = sharding_lib.get_default_mesh
+get_partition_axis = sharding_lib.get_partition_axis
 maybe_dequantize_array = common.convert_or_dequantize
 mesh_sharding = sharding_lib.mesh_sharding
 ExperimentHelper = exp_helper.ExperimentHelper
@@ -630,10 +630,7 @@ class MoEFeedForward(FeedForward):
         weight_partition=(None, None),
         output_partition=router_output_partition,
     )
-    self.ffn0_partition = (
-        (None, *self.sharding_config.ffn0_partition)
-        if self.sharding_config.ffn0_partition is not None else None
-    )
+    self.ffn0_partition = self.sharding_config.ffn0_partition
     self.ffn_0 = EinsumLinear(
         eqn='eio,e...i->e...o',
         weight_shape=[self.num_experts, self.model_dim, self.expand_dim],
@@ -643,10 +640,7 @@ class MoEFeedForward(FeedForward):
         # Sharding related.
         weight_partition=self.ffn0_partition,
     )
-    self.ffn1_partition = (
-        (None, *self.sharding_config.ffn1_partition)
-        if self.sharding_config.ffn1_partition is not None else None
-    )
+    self.ffn1_partition = self.sharding_config.ffn1_partition
     if self.use_gated_activation_in_ffn:
       self.ffn_0_gate = EinsumLinear(
           eqn='eio,e...i->e...o',
@@ -866,7 +860,27 @@ class MoEFeedForward(FeedForward):
     def moe_ffn(
         inputs, ffn0_w, ffn0_gate_w, ffn1_w,
         selected_indices, selected_weights):
-      batch_size, seq_len, _ = inputs.shape
+
+      def all_gather_if_sharded(w, partition, axis):
+        if axis_name := get_partition_axis(partition, axis=axis):
+          return jax.lax.all_gather(
+              w, axis_name=axis_name, tiled=True, axis=axis)
+        else:
+          return w
+
+      # All gather inputs on model_dim axis if sharded.
+      inputs = all_gather_if_sharded(
+          inputs, partition=self.sharding_config.activation_partition, axis=2)
+      # All gather ffn0_w on contraction dimension if sharded (used in fsdp).
+      ffn0_w = all_gather_if_sharded(
+          ffn0_w, self.sharding_config.ffn0_partition, axis=1)
+      # All gather ffn1_w on output dimension if sharded (used in fsdp).
+      ffn1_w = all_gather_if_sharded(
+          ffn1_w, self.sharding_config.ffn1_partition, axis=2)
+
+      # Repeat inputs by num_experts_per_token and then group by
+      # selected experts.
+      local_batch_size, local_seq_len, model_dim = inputs.shape
       # flat_repeated_inputs:
       # [batch_size * seq_len * num_experts_per_token, model_dim]
       flat_repeated_inputs = einops.repeat(
@@ -880,45 +894,179 @@ class MoEFeedForward(FeedForward):
       unsort_indices = jnp.argsort(sort_indices)
       sorted_inputs = flat_repeated_inputs[sort_indices]
       sorted_expert_indices = flat_selected_indices[sort_indices]
+      # group_sizes: [num_experts]
       group_sizes = jnp.bincount(sorted_expert_indices, length=self.num_experts)
       load = jnp.asarray(
           group_sizes / jnp.sum(group_sizes), self.activation_dtype
       )
       load = (
           jax.lax.psum(
-              load, axis_name=('replica', 'data', 'model')) /
+              load, axis_name=self.sharding_config.mesh_axis_names) /
           jax.lax.psum(
-              1, axis_name=('replica', 'data', 'model')))
+              1, axis_name=self.sharding_config.mesh_axis_names))
+      local_group_sizes = group_sizes
+
+      # Dispatch to different expert shards if using expert parallelism.
+      ep_axis = get_partition_axis(self.ffn0_partition, axis=0)
+      # Assume megatron-style tensor parallelism on FFN.
+      tp_axis = get_partition_axis(self.ffn0_partition, axis=-1)
+      num_ep = jax.lax.psum(1, axis_name=ep_axis) if ep_axis else 1
+      num_tp = jax.lax.psum(1, axis_name=tp_axis) if tp_axis else 1
+      local_num_tokens = sorted_inputs.shape[0]
+      ep_shard_idx = None
+
+      if num_ep > 1:
+        logging.info('using expert parallelism!')
+        ep_shard_idx = jax.lax.axis_index(ep_axis)
+        num_local_experts = self.num_experts // num_ep
+
+        # global_group_sizes: [num_ep, num_experts]
+        global_group_sizes = jax.lax.all_gather(
+            group_sizes, axis_name=ep_axis,
+            tiled=False, axis=0)
+
+        # global_send_sizes: [num_ep, num_ep]
+        # The [i, j] element in `global_send_sizes` is the number of
+        # tokens in expert shard i that should be sent to expert shard j.
+        global_send_sizes = jnp.sum(
+            jnp.reshape(
+                global_group_sizes, (num_ep, num_ep, num_local_experts)),
+            axis=-1, keepdims=False)
+        local_send_sizes = global_send_sizes[ep_shard_idx]
+        local_recv_sizes = global_send_sizes[:, ep_shard_idx]
+
+        def get_global_input_output_offsets(global_send_sizes):
+          global_input_offsets = jnp.concatenate(
+              [jnp.zeros((num_ep, 1), dtype=jnp.int32),
+               global_send_sizes[:, :-1]], axis=1)
+          global_input_offsets = jnp.cumsum(global_input_offsets, axis=1)
+          global_output_offsets = jnp.concatenate(
+              [jnp.zeros((1, num_ep), dtype=jnp.int32),
+               global_send_sizes[:-1]], axis=0)
+          global_output_offsets = jnp.cumsum(global_output_offsets, axis=0)
+          return global_input_offsets, global_output_offsets
+
+        global_input_offsets, global_output_offsets = (
+            get_global_input_output_offsets(global_send_sizes)
+        )
+        local_input_offsets = global_input_offsets[ep_shard_idx]
+        local_output_offsets = global_output_offsets[ep_shard_idx]
+        output_buffer_size = (
+            min(self.num_experts_per_token, num_local_experts)
+            * local_batch_size * local_seq_len * num_ep
+        )
+        output_buffer = jax.lax.empty(
+            shape=(output_buffer_size, model_dim),
+            dtype=self.activation_dtype)
+        sorted_inputs = jax.lax.ragged_all_to_all(
+            sorted_inputs,
+            output_buffer,
+            local_input_offsets,
+            local_send_sizes,
+            local_output_offsets,
+            local_recv_sizes,
+            axis_name=ep_axis,
+            axis_index_groups=None,
+        )
+
+        group_start_idx = ep_shard_idx * num_local_experts
+        local_expert_group_sizes = jax.lax.dynamic_slice_in_dim(
+            global_group_sizes, group_start_idx, num_local_experts, axis=1)
+        flat_local_expert_group_sizes = local_expert_group_sizes.reshape(-1)
+        local_expert_indices = jnp.mod(
+            jnp.arange(flat_local_expert_group_sizes.shape[0]),
+            num_local_experts)
+        # This works without masking out the padding tokens because the padding
+        # tokens are the last one in local_expert_indices thus assigned to
+        # the last expert group so it will not disturb the sorted order.
+        local_expert_indices = jnp.repeat(
+            local_expert_indices, flat_local_expert_group_sizes,
+            total_repeat_length=sorted_inputs.shape[0])
+        local_expert_sort_indices = jnp.argsort(local_expert_indices)
+        sorted_inputs = sorted_inputs[local_expert_sort_indices]
+        local_group_sizes = jnp.sum(local_expert_group_sizes, axis=0)
+
+      # Apply FFN on local expert shards if using expert parallelism.
+      sorted_inputs = jnp.asarray(sorted_inputs, self.activation_dtype)
       m, k = sorted_inputs.shape
       n = ffn0_w.shape[-1]
-      ffn0_w = jax.lax.all_gather(ffn0_w, axis_name='data', tiled=True, axis=1)
       ffn0_tiling = (
-          min(self.tile_batch_seq, m),
-          min(self.tile_model_dim, k),
-          min(self.tile_expand_dim, n),
+          self.tile_batch_seq, self.tile_model_dim, self.tile_expand_dim)
+
+      def round_up_to_base(x: int, base: int, threshold: int = 128):
+        if x < threshold:
+          return x
+        else:
+          return ((x + base - 1) // base) * base
+
+      ffn0_tiling = (
+          round_up_to_base(
+              min(ffn0_tiling[0], m), base=8, threshold=8),
+          round_up_to_base(min(ffn0_tiling[1], k), base=128, threshold=128),
+          round_up_to_base(min(ffn0_tiling[2], n), base=128, threshold=128),
       )
       ffn1_tiling = (ffn0_tiling[0], ffn0_tiling[2], ffn0_tiling[1])
-      projected_inputs = gmm(sorted_inputs, ffn0_w, group_sizes, ffn0_tiling)
+      projected_inputs = gmm(
+          sorted_inputs, ffn0_w, local_group_sizes, ffn0_tiling)
       activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
       if self.use_gated_activation_in_ffn:
-        ffn0_gate_w = jax.lax.all_gather(
-            ffn0_gate_w, axis_name='data', tiled=True, axis=1)
-        gate = gmm(sorted_inputs, ffn0_gate_w, group_sizes, ffn0_tiling)
+        ffn0_gate_w = all_gather_if_sharded(
+            ffn0_gate_w, self.sharding_config.ffn0_partition, axis=1)
+        gate = gmm(sorted_inputs, ffn0_gate_w, local_group_sizes, ffn0_tiling)
         gate = activation_fn(gate)
         middle = jnp.asarray(gate, self.activation_dtype) * projected_inputs
       else:
         middle = jnp.asarray(
             activation_fn(projected_inputs), self.activation_dtype
         )
-      ffn1_w = jax.lax.all_gather(ffn1_w, axis_name='data', tiled=True, axis=2)
-      sorted_outputs = gmm(middle, ffn1_w, group_sizes, ffn1_tiling)
+      sorted_outputs = gmm(middle, ffn1_w, local_group_sizes, ffn1_tiling)
+
+      # Dispatch tokens from expert shards to original shards
+      # if using expert parallelism.
+      if num_ep > 1:
+        sorted_outputs = sorted_outputs[jnp.argsort(local_expert_sort_indices)]
+        global_input_offsets, global_output_offsets = (
+            get_global_input_output_offsets(global_send_sizes.T)
+        )
+        local_input_offsets = global_input_offsets[ep_shard_idx]
+        local_output_offsets = global_output_offsets[ep_shard_idx]
+        local_send_sizes, local_recv_sizes = local_recv_sizes, local_send_sizes
+        output_buffer = jax.lax.empty(
+            shape=(local_num_tokens, model_dim),
+            dtype=self.activation_dtype,
+        )
+        sorted_outputs = jax.lax.ragged_all_to_all(
+            sorted_outputs,
+            output_buffer,
+            local_input_offsets,
+            local_send_sizes,
+            local_output_offsets,
+            local_recv_sizes,
+            axis_name=ep_axis,
+            axis_index_groups=None,
+        )
+
+      # outputs: [(batch_size * seq_len * num_experts_per_token), model_dim]
       outputs = sorted_outputs[unsort_indices]
+      # Assume megatron-style tensor parallelism on FFN.
+      if outputs_model_dim_axis := get_partition_axis(
+          self.sharding_config.activation_partition, -1
+      ):
+        outputs = jax.lax.psum_scatter(
+            outputs,
+            axis_name=outputs_model_dim_axis,
+            scatter_dimension=1,
+            tiled=True,
+        )
+      elif num_tp > 1:
+        outputs = jax.lax.psum(outputs, axis_name=tp_axis)
+
       # outputs: [batch_size, seq_len, model_dim, num_experts_per_token]
       outputs = einops.rearrange(
           outputs,
           '(b s r) d -> b s d r',
-          b=batch_size,
-          s=seq_len,
+          b=local_batch_size,
+          s=local_seq_len,
           r=self.num_experts_per_token,
       )
       outputs = jnp.einsum('bsk,bstk->bst', selected_weights, outputs)
@@ -1643,7 +1791,7 @@ class TransformerLM(module.SimplyModule):
   def setup(self) -> None:
     config = self.config
     if self.sharding_config is None:
-      self.sharding_config = config_lib.GSPMDSharding()
+      self.sharding_config = self.config.sharding_config
     sharding_config = self.sharding_config
     self.activation_dtype = config.activation_dtype_name
 
@@ -2056,7 +2204,7 @@ class TransformerLM(module.SimplyModule):
 ## Loss and backprop.
 
 
-def compute_loss(model, params, batch):
+def compute_loss(model, params, batch, add_extra_loss=True):
   """The base method for loss computation."""
   # inputs: [batch_size, seq_len]
   inputs = batch['decoder_input_tokens']
@@ -2072,8 +2220,12 @@ def compute_loss(model, params, batch):
   segment_positions = batch.get('decoder_positions', None)
   # logits: [batch_size, seq_len, vocab_size]
   logits, model_extra_output = model.apply(
-      params, inputs,
-      segment_ids=segment_ids, segment_positions=segment_positions)
+      params,
+      inputs,
+      segment_ids=segment_ids,
+      segment_positions=segment_positions,
+      extra_inputs=batch.get('extra_inputs', None),
+  )
   # Always use float32 in softmax.
   logits = logits.astype(jnp.float32)
   targets_one_hot = jax.nn.one_hot(targets, logits.shape[-1], axis=-1)
@@ -2093,7 +2245,8 @@ def compute_loss(model, params, batch):
   if model_extra_output:
     extra_loss, extra_metric_dict = collect_loss_and_metric(model_extra_output)
     extra_output.update(extra_metric_dict)
-    loss += extra_loss
+    if add_extra_loss:
+      loss += extra_loss
   return loss, extra_output
 
 
@@ -2126,11 +2279,11 @@ def collect_loss_and_metric(extra_outputs):
 
 
 def compute_train_loss(model, params, batch):
-  return compute_loss(model, params, batch)
+  return compute_loss(model, params, batch, add_extra_loss=True)
 
 
 def compute_eval_loss(model, params, batch):
-  return compute_loss(model, params, batch)
+  return compute_loss(model, params, batch, add_extra_loss=False)
 
 
 def compute_distill_loss(
@@ -2419,23 +2572,35 @@ class TrainLoopRegistry(registry.RootRegistry):
 @functools.partial(TrainLoopRegistry.register, name='default')
 def run_experiment(
     config,
-    sharding_config,
-    mesh_shape,
-    create_dataset=None,
     # Leave `experiment_dir` as empty string to skip saving experiment data.
     # Useful if no need to save any data and can reduce some overhead.
     experiment_dir='',
+    # All the args below are deprecated.
+    mesh_shape=None,
     dcn_mesh_shape=None,
     decoding_mesh_shape=None,
+    sharding_config=None,
+    create_dataset=None,
 ):
   if create_dataset is not None:
     warnings.warn('create_dataset is deprecated.')
-  del create_dataset
-  del decoding_mesh_shape
+  if mesh_shape is not None:
+    warnings.warn('mesh_shape is deprecated.')
+  if dcn_mesh_shape is not None:
+    warnings.warn('dcn_mesh_shape is deprecated.')
+  if decoding_mesh_shape is not None:
+    warnings.warn('decoding_mesh_shape is deprecated.')
+  if sharding_config is not None:
+    warnings.warn('sharding_config is deprecated.')
+  del (
+      create_dataset, decoding_mesh_shape, dcn_mesh_shape,
+      sharding_config, mesh_shape)
   logging.info('jax.process_index(): %s', jax.process_index())
   # Setup model, optimizer, initial state, and mesh.
   sharding_lib.set_default_mesh_shape(
-      mesh_shape=mesh_shape, dcn_mesh_shape=dcn_mesh_shape)
+      mesh_shape=config.mesh_shape, dcn_mesh_shape=config.dcn_mesh_shape,
+      axis_names=config.sharding_config.mesh_axis_names,
+  )
   helper = ExperimentHelper(
       experiment_dir,
       ckpt_interval=config.ckpt_interval,
@@ -2444,13 +2609,14 @@ def run_experiment(
       num_train_steps=config.num_train_steps,
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
+      should_save_ckpt=config.should_save_ckpt,
   )
-  model, extra_output = create_model(config, sharding_config)
+  model, extra_output = create_model(config, config.sharding_config)
   teacher_model = extra_output.get('teacher')
-  helper.save_config_info(config, sharding_config, model)
+  helper.save_config_info(config, config.sharding_config, model)
   opt = config.optimizer
   state = get_init_state(
-      config, sharding_config, helper.ckpt_mngr, helper.ckpt_dir)
+      config, config.sharding_config, helper.ckpt_mngr, helper.ckpt_dir)
   helper.save_state_info(state)
 
   # Compile loss, train and learning rate functions.
@@ -2480,7 +2646,7 @@ def run_experiment(
   logging.info('Initializing dataset.')
   train_set = data_lib.create_iter_dataset(config, training=True)
   logging.info('sharding_config.data_partition: %s',
-               sharding_config.data_partition)
+               config.sharding_config.data_partition)
 
   train_iter = iter(train_set)
 
@@ -2614,7 +2780,7 @@ def run_experiment(
 
 def create_model(config, sharding_config):
   if sharding_config is None:
-    sharding_config = config_lib.GSPMDSharding()
+    sharding_config = config.sharding_config
   if not (model := getattr(config, 'model', None)):
     model_cls = module.ModuleRegistry.get(config.model_name)
     model = model_cls(config, sharding_config=sharding_config)
@@ -2874,6 +3040,12 @@ class SamplingState:
     )
 
   @functools.cached_property
+  @jax.jit
+  def all_has_ended(self) -> Array:
+    """Returns whether all sequences in the batch are done with generation."""
+    return jnp.all(self.has_ended)
+
+  @functools.cached_property
   def next_position_is_output(self) -> Array:
     return self.position + 1 >= self.input_lens  # [batch, 1]
 
@@ -2935,6 +3107,8 @@ class SamplingOutput:
   output_token_logprobs: list[float]
   # Whether the output was truncated before reaching natural eos.
   is_truncated: bool
+  # The processed input arrays, which could be used for RL.
+  processed_input: sampling_lib.ProcessedInput
 
   # Log probs of the input tokens computed by log_softmax.
   # The score values are not affected by the sampling params.
@@ -3305,6 +3479,7 @@ class LMInterface:
       sampling_state = self.decode_fn(
           params=params,
           init_sampling_state=sampling_state,
+          extra_inputs=processed_input.extra_inputs,
           temperature=sampling_params.temperature,
           top_k=sampling_params.top_k,
           top_p=sampling_params.top_p,
@@ -3313,7 +3488,7 @@ class LMInterface:
           scoring_top_p=scoring_params.top_p,
       )
       position = jax.device_get(sampling_state.position)
-      if jax.device_get(jnp.all(sampling_state.has_ended)):
+      if jax.device_get(sampling_state.all_has_ended):
         break
     # Post process the outputs.
     all_raw_token_ids = jax.experimental.multihost_utils.process_allgather(
@@ -3373,9 +3548,10 @@ class LMInterface:
       else:
         output_chunks = self.input_processor.decode(output_token_ids)
 
+      input_index = i // sampling_params.num_samples
       sample_outputs.append(
           SamplingOutput(
-              input_chunks=raw_inputs[i // sampling_params.num_samples],
+              input_chunks=raw_inputs[input_index],
               output_chunks=output_chunks,
               input_token_ids=input_token_ids,
               output_token_ids=output_token_ids,
@@ -3383,6 +3559,7 @@ class LMInterface:
               input_token_scores=input_token_scores,
               output_token_scores=output_token_scores,
               is_truncated=(not ends_in_eos),
+              processed_input=unpadded_inputs[input_index],
           )
       )
 
@@ -3558,11 +3735,17 @@ def sample_from_logits(
 
   def masked_sample_fn(logits: Array) -> tuple[Array, Array]:
     logits = logits / temperature
+
     mask = jax.lax.cond(
-        top_k > 0,
-        lambda x: top_k_mask(x, top_k=top_k),
-        lambda x: top_p_mask(x, top_p=top_p),
-        logits,
+        jnp.logical_and(top_k > 0, top_p < 1),
+        lambda: (
+            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
+        ),
+        lambda: jax.lax.cond(
+            top_k > 0,
+            lambda: top_k_mask(logits, top_k=top_k),
+            lambda: top_p_mask(logits, top_p=top_p),
+        ),
     )
     m = distributions.MaskedCategorical(
         logits, mask=mask, neg_inf=neg_inf(logits.dtype)
@@ -3693,6 +3876,7 @@ def continue_decode(
     apply_fn: Callable[..., Array],
     params: PyTree,
     init_sampling_state: SamplingState,
+    extra_inputs: Mapping[str, PyTree] | None = None,
     temperature: float = 1.0,
     top_k: int = -1,
     top_p: float = 1.0,
@@ -3710,6 +3894,7 @@ def continue_decode(
         segment_positions=einops.repeat(
             sampling_state.position, '-> b 1', b=sampling_state.batch_size
         ),
+        extra_inputs=extra_inputs,
         decode_state=sampling_state.decode_state,
     )
 
@@ -3778,7 +3963,7 @@ def continue_decode(
   def cond_fn(sampling_state: SamplingState) -> jax.typing.ArrayLike:
     return (
         sampling_state.position < sampling_state.decode_state_length
-    ) & ~jnp.all(sampling_state.has_ended)
+    ) & ~sampling_state.all_has_ended
 
   final_sampling_state = jax.lax.while_loop(
       cond_fn, body_fn, init_sampling_state

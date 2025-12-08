@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import os
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from absl import logging
 from etils import epath
@@ -38,13 +38,18 @@ from simply.utils import pytree
 PartitionAnnotation = common.PartitionAnnotation
 MESH_CONTEXT_KEY: str = 'mesh_context'
 NOT_ANNOTATED = 'NOT_ANNOTATED'
+# For backward compatibility.
+DEFAULT_AXIS_NAMES = ('replica', 'data', 'model')
 
 
 @contextlib.contextmanager
 def mesh_context(
-    mesh_shape: Sequence[int], dcn_mesh_shape: Sequence[int] | None = None
+    mesh_shape: Sequence[int], dcn_mesh_shape: Sequence[int] | None = None,
+    axis_names: Sequence[str] | None = None,
 ):
-  set_default_mesh_shape(mesh_shape=mesh_shape, dcn_mesh_shape=dcn_mesh_shape)
+  set_default_mesh_shape(
+      mesh_shape=mesh_shape, dcn_mesh_shape=dcn_mesh_shape,
+      axis_names=axis_names)
   try:
     yield common.THREAD_CONTEXT.mesh_context[-1]
   finally:
@@ -53,21 +58,38 @@ def mesh_context(
 
 def set_default_mesh_shape(
     *,
-    mesh_shape: Sequence[int],
-    dcn_mesh_shape: Sequence[int] | None = None,
+    mesh_shape: Sequence[int] | Mapping[str, int],
+    dcn_mesh_shape: Sequence[int] | Mapping[str, int] | None = None,
+    axis_names: Sequence[str] | None = None,
 ):
+  """Sets the default mesh shape for the current thread context.
+
+  Args:
+    mesh_shape: The shape of the mesh. Can be a sequence of integers or a
+      mapping from axis names to sizes (missing keys are filled with 1).
+    dcn_mesh_shape: The shape of the DCN mesh, if applicable. Can be a sequence
+      of integers or a mapping from axis names to sizes (missing keys are filled
+      with 1).
+    axis_names: The names of the mesh axes. If None, `DEFAULT_AXIS_NAMES` is
+      used.
+  """
+  if axis_names is None:
+    axis_names = DEFAULT_AXIS_NAMES
   context = getattr(common.THREAD_CONTEXT, MESH_CONTEXT_KEY, None)
   if context is None:
     context = []
     setattr(common.THREAD_CONTEXT, MESH_CONTEXT_KEY, context)
-  context.append(create_mesh(mesh_shape, dcn_mesh_shape))
+  if isinstance(mesh_shape, Mapping):
+    mesh_shape = [mesh_shape.get(axis_name, 1) for axis_name in axis_names]
+  if isinstance(dcn_mesh_shape, Mapping):
+    dcn_mesh_shape = [
+        dcn_mesh_shape.get(axis_name, 1) for axis_name in axis_names]
+  context.append(create_mesh(mesh_shape, dcn_mesh_shape, axis_names=axis_names))
 
 
-def get_mesh_shape(num_devices):
-  return (num_devices, 1, 1)
-
-
-def create_mesh(mesh_shape=None, dcn_mesh_shape=None, print_debug_info=False):
+def create_mesh(
+    mesh_shape=None, dcn_mesh_shape=None, axis_names=None,
+    print_debug_info=False):
   """Creates mesh for the current device set.
 
   Full replica parallelism is used if mesh_shape is not provided.
@@ -75,14 +97,19 @@ def create_mesh(mesh_shape=None, dcn_mesh_shape=None, print_debug_info=False):
   Args:
     mesh_shape: The mesh shape.
     dcn_mesh_shape: The mesh shape for the dcn devices.
+    axis_names: The names of the mesh axes.
     print_debug_info: Whether to print debug info.
 
   Returns:
     The mesh.
   """
   num_devices = len(jax.devices())
+  if axis_names is None:
+    axis_names = DEFAULT_AXIS_NAMES
   if mesh_shape is None:
-    mesh_shape = get_mesh_shape(num_devices)
+    # By default we just do full replica parallelism and assume the first axis
+    # is the replica axis.
+    mesh_shape = [num_devices] + [1] * (len(axis_names) - 1)
   if len(mesh_shape) == 2:
     mesh_shape = (1, *mesh_shape)
   if dcn_mesh_shape and dcn_mesh_shape[0] > 1:
@@ -96,7 +123,7 @@ def create_mesh(mesh_shape=None, dcn_mesh_shape=None, print_debug_info=False):
     devices = mesh_utils.create_device_mesh(
         mesh_shape, allow_split_physical_axes=True
     )
-  return js.Mesh(devices, axis_names=('replica', 'data', 'model'))
+  return js.Mesh(devices, axis_names=axis_names)
 
 
 def get_default_mesh(print_debug_info=False):
@@ -117,6 +144,13 @@ def mesh_sharding(
     return js.NamedSharding(mesh, js.PartitionSpec())
   else:
     return js.NamedSharding(mesh, js.PartitionSpec(*pspec))
+
+
+def get_partition_axis(partition: PartitionAnnotation, axis: int):
+  if partition is None:
+    return None
+  else:
+    return partition[axis]
 
 
 def with_sharding_constraint(

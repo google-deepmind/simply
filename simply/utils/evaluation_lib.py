@@ -305,14 +305,6 @@ class ZeroShotDeepSeekQwenR1CoTBoxed(ZeroShotBoxedInQuestionEvaluation):
 
 @EvaluationRegistry.register
 @dataclasses.dataclass(frozen=True)
-class ZeroShotGeminiCoTBoxed(ZeroShotDeepSeekQwenR1CoTBoxed):
-  """0-shot that uses gemini thinking system instruction."""
-
-  system_message: str = 'SPECIAL INSTRUCTION: think silently.'
-
-
-@EvaluationRegistry.register
-@dataclasses.dataclass(frozen=True)
 class ZeroShotSystemCoTBoxed(ZeroShotDeepSeekQwenR1CoTBoxed):
   r"""0-shot that asks to reason step by step and put answer in \boxed{}.
 

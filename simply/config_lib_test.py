@@ -28,7 +28,7 @@ class ConfigLibTest(absltest.TestCase):
         'lm_test'
     )
     sharding_config = config_lib.ShardingConfigRegistry.get_config(
-        'GSPMDSharding'
+        'gspmd_sharding'
     )
     model_cls = module.ModuleRegistry.get(config.model_name)
     self.assertEqual(model_cls, model_lib.TransformerLM)

@@ -268,6 +268,13 @@ class PyTreeTest(absltest.TestCase):
     with self.assertRaises(ValueError):
       pytree.concatenate_pytrees([tree1, tree2])
 
+  def test_trim_none(self):
+    tree = {'a': 1, 'b': [None, {'z': None}], 'c': {'d': None, 'e': 2}}
+    self.assertEqual(pytree.trim_none(tree), {'a': 1, 'c': {'e': 2}})
+
+    tree = [None, {'z': None}, {'a': [None, {'c': [None]}]}]
+    self.assertIsNone(pytree.trim_none(tree))
+
   def test_save_and_load_pytree(self):
     tree = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])
     path = self.create_tempfile().full_path

@@ -13,17 +13,21 @@
 # limitations under the License.
 """Tokenizers."""
 
+from collections.abc import Mapping
 import functools
-from typing import Any, ClassVar, Generic, Protocol
+import json
+from typing import Any, ClassVar, Generic, Protocol, cast
 
+from etils import epath
 import seqio
-
 from simply.utils import common
 from simply.utils import registry
+import tokenizers
 
 
 class TokenizerRegistry(registry.RootRegistry):
   """Tokenizer registry."""
+
   namespace: ClassVar[str] = 'tokenizer'
 
 
@@ -49,7 +53,8 @@ class TestVocab(SimplyVocab[str]):
     self.unk_id = unk_id
     start_id = max(unk_id, pad_id, eos_id, bos_id) + 1
     self._vocab_dict = dict(
-        [(w, (i + start_id)) for i, w in enumerate(vocab_list)])
+        [(w, (i + start_id)) for i, w in enumerate(vocab_list)]
+    )
     self._rev_vocab_dict = {v: k for k, v in self._vocab_dict.items()}
 
   def encode(self, text: str) -> list[int]:
@@ -82,32 +87,43 @@ class HuggingFaceVocab(SimplyVocab[str]):
     self.vocab_path = vocab_path
 
   @functools.cached_property
-  def tokenizer(self) -> Any:
-    # TODO: Test if we can use tokenizers lib instead of transformers.
-    try:
-      import transformers  # pylint: disable=g-import-not-at-top # pytype: disable=import-error
-    except ImportError as exc:
-      raise ImportError(
-          'HuggingFace vocab requires transformers library, which'
-          ' is not included. Please include transformers library and try'
-          ' again.'
-      ) from exc
-    return transformers.AutoTokenizer.from_pretrained(self.vocab_path)
+  def tokenizer(self) -> tokenizers.Tokenizer:
+    vocab_path = epath.Path(self.vocab_path)
+    return tokenizers.Tokenizer.from_file(
+        (vocab_path / 'tokenizer.json').as_posix()
+    )
 
-  @property
+  @functools.cached_property
+  def tokenizer_config(self) -> Mapping[str, Any]:
+    vocab_path = epath.Path(self.vocab_path)
+    with (vocab_path / 'tokenizer_config.json').open() as f:
+      return json.load(f)
+
+  def get_token_id(self, name: str) -> int | None:
+    token = self.tokenizer_config[name]
+    if token is None:
+      return None
+    if not isinstance(token, str):
+      token = token['content']
+    if not isinstance(token, str):
+      raise ValueError(f'{token=} is not a string ({name=}).')
+    return self.tokenizer.token_to_id(token)
+
+  @functools.cached_property
   def bos_id(self) -> int | None:
-    return self.tokenizer.bos_token_id
+    return self.get_token_id('bos_token')
 
-  @property
-  def eos_id(self) -> int:
-    return self.tokenizer.eos_token_id
+  @functools.cached_property
+  def eos_id(self) -> int | None:
+    return self.get_token_id('eos_token')
 
-  @property
-  def pad_id(self) -> int:
-    return self.tokenizer.pad_token_id
+  @functools.cached_property
+  def pad_id(self) -> int | None:
+    return self.get_token_id('pad_token')
 
   def encode(self, text: str) -> list[int]:
-    return self.tokenizer.encode(text, add_special_tokens=False)
+    encoded = self.tokenizer.encode(text)
+    return cast(tokenizers.Encoding, encoded).ids
 
   def decode(self, token_ids: list[int]) -> str:
     return self.tokenizer.decode(token_ids)

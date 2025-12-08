@@ -16,10 +16,10 @@
 from collections.abc import Sequence
 import dataclasses
 import functools
-import pathlib
 from typing import TypedDict
 
 from absl.testing import absltest
+from etils import epath
 import numpy as np
 import seqio
 from simply import config_lib
@@ -128,13 +128,13 @@ class RunExperimentTest(absltest.TestCase):
         # lacks `SimplyV1Chat.extra_eos_tokens` we override the latter to empty.
         lm_format_name='MockSimplyV1Chat',
     )
-    experiment_dir = pathlib.Path(self.create_tempdir().full_path)
+    experiment_dir = epath.Path(self.create_tempdir().full_path)
 
     rl_lib.run_experiment(
         config=config,
         sharding_config=config.decoding_sharding_config,
         mesh_shape=(1, 1, 1),
-        experiment_dir=str(experiment_dir),
+        experiment_dir=experiment_dir.as_posix(),
     )
 
     self.assertTrue(

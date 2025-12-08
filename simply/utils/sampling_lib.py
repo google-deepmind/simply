@@ -1,4 +1,23 @@
-"""Sampling helpers for Simply."""
+"""Sampling helpers for Simply.
+
+The life of a sample is summarized below:
+
+1) Initial raw input is a sequence of `Chunk`. Similar to Gemini APIs, these
+   usually will simply hold text strings but can also hold arbitrary other input
+   data (e.g. images).
+
+2) `Chunk`s are processed into `ProcessedInput`, which is a purely array-based
+   representation of the input. For example, converting text into tokens will
+   happen here. The processing logic is specified by an implementation of
+   `InputProcessorInterface`, which can be customized.
+
+3) Multiple `ProcessedInput` are formed into `ProcessedInputBatch`, which may
+   involve padding/truncation.
+
+4) The `ProcessedInputBatch` is fed into the Jax-based sampling loop, producing
+   `SamplingOutput`s. TODO: Consider moving sampling loop code from
+   model_lib.py to this file.
+"""
 
 import dataclasses
 import enum
@@ -113,12 +132,14 @@ class SamplingParams:
     )
 
 
+@SamplingRegistry.register
 @dataclasses.dataclass(frozen=True)
 class ProcessedInput:
   tokens: Sequence[int]
   extra_inputs: Mapping[str, common.PyTree] | None = None
 
 
+@SamplingRegistry.register
 @dataclasses.dataclass(frozen=True)
 class ProcessedInputBatch:
   """Holder for all sampling input after processing.

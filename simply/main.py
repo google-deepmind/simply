@@ -27,18 +27,17 @@ if gpus:
     print(e)
 
 import dataclasses
-import json
 import os
 import re
 from typing import Sequence
 
 from absl import flags
 from absl import logging
-from etils import epath
 from simply import config_lib
 from simply import model_lib
 from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
+from simply.utils import experiment_helper
 from simply.utils import pytree
 from absl import app
 
@@ -47,7 +46,7 @@ _EXPERIMENT_CONFIG = flags.DEFINE_string(
     'experiment_config', None, 'Name of the experiment config.')
 
 _SHARDING_CONFIG = flags.DEFINE_string(
-    'sharding_config', 'GSPMDSharding', 'Name of the sharding config.')
+    'sharding_config', None, 'Name of the sharding config.')
 
 _EXPERIMENT_CONFIG_PATH = flags.DEFINE_string(
     'experiment_config_path',
@@ -85,65 +84,96 @@ _DECODING_MESH_SHAPE = flags.DEFINE_list(
 )
 
 
-def main(argv: Sequence[str]) -> None:
-  del argv
+def override_mesh_and_sharding(config):
+  """Updates sharding and mesh fields in the config."""
+  if sharding_config_path := _SHARDING_CONFIG_PATH.value:
+    sharding_config = pytree.load_pytree_from(sharding_config_path)
+    config = dataclasses.replace(config, sharding_config=sharding_config)
+  elif sharding_config_name := _SHARDING_CONFIG.value:
+    sharding_config = config_lib.ShardingConfigRegistry.get_config(
+        sharding_config_name
+    )
+    config = dataclasses.replace(config, sharding_config=sharding_config)
+
+  mesh_axis_names = config.sharding_config.mesh_axis_names
+
+  def parse_mesh_shape_flags(mesh_shape_flags):
+    """Parses mesh shape flags into a dict."""
+    return dict(zip(mesh_axis_names, map(int, mesh_shape_flags)))
+
+  kwargs = {}
+  if dcn_mesh_shape_flags := _DCN_MESH_SHAPE.value:
+    kwargs['dcn_mesh_shape'] = parse_mesh_shape_flags(dcn_mesh_shape_flags)
+  if mesh_shape_flags := _MESH_SHAPE.value:
+    kwargs['mesh_shape'] = parse_mesh_shape_flags(mesh_shape_flags)
+  if decoding_mesh_shape_flags := _DECODING_MESH_SHAPE.value:
+    kwargs['decoding_mesh_shape'] = parse_mesh_shape_flags(
+        decoding_mesh_shape_flags
+    )
+  if kwargs:
+    config = dataclasses.replace(config, **kwargs)
+
+  if config.mesh_shape is None:
+    mesh_shape = config_lib.get_default_mesh_shape(
+        config, mode='train', dcn_mesh_shape=config.dcn_mesh_shape
+    )
+    config = dataclasses.replace(config, mesh_shape=mesh_shape)
+
+  if config.decoding_mesh_shape is None:
+    decoding_mesh_shape = config_lib.get_default_mesh_shape(
+        config, mode='decode', dcn_mesh_shape=config.dcn_mesh_shape
+    )
+    config = dataclasses.replace(
+        config, decoding_mesh_shape=decoding_mesh_shape
+    )
+  return config
+
+
+def execute_code_patch(config):
+  if not dataclasses.is_dataclass(config):
+    config = common.AttributeDict(config)
+  if code_patch := getattr(config, 'code_patch', None):
+    for code, code_context in code_patch:
+      print(f'Executing under code context: {code_context}')
+      context = globals()[code_context]
+      print(f'code:\n{code}')
+      exec(code, context.__dict__)  # pylint: disable=exec-used
+
+
+def load_experiment_config():
+  """Loads the experiment configuration.
+
+  This function loads the experiment configuration from either a specified file
+  path or a registered config name. It also applies mesh and sharding overrides
+  based on command line flags and executes any code patches defined in the
+  config.
+
+  Returns:
+    A tuple containing the loaded experiment config and the experiment 
+    directory.
+  """
   if experiment_config_path := _EXPERIMENT_CONFIG_PATH.value:
-    assert (
-        not _EXPERIMENT_CONFIG.value
-    ), 'experiment_config and experiment_config_path cannot both be set.'
-    with epath.Path(experiment_config_path).open('r') as f:
-      config_dict = json.load(f)
-    if 'code_patch' in config_dict:
-      for code, code_context in config_dict['code_patch']:
-        print(f'Executing under code context: {code_context}')
-        context = globals()[code_context]
-        print(f'code:\n{code}')
-        exec(code, context.__dict__)  # pylint: disable=exec-used
-    config = pytree.load_dataclasses(config_dict)
+    if _EXPERIMENT_CONFIG.value:
+      logging.warning(
+          'experiment_config_path is set. Will ignore experiment_config.'
+      )
+    config = pytree.load_pytree_from(experiment_config_path)
   else:
     config = config_lib.ExperimentConfigRegistry.get_config(
         _EXPERIMENT_CONFIG.value
     )
-  if sharding_config_path := _SHARDING_CONFIG_PATH.value:
-    with epath.Path(sharding_config_path).open('r') as f:
-      sharding_config = pytree.load_dataclasses(json.load(f))
-  else:
-    sharding_config = config_lib.ShardingConfigRegistry.get_config(
-        _SHARDING_CONFIG.value
-    )
-  if dcn_mesh_shape := _DCN_MESH_SHAPE.value:
-    dcn_mesh_shape = [int(i) for i in dcn_mesh_shape]
+  config = override_mesh_and_sharding(config)
+  execute_code_patch(config)
+  return config, _EXPERIMENT_DIR.value
 
-  if mesh_shape := _MESH_SHAPE.value:
-    mesh_shape = [int(i) for i in mesh_shape]
-  else:
-    mesh_shape = config_lib.get_default_mesh_shape(
-        config, mode='train', dcn_mesh_shape=dcn_mesh_shape)
 
-  if decoding_mesh_shape := _DECODING_MESH_SHAPE.value:
-    decoding_mesh_shape = [int(i) for i in decoding_mesh_shape]
-  else:
-    decoding_mesh_shape = config_lib.get_default_mesh_shape(
-        config, mode='decode', dcn_mesh_shape=dcn_mesh_shape)
-  logging.info('mesh_shape: %s', mesh_shape)
-  logging.info('decoding_mesh_shape: %s', decoding_mesh_shape)
-
-  if not dataclasses.is_dataclass(config):
-    config = common.AttributeDict(config)
-
+def main(argv: Sequence[str]) -> None:
+  del argv
+  experiment_helper.setup_work_unit()
+  config, experiment_dir = load_experiment_config()
   logging.info('config: %s', config)
-  logging.info('sharding_config: %s', sharding_config)
-  logging.info('mesh_shape: %s', mesh_shape)
-  logging.info('dcn_mesh_shape: %s', dcn_mesh_shape)
   run_experiment_fn = model_lib.TrainLoopRegistry.get(config.train_loop_name)
-  run_experiment_fn(
-      config=config,
-      sharding_config=sharding_config,
-      mesh_shape=mesh_shape,
-      dcn_mesh_shape=dcn_mesh_shape,
-      experiment_dir=_EXPERIMENT_DIR.value,
-      decoding_mesh_shape=decoding_mesh_shape,
-  )
+  run_experiment_fn(config=config, experiment_dir=experiment_dir)
 
 if __name__ == '__main__':
   app.run(main)

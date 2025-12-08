@@ -30,6 +30,7 @@ from simply.utils import masked
 from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 from simply.utils import registry
+from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
 
 
@@ -86,9 +87,7 @@ class ModelLibTest(parameterized.TestCase):
     prng_key = jax.random.key(seed)
     config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
-    model = model_lib.TransformerLM(
-        config, sharding_config=config_lib.GSPMDSharding()
-    )
+    model = model_lib.TransformerLM(config)
     params = model.init(prng_key)
     batch_size = 2
     batch = jax.random.randint(
@@ -129,15 +128,36 @@ class ModelLibTest(parameterized.TestCase):
     self.assertTrue(
         np.allclose(np.array(expected_logits), logits, atol=1e-5))
 
+  def test_identical_inputs_run_to_run_consistency(self):
+    """Tests for deterministic outputs across multiple runs with identical inputs."""
+    config = lm_test()
+    model = model_lib.TransformerLM(config)
+
+    prng_key = jax.random.key(4)
+    batch_size, seq_len = 4, 8
+
+    prng_key, subkey = jax.random.split(prng_key)
+    x = jax.random.randint(
+        subkey,
+        shape=(batch_size, seq_len),
+        minval=0,
+        maxval=config.vocab_size,
+    )
+
+    params = model.init(prng_key)
+
+    logits1, _ = model.apply(params, x)
+    logits2, _ = model.apply(params, x)
+
+    np.testing.assert_array_equal(logits1, logits2, strict=True)
+
   def test_backward_pass(self):
     # Generate test data
     seed = 42
     prng_key = jax.random.key(seed)
     config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
-    model = model_lib.TransformerLM(
-        config, sharding_config=config_lib.GSPMDSharding()
-    )
+    model = model_lib.TransformerLM(config)
     params = model.init(prng_key)
     batch_size = 2
     inputs = jax.random.randint(
@@ -200,9 +220,7 @@ class ModelLibTest(parameterized.TestCase):
     prng_key = jax.random.key(seed)
     config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
-    model = model_lib.TransformerLM(
-        config, sharding_config=config_lib.GSPMDSharding()
-    )
+    model = model_lib.TransformerLM(config)
     params = model.init(prng_key)
     batch_size = 4
     inputs = jax.random.randint(
@@ -288,9 +306,7 @@ class ModelLibTest(parameterized.TestCase):
     prng_key = jax.random.key(seed)
     config = lm_test()
     config = dataclasses.replace(config, vocab_size=4)
-    model = model_lib.TransformerLM(
-        config, sharding_config=config_lib.GSPMDSharding()
-    )
+    model = model_lib.TransformerLM(config)
     params = model.init(prng_key)
     dim_annotations = jax.tree.map(
         lambda x: x.metadata['dim_annotation'],
@@ -357,8 +373,7 @@ class ModelLibTest(parameterized.TestCase):
     config = lm_test()
     new_config = dataclasses.replace(
         config, activation_dtype_name=activation_dtype_name)
-    tfm_lm = model_lib.TransformerLM(
-        new_config, sharding_config=config_lib.GSPMDSharding())
+    tfm_lm = model_lib.TransformerLM(new_config)
     params = tfm_lm.init(prng_key)
     batch_size = 8
     batch = jax.random.randint(
@@ -382,8 +397,7 @@ class ModelLibTest(parameterized.TestCase):
     config = lm_test()
     new_config = dataclasses.replace(
         config, activation_dtype_name=activation_dtype_name)
-    tfm_lm = model_lib.TransformerLM(
-        new_config, sharding_config=config_lib.GSPMDSharding())
+    tfm_lm = model_lib.TransformerLM(new_config)
     params = tfm_lm.init(prng_key)
     batch_size = 8
     quant_params = model_lib.quantize_tfm_params(params)
@@ -1156,7 +1170,7 @@ class ModelLibTest(parameterized.TestCase):
     new_config = dataclasses.replace(
         lm_test(), ffn_expand_dim=ffn_expand_dim)
     self.tfm_lm = model_lib.TransformerLM(
-        new_config, config_lib.GSPMDSharding()
+        new_config, config_lib.gspmd_sharding()
     )
     for tfm_block in self.tfm_lm.blocks:
       self.assertEqual(tfm_block.expand_dim, ffn_expand_dim)
@@ -1225,13 +1239,6 @@ class TestNpArrayQuantizer(tokenization.SimplyVocab[np.ndarray]):
     output_raw = np.array(output_raw, dtype=np.int32)[None, :]
     output_raw = np.repeat(output_raw, self.feature_dim, axis=1)
     return output_raw
-
-
-class MockShardingConfig:
-  ffn0_partition = None
-  ffn1_partition = None
-  ffn0_activation_partition = None
-  activation_partition = None
 
 
 def simple_moe(
@@ -1340,9 +1347,12 @@ class MoETest(parameterized.TestCase):
       self, use_gated_activation_in_ffn, num_experts, expert_capacity_factor,
       num_experts_per_token=2, activation_dtype='bfloat16',
   ):
+    sharding_config = config_lib.moe_sharding()
+    sharding_lib.set_default_mesh_shape(
+        mesh_shape=(1, 1, 1, 1),
+        axis_names=sharding_config.mesh_axis_names)
     batch_size, seq_len, model_dim, expand_factor = 2, 4, 4, 2
     segment_ids = jnp.array([[1, 2, 3, 0], [1, 0, 0, 1]])
-    sharding_config = MockShardingConfig()
     key = jax.random.PRNGKey(0)
     input_key, prng_key = jax.random.split(key)
     inputs = jax.random.normal(

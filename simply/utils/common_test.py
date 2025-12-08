@@ -123,6 +123,29 @@ class CommonTest(absltest.TestCase):
     unsorted_x = common.unsorted(sorted_x, indices)
     self.assertSequenceEqual(unsorted_x, x)
 
+  def test_eval_abstract_output(self):
+
+    def _fn(x, y):
+      y = jnp.asarray(y, dtype=x.dtype)
+      return jnp.concatenate([x, y], axis=-1)
+
+    sharding = jax.sharding.NamedSharding(
+        mesh=jax.sharding.Mesh(jax.devices(), 'x'),
+        spec=jax.sharding.PartitionSpec('x'),
+    )
+    abstract_output = common.eval_abstract_output(
+        _fn,
+        jax.ShapeDtypeStruct(
+            shape=(2, 3), dtype=jnp.float32, sharding=sharding
+        ),
+        jax.ShapeDtypeStruct(shape=(2, 2), dtype=jnp.int32),
+    )
+    print(f'{abstract_output=}')
+    self.assertEqual(abstract_output.shape, (2, 5))
+    self.assertEqual(abstract_output.dtype, jnp.float32)
+    self.assertEqual(abstract_output.sharding.mesh, sharding.mesh)
+    self.assertEqual(abstract_output.sharding.spec, sharding.spec)
+
 
 if __name__ == '__main__':
   absltest.main()

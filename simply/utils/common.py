@@ -200,20 +200,11 @@ def convert_or_dequantize(
   return jnp.asarray(dequant_w, dtype=dtype)
 
 
-def make_shape_dtype_struct_with_sharding(
-    x: Array, sharding: jax.sharding.Sharding
-) -> jax.ShapeDtypeStruct:
-  return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=sharding)
-
-
-def eval_shape_with_sharding(fn: Callable[..., Any], *args, **kwargs) -> PyTree:
-  """Returns output shape and sharding information for given function."""
+def eval_abstract_output(fn: Callable[..., Any], *args, **kwargs) -> PyTree:
+  """Returns jax.ShapeDtypeStruct tree for given function."""
   jitted_fn = jax.jit(fn)
-  shapes = jax.eval_shape(jitted_fn, *args, **kwargs)
   compiled_output = jitted_fn.lower(*args, **kwargs).compile()
-  shardings = compiled_output.output_shardings
-  return jax.tree_util.tree_map(
-      make_shape_dtype_struct_with_sharding, shapes, shardings)
+  return compiled_output.out_info
 
 
 def named_partial_fn(

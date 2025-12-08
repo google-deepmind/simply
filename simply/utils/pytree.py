@@ -390,6 +390,40 @@ def concatenate_pytrees(trees: Sequence[PyTree]) -> PyTree:
   return first_tree
 
 
+def trim_none(tree: PyTree) -> PyTree:
+  """Trim pytree with None values.
+
+  If the pytree is a mapping, the None values in the mapping will be removed.
+  If the pytree is a sequence, only when all values are None, the pytree will be
+  trimmed.
+
+  Args:
+    tree: The pytree to trim.
+
+  Returns:
+    The trimmed pytree.
+  """
+  if tree is None:
+    return None
+  if tree_is_mapping(tree):
+    trimmed_tree = {}
+    for k, v in tree.items():
+      v = trim_none(v)
+      if v is not None:
+        trimmed_tree[k] = v
+    return trimmed_tree if trimmed_tree else None
+  if tree_is_sequence(tree):
+    trimmed_tree = [None] * len(tree)
+    should_trim = True
+    for i, v in enumerate(tree):
+      v = trim_none(v)
+      trimmed_tree[i] = v
+      if v is not None:
+        should_trim = False
+    return None if should_trim else trimmed_tree
+  return tree
+
+
 def save_pytree_to(tree: Any, path: epath.PathLike):
   """Saves a pytree to a file."""
   path = epath.Path(path)
@@ -397,7 +431,7 @@ def save_pytree_to(tree: Any, path: epath.PathLike):
     json.dump(dump(tree), f)
 
 
-def load_pytree_from(path: epath.PathLike) -> PyTree:
+def load_pytree_from(path: epath.PathLike) -> Any:
   """Loads a pytree from a file."""
   path = epath.Path(path)
   with path.open('r') as f:

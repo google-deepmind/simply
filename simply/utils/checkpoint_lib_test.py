@@ -25,6 +25,7 @@ from simply import model_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import pytree
+from simply.utils import sharding as sharding_lib
 
 
 from importlib.resources import files, as_file
@@ -148,9 +149,10 @@ class CheckpointFormatTest(absltest.TestCase):
     )
 
 
-class Qwen2FormatTest(absltest.TestCase):
+class QwenFormatTest(absltest.TestCase):
 
-  def qwen2_test_config(self):
+  @classmethod
+  def qwen2_test_config(cls):
     return dataclasses.replace(
         config_lib.deepseek_qwen2_1p5b(),
         model_dim=4,
@@ -159,6 +161,23 @@ class Qwen2FormatTest(absltest.TestCase):
         n_layers=2,
         per_head_dim=2,
         vocab_size=2,
+    )
+
+  @classmethod
+  def qwen3_moe_test_config(cls):
+    return dataclasses.replace(
+        config_lib.qwen3_30b_a3b(),
+        use_qk_norm=False,
+        model_dim=4,
+        ffn_expand_dim=8,
+        n_heads=2,
+        n_kv_heads=2,
+        n_layers=1,
+        per_head_dim=2,
+        vocab_size=2,
+        use_moe=True,
+        num_experts=2,
+        num_experts_per_token=1,
     )
 
   def setUp(self):
@@ -178,16 +197,53 @@ class Qwen2FormatTest(absltest.TestCase):
     )
     mngr.wait_until_finished()
 
+    model = model_lib.TransformerLM(self.qwen2_test_config())
+    expected_abstract_state = {
+        'params': ckpt_lib.get_abstract_params(model)
+    }
     restored = ckpt_lib.load_checkpoint_from_dir(
-        ckpt_dir.full_path, self.expected_abstract_state
+        ckpt_dir.full_path, expected_abstract_state
     )
     restored = common.get_raw_arrays(restored)
+
+    expected_state = load_state('ckpt_expected_qwen2_format.json')
     pytree.traverse_tree_with_path(
         lambda actual, expected, path: self.assertAlmostEqual(
             actual.tolist(), expected.tolist(), msg=f'Mismatch at {path}'
         ),
         restored,
-        self.expected_state,
+        expected_state,
+    )
+
+  def test_restore_qwen3_moe_format(self):
+    qwen3_moe_state = load_state('ckpt_qwen3_moe_format.json')
+    ckpt_dir = self.create_tempdir()
+    mngr = ocp.CheckpointManager(ckpt_dir.full_path)
+    ckpt_lib.save_checkpoint(
+        mngr, qwen3_moe_state, 0, ckpt_format=ckpt_lib.Qwen2Format()
+    )
+    mngr.wait_until_finished()
+
+    config = self.qwen3_moe_test_config()
+    sharding_lib.set_default_mesh_shape(
+        mesh_shape=(1, 1, 1, 1),
+        axis_names=config.sharding_config.mesh_axis_names)
+    model = model_lib.TransformerLM(config)
+    expected_abstract_state = {
+        'params': ckpt_lib.get_abstract_params(model)
+    }
+    restored = ckpt_lib.load_checkpoint_from_dir(
+        ckpt_dir.full_path, expected_abstract_state
+    )
+    restored = common.get_raw_arrays(restored)
+
+    expected_state = load_state('ckpt_expected_qwen3_moe_format.json')
+    pytree.traverse_tree_with_path(
+        lambda actual, expected, path: self.assertAlmostEqual(
+            actual.tolist(), expected.tolist(), msg=f'Mismatch at {path}'
+        ),
+        restored,
+        expected_state,
     )
 
 

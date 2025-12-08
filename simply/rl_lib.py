@@ -11,7 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Components for RL training."""
+"""Components for RL training.
+
+High-level overview of what happens in a single training step:
+
+1. Load examples from data source, convert to `SamplingInput`s,
+   and run sampler to get `SamplingOutput`s.
+
+2. Collect input/output pairs as `RewardedSample` and compute rewards per
+   example. NOTE: In a multihost setting the reward computation is
+   sharded across hosts.
+
+3. Form `RLTrainingExampleBatch` from multiple `RewardedSample`s.
+   This may involve padding/truncation and reward normalization
+   over the batch.
+
+4. Compute loss and apply gradient on `RLTrainingExampleBatch`.
+"""
 
 import abc
 import collections
@@ -150,6 +166,24 @@ class RLTrainingExampleBatch:
   ref_logprobs: Array | None = None  # float [..., seq_len]
   extra_inputs: PyTree | None = None
 
+  @classmethod
+  def default_pytree_shape(cls, max_seq_len: int):
+    """Returns the default tree shape of a batch example."""
+    dummy_example = cls(
+        input_tokens=np.zeros(max_seq_len, dtype=np.int64),
+        target_tokens=np.zeros(max_seq_len, dtype=np.int64),
+        logprobs=np.zeros(max_seq_len, dtype=np.float64),
+        target_mask=np.zeros(max_seq_len, dtype=np.bool),
+        answer_mask=np.zeros(max_seq_len, dtype=np.bool),
+        in_batch_example_id=np.array(0, dtype=np.int64),
+        reward=np.array(0.0, dtype=np.float64),
+        is_correct=np.array(False, dtype=np.bool),
+        is_valid_for_training=np.array(False, dtype=np.bool),
+        ref_logprobs=None,
+        extra_inputs={},
+    )
+    return dummy_example.tree_structure()
+
   def tree_structure(self):
     return jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype), self
@@ -237,11 +271,14 @@ def compute_logprobs(
     segment_ids = microbatch.get('decoder_segment_ids', None)
     segment_positions = microbatch.get('decoder_positions', None)
     mask = microbatch['answer_masks']
+    extra_inputs = microbatch.get('extra_inputs', None)
+
     logits, _ = model.apply(
         params,
         inputs,
         segment_ids=segment_ids,
         segment_positions=segment_positions,
+        extra_inputs=extra_inputs,
     )
     logits = jnp.astype(logits, jnp.float32)
     m = distributions.Categorical(logits)
@@ -251,7 +288,11 @@ def compute_logprobs(
   batch_size = batch['input_tokens'].shape[0]
   num_microbatches = 1
   if microbatch_size is not None and microbatch_size > 0:
-    assert batch_size % microbatch_size == 0
+    if batch_size % microbatch_size != 0:
+      raise ValueError(
+          'The batch size must be a multiple of microbatch size:'
+          f' {batch_size=}, {microbatch_size=}.'
+      )
     num_microbatches = batch_size // microbatch_size
 
   if num_microbatches == 1:
@@ -321,11 +362,14 @@ def compute_stats(
       eval_masks.append(stats['eval_mask'])
     pass_at_k_corrects.append(np.any(corrects))
     pass_at_k_eval_masks.append(np.any(eval_masks))
-  stats_columns = common.convert_rows_to_columns(stats_rows)
+
+  stats_columns = collections.defaultdict(
+      lambda: np.array([]), common.convert_rows_to_columns(stats_rows)
+  )
   logging.info('stats_columns: %s', jax.tree.map(np.shape, stats_columns))
-  eval_mask = stats_columns['eval_mask']
+  eval_mask = stats_columns['eval_mask'].astype(np.bool)
   pass_at_k_corrects = np.array(pass_at_k_corrects)
-  pass_at_k_eval_masks = np.array(pass_at_k_eval_masks)
+  pass_at_k_eval_masks = np.array(pass_at_k_eval_masks).astype(np.bool)
   stats = {
       'seq_len/mean': np_safe_mean(stats_columns['seq_len'], where=eval_mask),
       'seq_len/max': np.max(
@@ -368,7 +412,9 @@ def compute_stats(
   }
   # TODO: Ideally we should implement reward_by_type.
   for reward_type in getattr(evaluation, 'reward_types', ()):
-    is_reward_type = stats_columns[f'is_reward_type/{reward_type}']
+    is_reward_type = stats_columns[f'is_reward_type/{reward_type}'].astype(
+        np.bool
+    )
     stats.update({
         f'reward/{reward_type}': np_safe_mean(
             stats_columns['reward'], where=is_reward_type & eval_mask
@@ -378,11 +424,13 @@ def compute_stats(
         ),
         f'eval_count/{reward_type}': np.sum(is_reward_type & eval_mask),
         f'train_count/{reward_type}': np.sum(
-            is_reward_type & stats_columns['train_sample_mask']
+            is_reward_type & stats_columns['train_sample_mask'].astype(np.bool)
         ),
     })
+  stats = jax.tree.map(np.float32, stats)
   logging.info('stats: %s', stats)
   stats = jax.experimental.multihost_utils.process_allgather(stats, tiled=True)
+  logging.info('stats_after_allgather: %s', stats)
 
   eval_count = stats['eval_count']
   formatted_stats = {
@@ -406,7 +454,9 @@ def compute_stats(
           stats['pass_at_k'], stats['pass_at_k_eval_count']
       ),
       'eval_count': np.sum(eval_count),
-      'train_sample_ratio': np.sum(stats['train_count']) / np.sum(eval_count),
+      'train_sample_ratio': (
+          np.sum(stats['train_count']) / np.maximum(eval_count, 1e-5)
+      ),
   }
   for reward_type in getattr(evaluation, 'reward_types', ()):
     eval_count = stats[f'eval_count/{reward_type}']
@@ -451,7 +501,7 @@ def create_train_batch(
     `train_batch_size`.
   """
   local_train_rows = []
-  pytree_shape = None
+  pytree_shape = RLTrainingExampleBatch.default_pytree_shape(max_seq_len)
 
   for rewarded_batch_per_prompt in rewarded_batch.values():
     for rewarded_per_response in rewarded_batch_per_prompt:
@@ -472,6 +522,11 @@ def create_train_batch(
             np.ones(len(so.output_token_ids), dtype=np.bool),
         ])
 
+      extra_inputs = so.processed_input.extra_inputs or {}
+      extra_inputs = extra_inputs | rewarded_per_response.raw_example.get(
+          'extra_inputs', {}
+      )
+
       # A single example which will later be formed into an actual batch.
       example_per_response = RLTrainingExampleBatch(
           input_tokens=np.array(all_token_ids[:-1]),
@@ -489,24 +544,25 @@ def create_train_batch(
           is_valid_for_training=np.array(
               rewarded_per_response.is_valid_for_training, dtype=np.bool
           ),
-          # TODO: Currently only getting extra_inputs directly from
-          # the raw example. We will also want to merge with extra_inputs
-          # created by the input processor.
-          extra_inputs=rewarded_per_response.raw_example.get(
-              'extra_inputs', {}
-          ),
+          extra_inputs=extra_inputs,
       )
       example_per_response = example_per_response.pad_sequences(max_seq_len)
 
-      pytree_shape = pytree_shape or example_per_response.tree_structure()
+      pytree_shape = example_per_response.tree_structure()
       example_per_response.assert_no_nan()
       if example_per_response.is_valid_for_training:
         local_train_rows.append(example_per_response)
 
-  # TODO: We are relying here on each process knowing the same pytree
-  # structure for RLTrainingExampleBatch. This seems potentially brittle
-  # (e.g. one process somehow has no examples, one example is missing some extra
-  # inputs, etc.). Find a way to allgather that is more robust to missing data.
+  logging.info('pytree_shape=%s', pytree_shape)
+
+  # TODO: We are relying here on each process knowing the
+  # same pytree structure for RLTrainingExampleBatch. This seems potentially
+  # brittle (e.g. one process somehow has no examples, one example is missing
+  # some extra inputs, etc.). Find a way to allgather that is more robust to
+  # missing data.
+  #
+  # NOTE: If using extra_inputs for image inputs, we need to ensure the same
+  # array shapes even for inputs that have no images.
   global_train_batch = sharding_lib.pytree_ragged_stack_allgather(
       pytree_shape,
       local_train_rows,
@@ -530,6 +586,7 @@ def create_train_batch(
             'input_tokens': global_train_batch.input_tokens,
             'target_tokens': global_train_batch.target_tokens,
             'answer_masks': global_train_batch.answer_mask,
+            'extra_inputs': global_train_batch.extra_inputs,
         },
     )
     global_train_batch = dataclasses.replace(
@@ -706,11 +763,13 @@ def compute_ppo_loss(
 def decoding_mesh_context(
     decoding_mesh_shape: Sequence[int] | None = None,
     dcn_mesh_shape: Sequence[int] | None = None,
+    axis_names: Sequence[str] | None = None,
 ):
   if decoding_mesh_shape is None:
     return contextlib.nullcontext()
   return sharding_lib.mesh_context(
-      mesh_shape=decoding_mesh_shape, dcn_mesh_shape=dcn_mesh_shape
+      mesh_shape=decoding_mesh_shape, dcn_mesh_shape=dcn_mesh_shape,
+      axis_names=axis_names,
   )
 
 
@@ -753,22 +812,33 @@ def prepare_params_for_decoding(
 @functools.partial(model_lib.TrainLoopRegistry.register, name='rl')
 def run_experiment(
     config,
-    sharding_config,
-    mesh_shape,
-    create_dataset=None,
     # Leave `experiment_dir` as empty string to skip saving experiment data.
     # Useful if no need to save any data and can reduce some overhead.
     experiment_dir='',
+    # All the args below are deprecated.
+    mesh_shape=None,
     dcn_mesh_shape=None,
     decoding_mesh_shape=None,
+    sharding_config=None,
+    create_dataset=None,
 ):
   if create_dataset is not None:
     raise ValueError('create_dataset is deprecated.')
-  del create_dataset
+  del (
+      create_dataset,
+      decoding_mesh_shape,
+      dcn_mesh_shape,
+      sharding_config,
+      mesh_shape,
+  )
   logging.info('jax.process_index(): %s', jax.process_index())
   # Setup model, optimizer, initial state, and mesh.
   sharding_lib.set_default_mesh_shape(
-      mesh_shape=mesh_shape, dcn_mesh_shape=dcn_mesh_shape
+      mesh_shape=config.mesh_shape,
+      dcn_mesh_shape=config.dcn_mesh_shape,
+      # Currently assumes the mesh axis names are the same as for training and
+      # decoding, but this can be decoupled in the future.
+      axis_names=config.sharding_config.mesh_axis_names,
   )
   helper = ExperimentHelper(
       experiment_dir,
@@ -780,11 +850,11 @@ def run_experiment(
       log_additional_info=config.log_additional_info,
       should_save_ckpt=config.should_save_ckpt,
   )
-  model, _ = model_lib.create_model(config, sharding_config)
-  helper.save_config_info(config, sharding_config, model)
+  model, _ = model_lib.create_model(config, config.sharding_config)
+  helper.save_config_info(config, config.sharding_config, model)
   opt = config.optimizer
   state = model_lib.get_init_state(
-      config, sharding_config, helper.ckpt_mngr, helper.ckpt_dir
+      config, config.sharding_config, helper.ckpt_mngr, helper.ckpt_dir
   )
   helper.save_state_info(state)
   train_iter_state = None
@@ -848,6 +918,11 @@ def run_experiment(
   # microbatch size as training.
   compute_logprobs_microbatch_size = None
   if config.grad_accum_steps > 1:
+    if config.train_batch_size % config.grad_accum_steps != 0:
+      raise ValueError(
+          'The train_batch_size must be a multiple of grad_accum_steps:'
+          f' {config.train_batch_size=}, {config.grad_accum_steps=}.'
+      )
     compute_logprobs_microbatch_size = (
         config.train_batch_size // config.grad_accum_steps
     )
@@ -883,7 +958,8 @@ def run_experiment(
     eval_iter_init_state = eval_iter.get_state()
 
   logging.info(
-      'sharding_config.data_partition: %s', sharding_config.data_partition
+      'sharding_config.data_partition: %s',
+      config.sharding_config.data_partition,
   )
 
   evaluation = config.evaluation
@@ -911,7 +987,7 @@ def run_experiment(
           use_remat=False,
           activation_dtype_name=config.activation_dtype_name,
       ),
-      config.decoding_sharding_config or sharding_config,
+      config.decoding_sharding_config or config.sharding_config,
   )
   extra_eos_tokens = list(
       set(config.extra_eos_tokens) | set(lm_format.extra_eos_tokens)
@@ -923,7 +999,9 @@ def run_experiment(
       pad_id_override=lm_format.pad_id,
       extra_eos_tokens=extra_eos_tokens,
   )
-  with decoding_mesh_context(decoding_mesh_shape, dcn_mesh_shape):
+  with decoding_mesh_context(
+      config.decoding_mesh_shape, config.dcn_mesh_shape,
+      axis_names=config.decoding_sharding_config.mesh_axis_names):
     lm_interface = model_lib.LMInterface(
         model_for_decoding,
         params=None,
@@ -935,7 +1013,7 @@ def run_experiment(
         extra_eos_tokens=extra_eos_tokens,
     )
     abstract_decoding_params = None
-    if decoding_mesh_shape or config.decoding_sharding_config:
+    if config.decoding_mesh_shape or config.decoding_sharding_config:
       # That means we need to do reshard.
       abstract_decoding_params = ckpt_lib.get_abstract_params(
           model_for_decoding
@@ -962,11 +1040,13 @@ def run_experiment(
   final_result = {}
   final_result['eval_accuracy_history'] = []
   while steps <= config.num_train_steps and not should_early_stop:
+    helper.set_notes(f'{steps=}')
     train_iter_state = train_iter.get_state()
     logging.info('train_iter_state=%s', train_iter_state)
     start_time = time.time()
     with jax.profiler.StepTraceAnnotation('sampling'), decoding_mesh_context(
-        decoding_mesh_shape, dcn_mesh_shape
+        config.decoding_mesh_shape, config.dcn_mesh_shape,
+        axis_names=config.decoding_sharding_config.mesh_axis_names
     ):
       decoding_params = prepare_params_for_decoding(
           params=state['params'],
@@ -984,7 +1064,9 @@ def run_experiment(
       num_valid_samples_array = np.zeros(jax.process_count(), dtype=np.int32)
       num_nan_samples_array = np.zeros(jax.process_count(), dtype=np.int32)
       num_truncated_array = np.zeros(jax.process_count(), dtype=np.int32)
-      rewarded_completed_batch = collections.defaultdict(list)
+      rewarded_completed_batch: collections.defaultdict[
+          int, list[RewardedSample]
+      ] = collections.defaultdict(list)
       rewarded_pending_batch: list[Tuple[RewardedSample, Any]] = []
       in_batch_example_index = 0
       max_num_samples_per_train_batch = (
@@ -998,6 +1080,13 @@ def run_experiment(
           # We have sampled this number of samples, no need to do further
           # sampling.
           break
+        helper.set_notes(
+            f'{steps=}, already sampled'
+            f' {in_batch_example_index * config.num_samples_per_example},'
+            f' {np.sum(num_valid_samples_array)}/{train_batch_size} are valid,'
+            f' got {np.sum(num_nan_samples_array)} nan rewards,'
+            f' {np.sum(num_truncated_array)} truncated'
+        )
 
         sampling_inputs: list[RewardedSample] = []
         for example in next(train_iter):
@@ -1039,18 +1128,10 @@ def run_experiment(
 
         # At this point, each process only processes a part of the batch, i.e.
         # per-process batch or local batch.
-        assert config.batch_size % jax.process_count() == 0
-        batch_size_per_process = config.batch_size // jax.process_count()
-        process_start_index = jax.process_index() * batch_size_per_process
-
-        def _sharded(xs):
-          assert len(xs) == config.batch_size
-          return xs[
-              process_start_index : process_start_index + batch_size_per_process
-          ]
-
         for input_example, so_per_prompt in zip(
-            _sharded(sampling_inputs), _sharded(sampling_outputs), strict=True
+            sharding_lib.multihost_sharded(sampling_inputs),
+            sharding_lib.multihost_sharded(sampling_outputs),
+            strict=True,
         ):
           assert len(so_per_prompt) == config.num_samples_per_example
           for so in so_per_prompt:
@@ -1119,7 +1200,9 @@ def run_experiment(
 
             is_nan_reward = np.isnan(rewarded_per_response.reward)
             num_nan_samples += is_nan_reward
-            is_truncated = rewarded_per_response.sampling_output.is_truncated
+            so = rewarded_per_response.sampling_output
+            assert so is not None
+            is_truncated = so.is_truncated
             num_truncated += is_truncated
 
             is_invalid = (
@@ -1128,7 +1211,7 @@ def run_experiment(
                 or (
                     tool_executor
                     and config.filter_throttled
-                    and rewarded_per_response.sampling_output.is_throttled
+                    and so.is_throttled
                 )
             )
             rewarded_per_prompt_batch[i] = dataclasses.replace(
@@ -1138,7 +1221,6 @@ def run_experiment(
           num_valid_samples += sum(
               x.is_valid_for_training for x in rewarded_per_prompt_batch
           )
-
         num_valid_samples_array = (
             jax.experimental.multihost_utils.process_allgather(
                 num_valid_samples,
@@ -1156,6 +1238,13 @@ def run_experiment(
         )
 
     del decoding_params
+    helper.set_notes(
+        f'{steps=}, already sampled'
+        f' {in_batch_example_index * config.num_samples_per_example},'
+        f' {np.sum(num_valid_samples_array)}/{train_batch_size} are valid,'
+        f' got {np.sum(num_nan_samples_array)} nan rewards,'
+        f' {np.sum(num_truncated_array)} truncated'
+    )
     # TODO: May also want to cancel sub-eval threads?
     for _, reward_future in rewarded_pending_batch:
       reward_future.cancel()
@@ -1171,13 +1260,15 @@ def run_experiment(
     write_record_start_time = time.time()
     for rewarded_per_prompt_batch in rewarded_completed_batch.values():
       for rewarded_per_response in rewarded_per_prompt_batch:
+        so = rewarded_per_response.sampling_output
+        assert so is not None
         helper.write_record(
             dict(
                 steps=rewarded_per_response.step,
                 in_batch_example_index=rewarded_per_response.in_batch_example_index,
                 reward=rewarded_per_response.reward,
                 correct=rewarded_per_response.correct,
-                lm_sampling_output_text=rewarded_per_response.sampling_output.output_text,
+                lm_sampling_output_text=so.output_text,
                 lm_request=sampling_lib.input_as_text(
                     rewarded_per_response.sampling_input
                 ),
@@ -1223,6 +1314,7 @@ def run_experiment(
       for batch in replay_buffer.iterator(train_batch_size, shuffle=True):
         logging.info('batch: %s', jax.tree.map(np.shape, batch))
         steps = int(state['steps'].addressable_data(0))
+        helper.set_notes(f'{steps=}, training')
         print(f'steps: {steps}')
         assert train_iter_state is not None
         helper.save_ckpt(
@@ -1240,7 +1332,8 @@ def run_experiment(
               sampling_params, num_samples=1
           )
 
-          with decoding_mesh_context(decoding_mesh_shape, dcn_mesh_shape):
+          with decoding_mesh_context(
+              config.decoding_mesh_shape, config.dcn_mesh_shape):
             decoding_params = prepare_params_for_decoding(
                 params=state['params'],
                 abstract_decoding_params=abstract_decoding_params,
@@ -1264,20 +1357,9 @@ def run_experiment(
                 break
               eval_prompt_batch = []
               for example in eval_batch:
-                lm_request = list(
-                    sampling_lib.input_as_chunks(
-                        lm_format.format(evaluation.get_messages(example))
-                    )
+                eval_prompt_batch.append(
+                    evaluation.get_sampling_input(example, lm_format)
                 )
-                extra_inputs = example.get('extra_inputs', {})
-                for extra_input_key in extra_inputs:
-                  lm_request.append(
-                      sampling_lib.Chunk(
-                          type=sampling_lib.Chunk.Type.ARRAY,
-                          content=example['extra_inputs'][extra_input_key],
-                      )
-                  )
-                eval_prompt_batch.append(lm_request)
               if tool_executor:
                 eval_sampling_outputs = tool_executor.sample_with_tool(
                     lm_interface,
@@ -1313,9 +1395,11 @@ def run_experiment(
             final_result['eval_accuracy_history'].append(eval_accuracy)
             helper.write_scalars(steps, {'eval_accuracy': eval_accuracy})
             should_early_stop = should_early_stop or (
-                config.early_stop and
-                config.early_stop.should_stop(
-                    steps, {'eval_accuracy': eval_accuracy}))
+                config.early_stop
+                and config.early_stop.should_stop(
+                    steps, {'eval_accuracy': eval_accuracy}
+                )
+            )
             helper.flush()
             eval_time = time.time() - eval_start_time
             logging.info(
@@ -1339,9 +1423,9 @@ def run_experiment(
 
         agg_metrics = helper.get_aggregated_metrics()
         should_early_stop = should_early_stop or (
-            config.early_stop and
-            config.early_stop.should_stop(
-                steps, agg_metrics))
+            config.early_stop
+            and config.early_stop.should_stop(steps, agg_metrics)
+        )
         if helper.should_log_metrics(steps):
           log_start_time = time.time()
           metrics_dict = dict(lr=lr)
@@ -1364,6 +1448,7 @@ def run_experiment(
     helper.add_metric('total_time', total_time)
   final_result['train_accuracy'] = float(stats.get('accuracy', 0.0))
   final_result['early_stop'] = should_early_stop
-  if should_early_stop: logging.info('Training is early stopped!')
+  if should_early_stop:
+    logging.info('Training is early stopped!')
   helper.close(final_result)
   return final_result

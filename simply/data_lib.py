@@ -34,7 +34,6 @@ from simply.utils import tokenization
 import t5.data.preprocessors
 import tensorflow as tf
 
-
 ################################################################################
 # Type aliases.
 Batch = MutableMapping[str, Union[np.ndarray, jnp.ndarray]]
