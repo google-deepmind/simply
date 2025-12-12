@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import json
 import os
-from typing import Callable, ClassVar, Mapping, MutableMapping, Optional, Protocol, Union
+from typing import Callable, ClassVar, Mapping, MutableMapping, Protocol, Union
 
 import einops
 from etils import epath
@@ -54,6 +54,7 @@ OPENMIX_V3_100864_V1_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r10
 OPENMIX_V3_100864_V2_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r100-v2-08312024.model')
 GEMMA2_VOCAB = os.path.join(VOCABS_DIR, 'gemma2_tokenizer.model')
 GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
+QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
 
 OPENMIX_V1_VOCABS = [
     ('vb100864_openmix_v1', OPENMIX_V1_100864_VOCAB),
@@ -80,6 +81,10 @@ register_vocabs()
 
 tokenization.TokenizerRegistry.register_value(
     seqio.SentencePieceVocabulary(GEMMA3_VOCAB), name='vb262144_gemma3'
+)
+
+tokenization.TokenizerRegistry.register_value(
+    tokenization.HuggingFaceVocab(QWEN3_VOCAB), name='Qwen3'
 )
 
 PILE_50432_V1_VOCAB = os.path.join(VOCABS_DIR, 'spm-50432-pile-train00-02122024.model')

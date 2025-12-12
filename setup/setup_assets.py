@@ -108,7 +108,7 @@ def reorganize_gemma_models(models_dir: str):
         shutil.move(str(src), str(dest))
 
     # tokenizer.model should stay at parent level for vocab loading
-    print(f"  [OK] Moved checkpoint files to 0/")
+    print("  [OK] Moved checkpoint files to 0/")
 
 
 def setup_gemma_vocabs(models_dir: str, vocabs_dir: str):
@@ -139,6 +139,37 @@ def setup_gemma_vocabs(models_dir: str, vocabs_dir: str):
       print(f"  [OK] Copied tokenizer from {model_dir}")
 
 
+def setup_qwen_vocabs(models_dir: str, vocabs_dir: str):
+  """Copy Qwen tokenizer files to vocabs directory.
+
+  Simply expects tokenizers in ~/.cache/simply/vocabs/
+  """
+  import shutil
+
+  dest_dir = Path(vocabs_dir) / 'Qwen3'
+  dest_dir.mkdir(parents=True, exist_ok=True)
+
+  # Source directory in models
+  # Assuming the model is downloaded as Qwen3-0.6B
+  src_dir = Path(models_dir) / 'Qwen3-0.6B'
+
+  if not src_dir.exists():
+    print(f"  [WARNING] Qwen source directory not found: {src_dir}")
+    return
+
+  files_to_copy = ['tokenizer.json', 'tokenizer_config.json']
+  for filename in files_to_copy:
+    src = src_dir / filename
+    dest = dest_dir / filename
+
+    if src.exists() and not dest.exists():
+      shutil.copy(str(src), str(dest))
+      print(f"  [OK] Copied {filename} to {dest_dir}")
+    elif not src.exists():
+        print(f"  [WARNING] Could not find {filename} in {src_dir}")
+
+
+
 def download_models(models_dir: str, repo: str = MODELS_REPO):
   """Download pretrained models from HuggingFace."""
   print(f"Downloading models from {repo}...")
@@ -162,6 +193,7 @@ def download_models(models_dir: str, repo: str = MODELS_REPO):
     # Setup vocab files
     print("\nSetting up vocab files...")
     setup_gemma_vocabs(models_dir, VOCABS_DIR)
+    setup_qwen_vocabs(models_dir, VOCABS_DIR)
 
     return True
   except Exception as e:
