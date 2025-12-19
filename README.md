@@ -20,6 +20,28 @@ Or if you want to debug by printing arrays like normal python code, you can disa
 export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 
+#### RL training with Gemma 2B on GSM8K
+
+Before running the example, you need to [download the model checkpoints and datasets](#setup-model-checkpoints-and-datasets).
+
+```shell
+EXP=gemma2b_gsm8k_rl; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config gemma2_2b_gsm8k_0shot_rl --experiment_dir /tmp/${EXP} --alsologtostderr
+```
+
+
+#### Small-scale pretraining (2e16 FLOPs)
+```shell
+EXP=pretrain_small; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config flops2e16_tfm15m_c4_l2048 --experiment_dir /tmp/${EXP} --alsologtostderr
+```
+
+#### Mesh shape configuration
+The above examples use default mesh shapes: data parallelism (FSDP) for training, and model (tensor) parallelism for decoding. You can customize with:
+- `--mesh_shape`: Training mesh shape (e.g., `--mesh_shape 1,8,1` for replica, data, model axes)
+- `--decoding_mesh_shape`: Decoding mesh shape
+- `--dcn_mesh_shape`: DCN mesh shape for multi-slice deployments
+
+Note: This is for dense models. Guide for MoE models coming soon.
+
 ## Dependencies
 
 The main dependencies are:
