@@ -81,6 +81,21 @@ python setup/setup_assets.py --datasets-only
 
 This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`. (Currently we only included a few datasets and models for testing, and will add more soon.)
 
+The checkpoints are created with `simply.tools.hf_to_orbax` to convert HuggingFace checkpoints to Orbax. We have already converted some Qwen checkpoints for download through `setup_assets.py`, and you can follow the example below to convert more checkpoints.
+
+```bash
+# Example command for downloading and converting the Qwen3-0.6B checkpoint
+name=Qwen3-0.6B
+format=Qwen2Format
+hf download Qwen/${name} --local-dir ${HF_DIR}${name}
+python -m simply.tools.hf_to_orbax \
+    --input_path=${HF_DIR}${name}/ \
+    --output_path=${HF_DIR}${name}/ORBAX/ \
+    --format=${format}
+# Remove the safetensors to save space.
+rm ${HF_DIR}${name}/*safetensors*
+```
+
 ## Citation
 
 If you find *Simply* helpful, please cite the following BibTeX:
