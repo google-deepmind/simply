@@ -22,8 +22,8 @@ from typing import Any, ClassVar, Self
 
 import jax
 
+from simply import data_lib
 from simply.utils import common
-from simply.utils import data_lib
 from simply.utils import evaluation_lib
 from simply.utils import optimizers as opt_lib
 from simply.utils import position_encoding as pe_lib
