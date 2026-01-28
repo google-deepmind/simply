@@ -13,16 +13,19 @@
 # limitations under the License.
 import dataclasses
 import functools
+import unittest
 
 from absl.testing import absltest
 import einops
 import jax
+from jax.experimental.pallas.ops.tpu.ragged_paged_attention import tuned_block_sizes
 import jax.numpy as jnp
 import numpy as np
 from simply.utils import common
 from simply.utils import ragged_paged_attention as rpa
 from simply.utils import sampling_lib
 from simply.utils import sharding
+
 
 RaggedArray = common.RaggedArray
 
@@ -153,6 +156,8 @@ class DecodeStateTest(absltest.TestCase):
         ]),
     )
 
+  @unittest.skipIf(
+      tuned_block_sizes.get_tpu_version() < 4, 'Requires TPU v4 or higher')
   def test_update_decode_state_and_compute_attn(self):
     total_num_pages = 6
     page_size = 3
@@ -355,6 +360,8 @@ class SamplingStateTest(absltest.TestCase):
         ],
     )
 
+  @unittest.skipIf(
+      tuned_block_sizes.get_tpu_version() < 4, 'Requires TPU v4 or higher')
   def test_continue_decode(self):
     max_seq_len = 8
     batch_size = 2

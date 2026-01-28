@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from unittest import mock
 
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
 import jax.sharding as js
-from unittest import mock
 import numpy as np
 from simply.utils import sharding
 

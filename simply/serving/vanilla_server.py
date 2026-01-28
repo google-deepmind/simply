@@ -14,8 +14,7 @@
 r"""Simply gRPC server that uses vanilla decoding method.
 
 Start server example:
-
-python -m simply.serving.vanilla_server -- \
+  python -m simply.serving.vanilla_server \
     --experiment_config=qwen3_1p7b \
     --lm_format=QwQChat \
     --batch_size=4 \

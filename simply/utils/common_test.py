@@ -150,19 +150,6 @@ class CommonTest(absltest.TestCase):
     self.assertEqual(z.dtype, a.dtype)
     self.assertEqual(z.shape, a.shape)
 
-  def test_prng_key_in_current_mesh(self):
-    prng_key = jax.random.key(seed=12)
-    new_prng_key = common.prng_key_in_current_mesh(prng_key)
-    np.testing.assert_array_equal(
-        jax.random.key_data(new_prng_key), jax.random.key_data(prng_key)
-    )
-    new_prng_key = common.prng_key_in_current_mesh(
-        jax.random.key_data(prng_key)
-    )
-    np.testing.assert_array_equal(
-        jax.random.key_data(new_prng_key), jax.random.key_data(prng_key)
-    )
-
   def test_neg_inf(self):
     self.assertAlmostEqual(common.neg_inf(jnp.float32), -1.7014117e38)
     self.assertAlmostEqual(common.neg_inf(jnp.float16), -3.275e4)

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from absl.testing import absltest
 from unittest import mock
+
+from absl.testing import absltest
 from simply.utils import metric_writer
 import tensorboardX
 

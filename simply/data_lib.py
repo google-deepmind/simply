@@ -73,7 +73,11 @@ OPENMIX_V3_100864_V1_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r10
 OPENMIX_V3_100864_V2_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r100-v2-08312024.model')
 GEMMA2_VOCAB = os.path.join(VOCABS_DIR, 'gemma2_tokenizer.model')
 GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
-QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
+QWEN2P5_VOCAB = os.path.join(VOCABS_DIR, 'Qwen2.5-32B')
+QWQ_VOCAB = os.path.join(VOCABS_DIR, 'QwQ-32B')
+DEEPSEEK_R1_DISTILL_QWEN_VOCAB = os.path.join(VOCABS_DIR, 'DeepSeek-R1-Distill-Qwen-32B')
+QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3-32B')
+
 
 OPENMIX_V1_VOCABS = [
     ('vb100864_openmix_v1', OPENMIX_V1_100864_VOCAB),
@@ -83,15 +87,22 @@ OPENMIX_V2_VOCABS = [
 OPENMIX_V3_VOCABS = [
     ('vb100864_v2_openmix_v3', OPENMIX_V3_100864_V2_VOCAB)]
 GEMMA2_VOCABS = [('vb256128_gemma2', GEMMA2_VOCAB)]
+GEMMA3_VOCABS = [('vb262144_gemma3', GEMMA3_VOCAB)]
 T5_CC_VOCABS = [
     ('vb32000_t5_cc',
      'gs://t5-data/vocabs/cc_all.32000.100extra/sentencepiece.model')]
 
+HF_VOCABS = [
+    ('Qwen2.5', QWEN2P5_VOCAB),
+    ('QwQ', QWEN2P5_VOCAB),
+    ('DeepSeek-R1-Distill-Qwen', DEEPSEEK_R1_DISTILL_QWEN_VOCAB),
+    ('Qwen3', QWEN3_VOCAB),
+]
 
 tokenization.TokenizerRegistry.reset()
 
 
-def register_vocabs():
+def register_spm_vocabs():
   vocabs = (
       OPENMIX_V1_VOCABS + OPENMIX_V2_VOCABS +
       OPENMIX_V3_VOCABS + GEMMA2_VOCABS)
@@ -101,18 +112,17 @@ def register_vocabs():
         lambda vocab_path=vocab_path: tokenization.SimplySentencePieceVocab(
             vocab_path), name=name)
 
-register_vocabs()
+register_spm_vocabs()
 
-tokenization.TokenizerRegistry.register(
-        lambda: tokenization.SimplySentencePieceVocab(GEMMA3_VOCAB),
-        name='vb262144_gemma3'
-)
 
-# Qwen vocabs
-tokenization.TokenizerRegistry.register(
-    lambda: tokenization.HuggingFaceVocab(QWEN3_VOCAB),
-    name='Qwen3',
-)
+def register_hf_vocabs():
+  for name, vocab_path in HF_VOCABS:
+    tokenization.TokenizerRegistry.register(
+        lambda vocab_path=vocab_path: tokenization.HuggingFaceVocab(vocab_path),
+        name=name)
+
+register_hf_vocabs()
+
 
 ################################################################################
 # Registries.

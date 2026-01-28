@@ -16,7 +16,7 @@
 import dataclasses
 import functools
 import tempfile
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from absl.testing import absltest
 from etils import epath

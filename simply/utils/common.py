@@ -102,6 +102,10 @@ def transfer_metadata(base_tree: PyTree, target_tree: PyTree):
         array = target.array
       elif isinstance(target, Array):
         array = target
+      elif target is None:
+        if base is not None:
+          raise ValueError(f'Target is None, but base is not None: {base=}')
+        array = target
       else:
         raise ValueError(f'Unsupported target type: {type(target)}')
       return AnnotatedArray.create(array, **base.metadata)
@@ -237,7 +241,7 @@ def convert_rows_to_columns(
 
 def convert_columns_to_rows(
     columns: Mapping[str, np.typing.ArrayLike],
-) -> list[dict[str, Any]]:
+) -> Sequence[Mapping[str, Any]]:
   """Converts a column view to a sequence of rows."""
   keys = list(columns.keys())
   if not keys:
@@ -537,33 +541,6 @@ def convert_array_with_abstract(
       jnp.asarray(x_np, abstract.dtype), abstract.sharding
   )
   return y
-
-
-def prng_key_in_current_mesh(prng_key: jax.Array):
-  # Check if input is already key data (raw array) or a PRNG key
-  try:
-    # Try to get key_data - if it succeeds, it's a PRNG key
-    key_data = jax.random.key_data(prng_key)
-    is_prng_key = True
-  except (TypeError, AttributeError):
-    # If it fails, it's already key data
-    key_data = prng_key
-    is_prng_key = False
-
-  if is_prng_key:
-    if not prng_key.is_fully_replicated:
-      logging.warning(
-          'Prng key is not fully replicated. This may cause non-determinism.'
-      )
-    if getattr(prng_key.sharding, 'mesh', None) != js.get_mesh():
-      prng_key = jax.random.wrap_key_data(
-          jnp.asarray(np.asarray(key_data))
-      )
-  else:
-    # Wrap raw key data
-    prng_key = jax.random.wrap_key_data(jnp.asarray(np.asarray(key_data)))
-
-  return prng_key
 
 
 def neg_inf(dtype: jax.typing.DTypeLike) -> float:

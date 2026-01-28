@@ -13,7 +13,8 @@
 # limitations under the License.
 r"""Simply gRPC server that uses Ragged Paged Attention.
 
-  JAX_DISABLE_JIT=1 python -m simply.serving.page_server -- \
+Start server example:
+  JAX_DISABLE_JIT=1 python -m simply.serving.page_server \
     --experiment_config=qwen3_1p7b \
     --lm_format=QwQChat \
     --batch_size=4 \
