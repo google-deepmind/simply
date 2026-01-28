@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Self
 import jax
 
 from simply.utils import common
+from simply.utils import data_lib
 from simply.utils import evaluation_lib
 from simply.utils import optimizers as opt_lib
 from simply.utils import position_encoding as pe_lib
@@ -565,7 +566,29 @@ def flops6e20_tfm2b_c4_l2048():
       expand_factor=8,
       seq_len=2048,
       vocab_size=100_864,
-      dataset_name='c4.vb100864_openmix_v1',
+      dataset_config=data_lib.DatasetConfig(
+          source=data_lib.TFDSSourceConfig(
+              name='c4:3.1.0',
+              split='train',
+          ),
+          data_key='text',
+          packing=data_lib.PACKING_CONCAT_SPLIT,
+          add_eos=True,
+          add_bos=True,
+          lm_format_name='Pretrain',
+      ),
+      validation_dataset_config=data_lib.DatasetConfig(
+          source=data_lib.TFDSSourceConfig(
+              name='c4:3.1.0',
+              split='validation',
+          ),
+          data_key='text',
+          packing=data_lib.PACKING_CONCAT_SPLIT,
+          add_eos=True,
+          add_bos=True,
+          lm_format_name='Pretrain',
+      ),
+      vocab_name='vb100864_openmix_v1',
       batch_size=1024,
       clip_grad_norm=1.0,
       num_train_steps=21_297,
@@ -1863,7 +1886,23 @@ def lm_test():
       seq_len=64,
       prefetch_num_workers=0,
       prefetch_per_worker_buffer_size=2,
-      dataset_name='imdb_reviews.vb32000_t5_cc',
+      dataset_config=data_lib.DatasetConfig(
+          source=data_lib.TFDSSourceConfig(
+              name='imdb_reviews',
+              split='train[:1000]',
+          ),
+          data_key='text',
+      ),
+      validation_dataset_config=data_lib.DatasetConfig(
+          source=data_lib.TFDSSourceConfig(
+              name='imdb_reviews',
+              split='test[:100]',
+          ),
+          data_key='text',
+      ),
+      vocab_name='Qwen3',
+      vocab_size=151_669,
+      # Optimizer config
       lr=opt_lib.LinearWarmupCosineDecay(
           value=1e-3,
           warmup_steps=10,
