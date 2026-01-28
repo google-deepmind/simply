@@ -1,14 +1,11 @@
 orbax
 grain
-seqio
 einops
 absl-py
-clu
-t5
 tensorboard
+tensorboardX
+deprecated
+pytest
 # Following packages are only required for running simply/utils/math_eval.py
 sympy
 pylatexenc
-pytest
-tensorboardX
-deprecated
