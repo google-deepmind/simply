@@ -16,7 +16,6 @@
 import asyncio
 import collections
 from collections.abc import Callable, MutableMapping, Sequence
-import contextlib
 import dataclasses
 import functools
 import os
@@ -24,8 +23,10 @@ import time
 from typing import Any, Mapping
 
 from absl import logging
+import deprecated
 from etils import epath
 import jax
+import jax.core
 from jax.experimental import mesh_utils
 from jax.experimental import multihost_utils
 import jax.numpy as jnp
@@ -36,32 +37,30 @@ from simply.utils import pytree
 
 
 PartitionAnnotation = common.PartitionAnnotation
-MESH_CONTEXT_KEY: str = 'mesh_context'
 NOT_ANNOTATED = 'NOT_ANNOTATED'
 # For backward compatibility.
 DEFAULT_AXIS_NAMES = ('replica', 'data', 'model')
 
 
-@contextlib.contextmanager
+@deprecated.deprecated(reason='Use jax.sharding.set_mesh instead.')
 def mesh_context(
-    mesh_shape: Sequence[int], dcn_mesh_shape: Sequence[int] | None = None,
+    mesh_shape: Sequence[int],
+    dcn_mesh_shape: Sequence[int] | None = None,
     axis_names: Sequence[str] | None = None,
 ):
-  set_default_mesh_shape(
-      mesh_shape=mesh_shape, dcn_mesh_shape=dcn_mesh_shape,
-      axis_names=axis_names)
-  try:
-    yield common.THREAD_CONTEXT.mesh_context[-1]
-  finally:
-    common.THREAD_CONTEXT.mesh_context.pop()
+  return set_default_mesh_shape(
+      mesh_shape=mesh_shape,
+      dcn_mesh_shape=dcn_mesh_shape,
+      axis_names=axis_names,
+  )
 
 
+@deprecated.deprecated(reason='Use jax.sharding.set_mesh instead.')
 def set_default_mesh_shape(
-    *,
     mesh_shape: Sequence[int] | Mapping[str, int],
     dcn_mesh_shape: Sequence[int] | Mapping[str, int] | None = None,
     axis_names: Sequence[str] | None = None,
-):
+) -> js.set_mesh:
   """Sets the default mesh shape for the current thread context.
 
   Args:
@@ -72,24 +71,36 @@ def set_default_mesh_shape(
       with 1).
     axis_names: The names of the mesh axes. If None, `DEFAULT_AXIS_NAMES` is
       used.
+
+  Returns:
+    The set mesh.
   """
-  if axis_names is None:
-    axis_names = DEFAULT_AXIS_NAMES
-  context = getattr(common.THREAD_CONTEXT, MESH_CONTEXT_KEY, None)
-  if context is None:
-    context = []
-    setattr(common.THREAD_CONTEXT, MESH_CONTEXT_KEY, context)
-  if isinstance(mesh_shape, Mapping):
-    mesh_shape = [mesh_shape.get(axis_name, 1) for axis_name in axis_names]
-  if isinstance(dcn_mesh_shape, Mapping):
-    dcn_mesh_shape = [
-        dcn_mesh_shape.get(axis_name, 1) for axis_name in axis_names]
-  context.append(create_mesh(mesh_shape, dcn_mesh_shape, axis_names=axis_names))
+  return set_mesh(
+      mesh_shape=mesh_shape,
+      dcn_mesh_shape=dcn_mesh_shape,
+      axis_names=axis_names,
+  )
+
+
+def set_mesh(
+    mesh_shape: Sequence[int] | Mapping[str, int],
+    dcn_mesh_shape: Sequence[int] | Mapping[str, int] | None = None,
+    axis_names: Sequence[str] | None = None,
+) -> js.set_mesh:
+  return js.set_mesh(
+      create_mesh(
+          mesh_shape=mesh_shape,
+          dcn_mesh_shape=dcn_mesh_shape,
+          axis_names=axis_names,
+      )
+  )
 
 
 def create_mesh(
-    mesh_shape=None, dcn_mesh_shape=None, axis_names=None,
-    print_debug_info=False):
+    mesh_shape: Sequence[int] | Mapping[str, int] | None = None,
+    dcn_mesh_shape: Sequence[int] | Mapping[str, int] | None = None,
+    axis_names: Sequence[str] | None = None,
+) -> js.Mesh:
   """Creates mesh for the current device set.
 
   Full replica parallelism is used if mesh_shape is not provided.
@@ -98,63 +109,128 @@ def create_mesh(
     mesh_shape: The mesh shape.
     dcn_mesh_shape: The mesh shape for the dcn devices.
     axis_names: The names of the mesh axes.
-    print_debug_info: Whether to print debug info.
 
   Returns:
     The mesh.
   """
-  num_devices = len(jax.devices())
   if axis_names is None:
     axis_names = DEFAULT_AXIS_NAMES
+
   if mesh_shape is None:
     # By default we just do full replica parallelism and assume the first axis
     # is the replica axis.
-    mesh_shape = [num_devices] + [1] * (len(axis_names) - 1)
+    mesh_shape = [len(jax.devices())] + [1] * (len(axis_names) - 1)
+  if isinstance(mesh_shape, Mapping):
+    mesh_shape = [mesh_shape.get(axis_name, 1) for axis_name in axis_names]
   if len(mesh_shape) == 2:
     mesh_shape = (1, *mesh_shape)
-  if dcn_mesh_shape and dcn_mesh_shape[0] > 1:
-    if print_debug_info:
-      print(f'hybrid, ici mesh_shape: {mesh_shape}')
-      print(f'hybrid, dcn_mesh_shape: {dcn_mesh_shape}')
+  if len(mesh_shape) != len(axis_names):
+    raise ValueError(f'{mesh_shape=} does not match {axis_names=}')
+
+  if isinstance(dcn_mesh_shape, Mapping):
+    dcn_mesh_shape = [
+        dcn_mesh_shape.get(axis_name, 1) for axis_name in axis_names
+    ]
+
+  if dcn_mesh_shape and sum(dcn_mesh_shape) > 1:
+    logging.info(
+        'hybrid, ici_mesh_shape=%s, dcn_mesh_shape=%s',
+        mesh_shape,
+        dcn_mesh_shape,
+    )
+    if len(dcn_mesh_shape) != len(axis_names):
+      raise ValueError(f'{dcn_mesh_shape=} does not match {axis_names=}')
     devices = mesh_utils.create_hybrid_device_mesh(
         mesh_shape, dcn_mesh_shape, allow_split_physical_axes=True
     )
   else:
+    logging.info('non-hybrid, ici_mesh_shape: %s', mesh_shape)
     devices = mesh_utils.create_device_mesh(
         mesh_shape, allow_split_physical_axes=True
     )
   return js.Mesh(devices, axis_names=axis_names)
 
 
-def get_default_mesh(print_debug_info=False):
+@deprecated.deprecated(reason='Use jax.sharding.get_mesh instead.')
+def get_default_mesh():
   """Returns the default mesh for the current device set."""
-  context = getattr(common.THREAD_CONTEXT, MESH_CONTEXT_KEY, None)
-  if context:
-    return context[-1]
-  return create_mesh(print_debug_info=print_debug_info)
+  mesh = js.get_abstract_mesh()
+  if mesh.empty:
+    logging.warning('No mesh is set. Creating a default mesh.')
+    mesh = create_mesh()
+  return mesh
 
 
+@deprecated.deprecated(reason='Use named_sharding instead.')
 def mesh_sharding(
     pspec: common.PartitionAnnotation = None,
     mesh: js.Mesh | None = None,
 ) -> js.Sharding:
   if mesh is None:
-    mesh = get_default_mesh()
+    return named_sharding(pspec)
+  return js.NamedSharding(mesh, partition_spec(pspec))
+
+
+def named_sharding(
+    pspec: common.PartitionAnnotation = None,
+) -> js.NamedSharding:
+  mesh = js.get_abstract_mesh()
+  if mesh.empty:
+    logging.warning(
+        'No mesh is set. Creating a default mesh for pspec=%s', pspec
+    )
+    mesh = create_mesh()
   if pspec is None:
     return js.NamedSharding(mesh, js.PartitionSpec())
-  else:
-    return js.NamedSharding(mesh, js.PartitionSpec(*pspec))
+  return js.NamedSharding(mesh, js.PartitionSpec(*pspec))
 
 
-def get_partition_axis(partition: PartitionAnnotation, axis: int):
+def get_array_sharding(array: jax.Array) -> js.Sharding:
+  """Returns the sharding of the array."""
+  if isinstance(array, jax.core.Tracer):
+    if js.get_abstract_mesh().are_all_axes_explicit:
+      return jax.typeof(array).sharding
+    raise ValueError(
+        f'Array {array} is a tracer but not all mesh axes are explicit.'
+    )
+  return array.sharding
+
+
+def get_partition_axis(
+    partition: PartitionAnnotation, axis: int
+) -> str | Sequence[str] | None:
   if partition is None:
     return None
-  else:
-    return partition[axis]
+  return partition[axis]
+
+
+def get_partition_size(partition: str | Sequence[str] | None) -> int:
+  if partition is None:
+    return 1
+  if isinstance(partition, str):
+    partition = (partition,)
+  axis_sizes = [
+      js.get_abstract_mesh().shape[axis] if axis is not None else 1
+      for axis in partition
+  ]
+  return np.prod(axis_sizes, dtype=int)
+
+
+def partition_spec(
+    partition: PartitionAnnotation | js.PartitionSpec,
+) -> js.PartitionSpec:
+  if isinstance(partition, js.PartitionSpec):
+    return partition
+  if partition is None:
+    return js.PartitionSpec()
+  if isinstance(partition, str):
+    return js.PartitionSpec(partition)
+  return js.PartitionSpec(*partition)
 
 
 def with_sharding_constraint(
-    x: jax.Array, partition: PartitionAnnotation | js.Sharding
+    x: jax.Array,
+    partition: js.Sharding | js.PartitionSpec | PartitionAnnotation,
 ):
   """An extension of jax.lax.with_sharding_constraint.
 
@@ -174,12 +250,19 @@ def with_sharding_constraint(
     return x
   if isinstance(partition, js.Sharding):
     return jax.lax.with_sharding_constraint(x, partition)
-  if partition is not None and len(partition) != x.ndim:
+  partition = partition_spec(partition)
+  if len(partition) > 0 and len(partition) != len(x.shape):  # pylint: disable=g-explicit-length-test
     raise ValueError(
-        f'If exists, partition ({partition}) must have the same length as'
-        f' x.ndim ({x.ndim}).'
+        f'If exists, {partition=} must have the same length as {x.ndim=}.'
     )
-  return jax.lax.with_sharding_constraint(x, mesh_sharding(partition))
+  if js.get_abstract_mesh().are_all_axes_explicit:
+    return js.reshard(x, partition)
+  if js.get_abstract_mesh().empty:
+    logging.warning('No mesh is set. Creating a default mesh for array %s', x)
+    return jax.lax.with_sharding_constraint(
+        x, js.NamedSharding(create_mesh(), partition)
+    )
+  return jax.lax.with_sharding_constraint(x, partition)
 
 
 def reduce_across_hosts(
@@ -192,12 +275,12 @@ def reduce_across_hosts(
   devices: np.ndarray = np.array(jax.devices()).reshape(
       jax.process_count(), jax.local_device_count()
   )
-  global_mesh = jax.sharding.Mesh(devices, ('processes', 'local_devices'))
-  pspec = jax.sharding.PartitionSpec('processes')
+  global_mesh = js.Mesh(devices, ('processes', 'local_devices'))
+  pspec = js.PartitionSpec('processes')
 
   def pre_jit(x):
     inp = np.expand_dims(x, axis=0)
-    return jax.experimental.multihost_utils.host_local_array_to_global_array(
+    return multihost_utils.host_local_array_to_global_array(
         inp, global_mesh, pspec
     )
 
@@ -205,12 +288,11 @@ def reduce_across_hosts(
     return jax.device_get(x.addressable_data(0))
 
   in_tree = jax.tree.map(pre_jit, in_tree)
-  out_tree = jax.jit(
-      lambda x: jax.tree.map(functools.partial(reduce_op, axis=0), x),
-      out_shardings=jax.sharding.NamedSharding(
-          global_mesh, jax.sharding.PartitionSpec()
-      ),
-  )(in_tree)
+  with js.set_mesh(global_mesh):
+    out_tree = jax.jit(
+        lambda x: jax.tree.map(functools.partial(reduce_op, axis=0), x),
+        out_shardings=js.PartitionSpec(),
+    )(in_tree)
   return jax.tree.map(post_jit, out_tree)
 
 

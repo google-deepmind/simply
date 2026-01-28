@@ -27,26 +27,31 @@ if gpus:
     print(e)
 
 import dataclasses
+import json
 import os
 import re
 from typing import Sequence
 
 from absl import flags
 from absl import logging
+from etils import epath
 from simply import config_lib
 from simply import model_lib
 from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
 from simply.utils import experiment_helper
 from simply.utils import pytree
+
 from absl import app
 
 
 _EXPERIMENT_CONFIG = flags.DEFINE_string(
-    'experiment_config', None, 'Name of the experiment config.')
+    'experiment_config', None, 'Name of the experiment config.'
+)
 
 _SHARDING_CONFIG = flags.DEFINE_string(
-    'sharding_config', None, 'Name of the sharding config.')
+    'sharding_config', None, 'Name of the sharding config.'
+)
 
 _EXPERIMENT_CONFIG_PATH = flags.DEFINE_string(
     'experiment_config_path',
@@ -63,7 +68,8 @@ _SHARDING_CONFIG_PATH = flags.DEFINE_string(
 )
 
 _EXPERIMENT_DIR = flags.DEFINE_string(
-    'experiment_dir', '/tmp/simply_lm/', 'Path to save the experiment data.')
+    'experiment_dir', '/tmp/simply_lm/', 'Path to save the experiment data.'
+)
 
 _MESH_SHAPE = flags.DEFINE_list(
     'mesh_shape',
@@ -149,7 +155,7 @@ def load_experiment_config():
   config.
 
   Returns:
-    A tuple containing the loaded experiment config and the experiment 
+    A tuple containing the loaded experiment config and the experiment
     directory.
   """
   if experiment_config_path := _EXPERIMENT_CONFIG_PATH.value:
@@ -157,18 +163,22 @@ def load_experiment_config():
       logging.warning(
           'experiment_config_path is set. Will ignore experiment_config.'
       )
-    config = pytree.load_pytree_from(experiment_config_path)
+    with epath.Path(experiment_config_path).open('r') as f:
+      config_dict = json.load(f)
+    execute_code_patch(config_dict)
+    config = pytree.load(config_dict)
   else:
     config = config_lib.ExperimentConfigRegistry.get_config(
         _EXPERIMENT_CONFIG.value
     )
+    execute_code_patch(config)
   config = override_mesh_and_sharding(config)
-  execute_code_patch(config)
   return config, _EXPERIMENT_DIR.value
 
 
 def main(argv: Sequence[str]) -> None:
   del argv
+
   experiment_helper.setup_work_unit()
   config, experiment_dir = load_experiment_config()
   logging.info('config: %s', config)

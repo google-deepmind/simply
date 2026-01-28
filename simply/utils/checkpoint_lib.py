@@ -27,6 +27,7 @@ from typing import Any, ClassVar, final
 from etils import epath
 import jax
 import jax.numpy as jnp
+import jax.sharding as js
 import orbax.checkpoint as ocp
 from orbax.checkpoint import checkpoint_manager as ocp_constants
 from simply.utils import common
@@ -475,7 +476,12 @@ def construct_restore_item(x: PyTree) -> PyTree:
   """Constructs a restore item from a PyTree."""
   leaves, treedef = jax.tree_util.tree_flatten(x)
 
-  mesh = sharding_lib.get_default_mesh()
+  mesh = js.get_mesh()
+  if mesh.empty:
+    logging.warning(
+        'No mesh is set. Creating a default mesh for checkpoint loading.'
+    )
+    mesh = sharding_lib.create_mesh()
   partitions = sharding_lib.batch_partition_with_minimum_redundancy(
       [leaf.shape for leaf in leaves], mesh.axis_names, mesh.axis_sizes
   )
@@ -490,7 +496,9 @@ def construct_restore_item(x: PyTree) -> PyTree:
         jax.ShapeDtypeStruct(
             shape=leaf.shape,
             dtype=leaf.dtype,
-            sharding=sharding_lib.mesh_sharding(partition),
+            sharding=js.NamedSharding(
+                mesh, sharding_lib.partition_spec(partition)
+            ),
         )
     )
   return jax.tree_util.tree_unflatten(treedef, structs)
@@ -507,7 +515,6 @@ def load_checkpoint_from_path(
   logging.info('Loading checkpoint from %s', ckpt_path)
   handler = resolve_checkpoint_handler_from_path(ckpt_path)
   start_time = time.time()
-  logging.info('Loading checkpoint from %s', ckpt_path)
   with ocp.Checkpointer(handler) as checkpointer:
     item_metadata = checkpointer.metadata(ckpt_path).item_metadata
 
@@ -545,6 +552,13 @@ def load_checkpoint_from_path(
           path: jax.tree_util.KeyPath,
           abstract: jax.ShapeDtypeStruct | jax.Array,
       ):
+        logging.info(
+            'Getting value at path=%r, abstract=%s/%s/%s',
+            path,
+            abstract.shape,
+            abstract.dtype,
+            abstract.sharding,
+        )
         try:
           value = pytree.tree_value(state, path)
           if value.shape != abstract.shape:
@@ -552,9 +566,22 @@ def load_checkpoint_from_path(
                 f'Shape mismatch for {path}: restored is {value.shape} while '
                 f'target is {abstract.shape}'
             )
-          return sharding_lib.with_sharding_constraint(
-              jnp.astype(value, abstract.dtype), abstract.sharding
+          # NOTE: As we randomly assigned initial sharding to value, astype may
+          # not be operatable on it before it is resharded.
+          new_value = jnp.astype(
+              jax.lax.with_sharding_constraint(value, abstract.sharding),
+              abstract.dtype,
           )
+          if not isinstance(value, jax.core.Tracer):
+            if (
+                value.sharding != new_value.sharding
+                or value.dtype != new_value.dtype
+            ):
+              logging.info('Deleting old value at path=%s', path)
+              # This value is definitely not reused by the output, so we delete
+              # the array to save HBM.
+              value.delete()
+          return new_value
         except KeyError as e:
           logging.warning(
               'Value at %s is not loaded from checkpoint: %s', path, e
@@ -589,9 +616,10 @@ def load_checkpoint_from_path(
   state = restored[state_key] if state_key else restored
 
   for unused_argpath in unused_argpaths:
-    # Turn PLACEHOLDER to None to avoid feeding into jitted function.
+    # Turn PLACEHOLDER to None to avoid feeding into transforms function.
     pytree.set_tree_value(state, unused_argpath, None)
-  pytree.trim_none(state)
+  state = pytree.trim_none(state)
+
   state = transform_state_fn(state)
   state = common.transfer_metadata(abstract_state, state)
   return state

@@ -26,8 +26,10 @@ from typing import ClassVar, Mapping, Protocol, Sequence
 
 import einops
 import jax
+import jax.numpy as jnp
 import numpy as np
 from simply.utils import common
+from simply.utils import distributions
 from simply.utils import registry
 
 
@@ -406,3 +408,153 @@ def create_input_processor(config, **kwargs) -> InputProcessorInterface:
   if input_processor_name is None:
     return BasicTextInputProcessor(**kwargs)
   return InputProcessorRegistry.get(input_processor_name)(**kwargs)
+
+
+def top_k_mask(logits: jax.Array, top_k: int) -> jax.Array:
+  inner_size = logits.shape[-1]
+  indices = jnp.argsort(logits, axis=-1, descending=True)
+  mask = jnp.arange(inner_size) < top_k
+  mask = jnp.broadcast_to(mask, indices.shape)
+  _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
+  return mask
+
+
+def top_p_mask(logits: jax.Array, top_p: float) -> jax.Array:
+  probs = jax.nn.softmax(logits, axis=-1)
+  indices = jnp.argsort(logits, axis=-1, descending=True)
+  sorted_probs = jnp.take_along_axis(probs, indices, axis=-1)
+  cumsum = jnp.cumulative_sum(sorted_probs, axis=-1, include_initial=True)
+  mask = cumsum[..., :-1] < top_p
+  _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
+  return mask
+
+
+def sample_from_logits(
+    prng_key: jax.Array,
+    logits: jax.Array,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+  """Samples from the last step of the logits.
+
+  Args:
+    prng_key: A PRNGKey used as the random key.
+    logits: The logits from the model.
+    temperature: The temperature for sampling.
+    top_k: The maximum number of top tokens to sample from. If top_k == -1,
+      results are sampled from the whole vocabulary.
+    top_p: The cumulate probabilty of top tokens to sample from.
+
+  Returns:
+    The sampled tokens and the corresponding logprobs.
+  """
+  logits = jnp.astype(logits, jnp.float32)
+
+  def greedy_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+    tokens = jnp.argmax(logits, axis=-1)
+    logprobs = jnp.zeros(logits.shape[:-1], dtype=logits.dtype)
+    return tokens, logprobs
+
+  def simple_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+    logits = logits / temperature
+    m = distributions.Categorical(logits)
+    tokens = m.sample(prng_key)
+    logprobs = m.log_prob(tokens)
+    return tokens, logprobs
+
+  def masked_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+    logits = logits / temperature
+
+    mask = jax.lax.cond(
+        jnp.logical_and(top_k > 0, top_p < 1),
+        lambda: (
+            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
+        ),
+        lambda: jax.lax.cond(
+            top_k > 0,
+            lambda: top_k_mask(logits, top_k=top_k),
+            lambda: top_p_mask(logits, top_p=top_p),
+        ),
+    )
+    m = distributions.MaskedCategorical(
+        logits, mask=mask, neg_inf=common.neg_inf(logits.dtype)
+    )
+    tokens = m.sample(prng_key)
+    logprobs = m.log_prob(tokens)
+    return tokens, logprobs
+
+  def sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return jax.lax.cond(
+        jnp.logical_or(top_k > 0, top_p < 1),
+        masked_sample_fn,
+        simple_sample_fn,
+        logits,
+    )
+  return jax.lax.cond(
+      jnp.logical_or(temperature == 0, top_k == 1), greedy_fn, sample_fn, logits
+  )
+
+
+def compute_log_likelihood(
+    logits: jax.Array,
+    tokens: jax.Array,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
+) -> jax.Array:
+  """Computes the log likelyhood in float32."""
+  logits = jnp.astype(logits, jnp.float32)
+
+  def greedy_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    shape = tokens.shape
+    dtype = logits.dtype
+    target_tokens = jnp.argmax(logits, axis=-1)
+    return jnp.where(
+        tokens == target_tokens,
+        jnp.zeros(shape, dtype=dtype),
+        jnp.full(shape, common.neg_inf(dtype), dtype=dtype),
+    )
+
+  def simple_sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    # The shape of logits is (batch_size, seq_len, vocab_size).
+    m = distributions.Categorical(logits / temperature)
+    return m.log_prob(tokens)
+
+  def masked_sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    # The shape of logits is (batch_size, seq_len, vocab_size).
+    logits = logits / temperature
+
+    mask = jax.lax.cond(
+        jnp.logical_and(top_k > 0, top_p < 1),
+        lambda: (
+            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
+        ),
+        lambda: jax.lax.cond(
+            top_k > 0,
+            lambda: top_k_mask(logits, top_k=top_k),
+            lambda: top_p_mask(logits, top_p=top_p),
+        ),
+    )
+
+    m = distributions.MaskedCategorical(
+        logits, mask=mask, neg_inf=common.neg_inf(logits.dtype)
+    )
+    return m.log_prob(tokens)
+
+  def sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    return jax.lax.cond(
+        jnp.logical_or(top_k > 0, top_p < 1),
+        masked_sample_score_fn,
+        simple_sample_score_fn,
+        logits,
+        tokens,
+    )
+
+  return jax.lax.cond(
+      jnp.logical_or(temperature == 0, top_k == 1),
+      greedy_score_fn,
+      sample_score_fn,
+      logits,
+      tokens,
+  )

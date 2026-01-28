@@ -115,13 +115,17 @@ class Adam(Optimizer):
     state = {}
     state['params'] = params
     state['m'] = jax.tree_util.tree_map(
-        lambda x: jax.lax.with_sharding_constraint(
-            jnp.zeros_like(x), x.sharding),
-        params)
+        lambda x: sharding.with_sharding_constraint(
+            jnp.zeros_like(x), sharding.get_array_sharding(x)
+        ),
+        params,
+    )
     state['v'] = jax.tree_util.tree_map(
-        lambda x: jax.lax.with_sharding_constraint(
-            jnp.zeros_like(x), x.sharding),
-        params)
+        lambda x: sharding.with_sharding_constraint(
+            jnp.zeros_like(x), sharding.get_array_sharding(x)
+        ),
+        params,
+    )
     state['steps'] = get_init_steps()
     return state
 
@@ -151,9 +155,12 @@ class Lion(Optimizer):
     state = {}
     state['params'] = params
     state['m'] = jax.tree_util.tree_map(
-        lambda x: jax.lax.with_sharding_constraint(
-            jnp.zeros_like(x, dtype=self.momentum_dtype), x.sharding),
-        params)
+        lambda x: sharding.with_sharding_constraint(
+            jnp.zeros_like(x, dtype=self.momentum_dtype),
+            sharding.get_array_sharding(x),
+        ),
+        params,
+    )
     state['steps'] = get_init_steps()
     return state
 
@@ -204,13 +211,15 @@ class Muon(Optimizer):
       if p.ndim < 2 or max(p.shape) > self.dim_threshold:
         return None
       else:
-        sharded_zeros = jax.lax.with_sharding_constraint(
-            jnp.zeros_like(p), p.sharding)
+        sharded_zeros = sharding.with_sharding_constraint(
+            jnp.zeros_like(p), sharding.get_array_sharding(p)
+        )
         return sharded_zeros
     def init_adam(p):
       if p.ndim < 2 or max(p.shape) > self.dim_threshold:
-        sharded_zeros = jax.lax.with_sharding_constraint(
-            jnp.zeros_like(p), p.sharding)
+        sharded_zeros = sharding.with_sharding_constraint(
+            jnp.zeros_like(p), sharding.get_array_sharding(p)
+        )
         return sharded_zeros
       else:
         return None

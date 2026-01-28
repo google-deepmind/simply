@@ -21,6 +21,7 @@ import functools
 import time
 from typing import Any, cast, ClassVar, Self, Tuple
 import warnings
+
 from absl import logging
 import einops
 import jax
@@ -35,12 +36,13 @@ import numpy as np
 from simply import data_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
-from simply.utils import distributions
 from simply.utils import experiment_helper as exp_helper
 from simply.utils import initializer
 from simply.utils import module
 from simply.utils import optimizers as opt_lib
+from simply.utils import position_encoding as pe_lib
 from simply.utils import pytree
+from simply.utils import ragged_paged_attention as rpa
 from simply.utils import registry
 from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
@@ -79,21 +81,7 @@ AnnotatedArray = common.AnnotatedArray
 # Use the `get_raw_arrays` function below to turn all the AnnotatedArray
 # back to raw arrays in a PyTree like `get_raw_arrays(x)`.
 get_raw_arrays = common.get_raw_arrays
-
-
-################################################################################
-# Initialization.
-
-
-def xavier_init(prng_key, shape, dtype, in_dim, out_dim):
-  logging.warning(
-      'DEPRECATED: xavier_init is deprecated. Use XavierUniformInit instead.'
-  )
-  scale = jnp.sqrt(6 / (in_dim + out_dim))
-  return jax.random.uniform(
-      prng_key, shape, dtype=dtype, minval=-1.0, maxval=1.0) * jnp.array(
-          scale, dtype=dtype)
-
+neg_inf = common.neg_inf
 
 ################################################################################
 # Architecture.
@@ -212,17 +200,6 @@ class PerDimScale(module.SimplyModule):
     scaling_factor *= jax.nn.softplus(params['scale'])
     x *= scaling_factor
     return x
-
-
-def neg_inf(dtype: DTypeLike) -> float:
-  if np.issubdtype(dtype, np.inexact):
-    dtype_max = np.finfo(dtype).max
-  elif np.issubdtype(dtype, np.integer):
-    dtype_max = np.iinfo(dtype).max
-  else:
-    raise ValueError(f'Unsupported dtype: {dtype}')
-  # NOTE: Gemma uses -0.7 * dtype_max
-  return -0.5 * dtype_max
 
 
 def rotary_positional_embedding(
@@ -488,6 +465,7 @@ def chunked_local_attn(
   return output
 
 
+@jax.named_call
 def attn(q, k, v, mask, *, attn_soft_cap=50.0, dtype='bfloat16'):
   group_axis = 'g' if len(q.shape) > len(k.shape) else ''
   # ...tgnh, ...snh -> ...gnts
@@ -593,6 +571,33 @@ class FeedForward(module.SimplyModule):
       x = jnp.asarray(activation_fn(projected_x), self.activation_dtype)
     x = self.ffn_1.apply(params['ffn_1'], x)
     return x, extra_output
+
+
+def permute(x, permute_indices, use_custom_vjp=True):
+  assert x.shape[0] == permute_indices.shape[0]
+  with jax.named_scope('custom_permute'):
+    if use_custom_vjp:
+      return _custom_permute(x, permute_indices)
+    else:
+      return x[permute_indices]
+
+
+@jax.custom_vjp
+def _custom_permute(x, permute_indices):
+  return x[permute_indices]
+
+
+def _custom_permute_fwd(x, permute_indices):
+  return _custom_permute(x, permute_indices), permute_indices
+
+
+def _custom_permute_bwd(res, g):
+  permute_indices = res
+  unpermute_indices = jnp.argsort(permute_indices)
+  return g[unpermute_indices], None
+
+
+_custom_permute.defvjp(_custom_permute_fwd, _custom_permute_bwd)
 
 
 @module.ModuleRegistry.register
@@ -799,7 +804,7 @@ class MoEFeedForward(FeedForward):
       return output
 
     if self.sharding_config.activation_partition is None:
-      selected_indices_partition = None
+      selected_indices_partition = js.PartitionSpec()
     else:
       selected_indices_partition = js.PartitionSpec(
           self.sharding_config.activation_partition[0],
@@ -810,11 +815,7 @@ class MoEFeedForward(FeedForward):
     # ffn0_w: [num_experts, model_dim, expand_dim]
     ffn0_w = params['ffn_0']['w']
     ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)
-    ffn0_partition = (
-        js.PartitionSpec(*self.ffn0_partition)
-        if self.ffn0_partition is not None
-        else js.PartitionSpec()
-    )
+    ffn0_partition = sharding_lib.partition_spec(self.ffn0_partition)
 
     if self.use_gated_activation_in_ffn:
       # ffn0_gate_w: [num_experts, model_dim, expand_dim]
@@ -843,20 +844,19 @@ class MoEFeedForward(FeedForward):
           *self.sharding_config.activation_partition)
 
     @jax.shard_map(
-        mesh=sharding_lib.get_default_mesh(),
+        mesh=js.get_abstract_mesh(),
         in_specs=(
             activation_partition,
             ffn0_partition,
             ffn0_gate_partition,
             ffn1_partition,
             selected_indices_partition,
-            selected_weights_partition
+            selected_weights_partition,
         ),
-        out_specs=(
-            activation_partition,
-            js.PartitionSpec()),
+        out_specs=(activation_partition, js.PartitionSpec()),
         # Needed when using megablox.
-        check_vma=False)
+        check_vma=False,
+    )
     def moe_ffn(
         inputs, ffn0_w, ffn0_gate_w, ffn1_w,
         selected_indices, selected_weights):
@@ -892,7 +892,7 @@ class MoEFeedForward(FeedForward):
       flat_selected_indices = jnp.ravel(selected_indices)
       sort_indices = jnp.argsort(flat_selected_indices)
       unsort_indices = jnp.argsort(sort_indices)
-      sorted_inputs = flat_repeated_inputs[sort_indices]
+      sorted_inputs = permute(flat_repeated_inputs, sort_indices)
       sorted_expert_indices = flat_selected_indices[sort_indices]
       # group_sizes: [num_experts]
       group_sizes = jnp.bincount(sorted_expert_indices, length=self.num_experts)
@@ -983,7 +983,7 @@ class MoEFeedForward(FeedForward):
             local_expert_indices, flat_local_expert_group_sizes,
             total_repeat_length=sorted_inputs.shape[0])
         local_expert_sort_indices = jnp.argsort(local_expert_indices)
-        sorted_inputs = sorted_inputs[local_expert_sort_indices]
+        sorted_inputs = permute(sorted_inputs, local_expert_sort_indices)
         local_group_sizes = jnp.sum(local_expert_group_sizes, axis=0)
 
       # Apply FFN on local expert shards if using expert parallelism.
@@ -1024,7 +1024,8 @@ class MoEFeedForward(FeedForward):
       # Dispatch tokens from expert shards to original shards
       # if using expert parallelism.
       if num_ep > 1:
-        sorted_outputs = sorted_outputs[jnp.argsort(local_expert_sort_indices)]
+        sorted_outputs = permute(
+            sorted_outputs, jnp.argsort(local_expert_sort_indices))
         global_input_offsets, global_output_offsets = (
             get_global_input_output_offsets(global_send_sizes.T)
         )
@@ -1047,19 +1048,7 @@ class MoEFeedForward(FeedForward):
         )
 
       # outputs: [(batch_size * seq_len * num_experts_per_token), model_dim]
-      outputs = sorted_outputs[unsort_indices]
-      # Assume megatron-style tensor parallelism on FFN.
-      if outputs_model_dim_axis := get_partition_axis(
-          self.sharding_config.activation_partition, -1
-      ):
-        outputs = jax.lax.psum_scatter(
-            outputs,
-            axis_name=outputs_model_dim_axis,
-            scatter_dimension=1,
-            tiled=True,
-        )
-      elif num_tp > 1:
-        outputs = jax.lax.psum(outputs, axis_name=tp_axis)
+      outputs = permute(sorted_outputs, unsort_indices)
 
       # outputs: [batch_size, seq_len, model_dim, num_experts_per_token]
       outputs = einops.rearrange(
@@ -1070,6 +1059,20 @@ class MoEFeedForward(FeedForward):
           r=self.num_experts_per_token,
       )
       outputs = jnp.einsum('bsk,bstk->bst', selected_weights, outputs)
+
+      # Assume megatron-style tensor parallelism on FFN.
+      if outputs_model_dim_axis := get_partition_axis(
+          self.sharding_config.activation_partition, -1
+      ):
+        outputs = jax.lax.psum_scatter(
+            outputs,
+            axis_name=outputs_model_dim_axis,
+            scatter_dimension=2,
+            tiled=True,
+        )
+      elif num_tp > 1:
+        outputs = jax.lax.psum(outputs, axis_name=tp_axis)
+
       return outputs, load
 
     outputs, load = moe_ffn(
@@ -1204,9 +1207,44 @@ class Attention(module.SimplyModule):
   qkv_use_bias: bool = False
   o_use_bias: bool = False
   attn_soft_cap: float = 50.0
-  rope_max_timescale: int = 10_000
-  rope_scale_factor: float = 1.0
   query_scale: float = -1.0
+  # Ragged paged attention
+  total_num_pages: int = 0
+  page_size: int = 0
+  # Position encoding (None = NoPE, no positional encoding).
+  position_encoding: pe_lib.PositionEncodingConfig | None = None
+
+  @property
+  def rope_max_timescale(self) -> int:
+    """Backward compatibility. Use position_encoding instead."""
+    warnings.warn(
+        'rope_max_timescale is deprecated. Use position_encoding instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if self.position_encoding is None:
+      return -1  # NoPE - no positional encoding
+    if isinstance(self.position_encoding, pe_lib.RoPE):
+      return self.position_encoding.max_timescale
+    raise TypeError(
+        f'rope_max_timescale not supported for {type(self.position_encoding)}'
+    )
+
+  @property
+  def rope_scale_factor(self) -> float:
+    """Backward compatibility. Use position_encoding instead."""
+    warnings.warn(
+        'rope_scale_factor is deprecated. Use position_encoding instead.',
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if self.position_encoding is None:
+      return -1.0  # NoPE - no positional encoding
+    if isinstance(self.position_encoding, pe_lib.RoPE):
+      return self.position_encoding.scale_factor
+    raise TypeError(
+        f'rope_scale_factor not supported for {type(self.position_encoding)}'
+    )
 
   def setup(self) -> None:
     if self.use_per_dim_scale:
@@ -1284,6 +1322,7 @@ class Attention(module.SimplyModule):
       *,
       segment_ids: Array,
       segment_positions: Array,
+      extra_inputs: PyTree = None,
       decode_state: PyTree = None,
   ) -> tuple[Array, PyTree]:
     params = get_raw_arrays(params)
@@ -1301,18 +1340,9 @@ class Attention(module.SimplyModule):
       q = self.qk_norm.apply(params['q_norm'], q)
       k = self.qk_norm.apply(params['k_norm'], k)
 
-    q = rotary_positional_embedding(
-        q,
-        segment_positions=segment_positions,
-        max_timescale=self.rope_max_timescale,
-        scale_factor=self.rope_scale_factor,
-    )
-    k = rotary_positional_embedding(
-        k,
-        segment_positions=segment_positions,
-        max_timescale=self.rope_max_timescale,
-        scale_factor=self.rope_scale_factor,
-    )
+    if self.position_encoding is not None:
+      q = self.position_encoding.apply(q, segment_positions=segment_positions)
+      k = self.position_encoding.apply(k, segment_positions=segment_positions)
 
     if self.use_per_dim_scale:
       q = self.per_dim_scale.apply(params['per_dim_scale'], q)
@@ -1326,6 +1356,7 @@ class Attention(module.SimplyModule):
     # k in [batch_size, seq_len, n_kv_heads, per_head_dim]
     # v in [batch_size, seq_len, n_kv_heads, per_head_dim]
 
+    # TODO: Refactor this so that we don't need to rearrange it.
     # Note: g/n_kv_heads order change is for compatibility with Gemma models.
     q = einops.rearrange(
         q,
@@ -1340,163 +1371,206 @@ class Attention(module.SimplyModule):
           *self.attn_activation_partition[2:],
       )
 
-    k, v, kv_segment_positions, kv_segment_ids, decode_state = (
-        updated_decode_state(
-            k=k,
-            v=v,
+    extra_output = {}
+
+    if isinstance(decode_state, rpa.DecodeState):
+      q = einops.rearrange(q, '1 l g n_kv_heads ... -> l (n_kv_heads g) ...')
+      k = einops.rearrange(k, '1 l ... -> l ...')
+      v = einops.rearrange(v, '1 l ... -> l ...')
+      decode_state, output = decode_state.update_decode_state_and_compute_attn(
+          q=common.RaggedArray(q, extra_inputs['lens']),
+          k=k,
+          v=v,
+          page_manage_cache=extra_inputs.get('page_manage_cache'),
+      )
+      output = einops.rearrange(output, 'l ... -> 1 l ...')
+    else:
+      if (
+          extra_inputs
+          and (prefill_position := extra_inputs.get('prefill_position'))
+          is not None
+      ):
+        decode_state = decode_state or {}
+        decode_state['prefill_position'] = prefill_position
+      k, v, kv_segment_positions, kv_segment_ids, decode_state = (
+          updated_decode_state(
+              k=k,
+              v=v,
+              segment_positions=segment_positions,
+              segment_ids=segment_ids,
+              decode_state=decode_state,
+              window_size=self.window_size,
+          )
+      )
+
+      q_seq_len = q.shape[1]
+      kv_seq_len = k.shape[1]
+
+      # At decoding time (q.shape[1] == 1), we don't use flash attention.
+      if self.use_flash_attention and q_seq_len > 1:
+        batch_size_axis, seq_len_axis, num_heads_axis, per_head_size_axis = (
+            self.attn_activation_partition
+        )
+        bnlh = js.PartitionSpec(
+            batch_size_axis, num_heads_axis, seq_len_axis, per_head_size_axis
+        )
+        bl = js.PartitionSpec(batch_size_axis, seq_len_axis)
+
+        q = einops.rearrange(
+            q,
+            'b l g n_kv_heads h -> b (n_kv_heads g) l h ',
+            n_kv_heads=self.n_kv_heads,
+        )
+        k = einops.repeat(
+            k,
+            'b l n_kv_heads h -> b (n_kv_heads g) l h',
+            g=self.n_heads // self.n_kv_heads,
+        )
+        v = einops.repeat(
+            v,
+            'b l n_kv_heads h -> b (n_kv_heads g) l h',
+            g=self.n_heads // self.n_kv_heads,
+        )
+
+        # NOTE: These are static masks, and their behavior are global which can
+        # result in some limitations. For example, we cannot mask first/last k
+        # tokens for each sequence under packed mode.
+        mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
+        if self.window_size > 0 and self.window_size + 1 < kv_seq_len:
+          mask &= splash_attention.LocalMask(
+              (q_seq_len, kv_seq_len),
+              (self.window_size, None),
+              offset=0,
+          )
+        mask = splash_attention.MultiHeadMask([mask] * self.n_heads)
+
+        block_sizes = splash_attention.BlockSizes(
+            block_q=self.flash_attention_block_size,
+            block_kv=self.flash_attention_block_size,
+            block_kv_compute=self.flash_attention_block_size,
+            block_q_dkv=self.flash_attention_block_size,
+            block_kv_dkv=self.flash_attention_block_size,
+            block_kv_dkv_compute=self.flash_attention_block_size,
+            block_q_dq=self.flash_attention_block_size,
+            block_kv_dq=self.flash_attention_block_size,
+        )
+
+        mesh = js.get_abstract_mesh()
+        attn_soft_cap = self.attn_soft_cap
+        if attn_soft_cap is not None and attn_soft_cap < 0:
+          attn_soft_cap = None
+        splash_attn_kernel = splash_attention.make_splash_mha(
+            mask=mask,
+            block_sizes=block_sizes,
+            mask_value=neg_inf(np.float32),
+            attn_logits_soft_cap=attn_soft_cap,
+            head_shards=mesh.shape[num_heads_axis],
+            q_seq_shards=1,
+        )
+        kernel_sharding = splash_attn_kernel.manual_sharding_spec(
+            sharding_lib.named_sharding((num_heads_axis, seq_len_axis))
+        )
+
+        @functools.partial(
+            shard_map.shard_map,
+            mesh=mesh,
+            in_specs=(kernel_sharding, bnlh, bnlh, bnlh, bl, bl),
+            out_specs=bnlh,
+            check_rep=False,
+        )
+        def flash_attention_fn(
+            kernel, query, key, value, q_segment_ids, kv_segment_ids
+        ):
+          attn_out = jax.vmap(kernel)(
+              q=query,
+              k=key,
+              v=value,
+              segment_ids=splash_attention.SegmentIds(
+                  q=q_segment_ids, kv=kv_segment_ids
+              ),
+          )
+          return attn_out
+
+        output = flash_attention_fn(
+            splash_attn_kernel, q, k, v, segment_ids, kv_segment_ids
+        )
+        output = jnp.swapaxes(output, 1, 2)  # Swap back.
+      else:
+        mask = create_mask(
             segment_positions=segment_positions,
+            kv_segment_positions=kv_segment_positions,
             segment_ids=segment_ids,
-            decode_state=decode_state,
+            kv_segment_ids=kv_segment_ids,
             window_size=self.window_size,
         )
-    )
+        # Add the group and head dimension.
+        mask = einops.rearrange(mask, 'b l1 l2 -> b 1 1 l1 l2')
 
-    extra_output = dict(decode_state=decode_state)
+        # q: [batch_size, seq_len, n_groups, self.n_kv_heads, self.per_head_dim]
+        # k, v: [batch_size, seq_len, self.n_kv_heads, self.per_head_dim]
+        if (
+            self.use_window_chunk
+            and self.window_size > 0
+            and self.window_size + 1 < kv_seq_len
+            and q_seq_len > 1
+        ):
+          # We don't do this trick at decoding time (q.shape[1] == 1), as we
+          # have better way there.
+          output = chunked_local_attn(
+              q,
+              k,
+              v,
+              mask,
+              self.window_size,
+              attn_soft_cap=self.attn_soft_cap,
+              dtype=self.activation_dtype,
+          )
+        else:
+          output, attn_mat = attn(
+              q,
+              k,
+              v,
+              mask,
+              attn_soft_cap=self.attn_soft_cap,
+              dtype=self.activation_dtype,
+          )
+          if self.add_extra_output:
+            extra_output['attn_mat'] = attn_mat
 
-    q_seq_len = q.shape[1]
-    kv_seq_len = k.shape[1]
-
-    # At decoding time (q.shape[1] == 1), we don't use flash attention.
-    if self.use_flash_attention and q_seq_len > 1:
-      batch_size_axis, seq_len_axis, num_heads_axis, per_head_size_axis = (
-          self.attn_activation_partition
-      )
-      bnlh = js.PartitionSpec(
-          batch_size_axis, num_heads_axis, seq_len_axis, per_head_size_axis
-      )
-      bl = js.PartitionSpec(batch_size_axis, seq_len_axis)
-
-      q = einops.rearrange(
-          q,
-          'b l g n_kv_heads h -> b (n_kv_heads g) l h ',
-          n_kv_heads=self.n_kv_heads,
-      )
-      k = einops.repeat(
-          k,
-          'b l n_kv_heads h -> b (n_kv_heads g) l h',
-          g=self.n_heads // self.n_kv_heads,
-      )
-      v = einops.repeat(
-          v,
-          'b l n_kv_heads h -> b (n_kv_heads g) l h',
-          g=self.n_heads // self.n_kv_heads,
-      )
-
-      # NOTE: These are static masks, and their behavior are global which can
-      # result in some limitations. For example, we cannot mask first/last k
-      # tokens for each sequence under packed mode.
-      mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
-      if self.window_size > 0 and self.window_size + 1 < kv_seq_len:
-        mask &= splash_attention.LocalMask(
-            (q_seq_len, kv_seq_len),
-            (self.window_size, None),
-            offset=0,
+        output = sharding_lib.with_sharding_constraint(output, group_sharding)
+        output = einops.rearrange(
+            output, '... n_groups n_kv_heads i -> ... (n_kv_heads n_groups) i'
         )
-      mask = splash_attention.MultiHeadMask([mask] * self.n_heads)
-
-      block_sizes = splash_attention.BlockSizes(
-          block_q=self.flash_attention_block_size,
-          block_kv=self.flash_attention_block_size,
-          block_kv_compute=self.flash_attention_block_size,
-          block_q_dkv=self.flash_attention_block_size,
-          block_kv_dkv=self.flash_attention_block_size,
-          block_kv_dkv_compute=self.flash_attention_block_size,
-          block_q_dq=self.flash_attention_block_size,
-          block_kv_dq=self.flash_attention_block_size,
+      output = sharding_lib.with_sharding_constraint(
+          output, self.attn_activation_partition
       )
-
-      mesh = sharding_lib.get_default_mesh()
-      attn_soft_cap = self.attn_soft_cap
-      if attn_soft_cap is not None and attn_soft_cap < 0:
-        attn_soft_cap = None
-      splash_attn_kernel = splash_attention.make_splash_mha(
-          mask=mask,
-          block_sizes=block_sizes,
-          mask_value=neg_inf(np.float32),
-          attn_logits_soft_cap=attn_soft_cap,
-          head_shards=mesh.shape[num_heads_axis],
-          q_seq_shards=1,
-      )
-      kernel_sharding = splash_attn_kernel.manual_sharding_spec(
-          mesh_sharding((num_heads_axis, seq_len_axis))
-      )
-
-      @functools.partial(
-          shard_map.shard_map,
-          mesh=sharding_lib.get_default_mesh(),
-          in_specs=(kernel_sharding, bnlh, bnlh, bnlh, bl, bl),
-          out_specs=bnlh,
-          check_rep=False,
-      )
-      def flash_attention_fn(
-          kernel, query, key, value, q_segment_ids, kv_segment_ids
-      ):
-        attn_out = jax.vmap(kernel)(
-            q=query,
-            k=key,
-            v=value,
-            segment_ids=splash_attention.SegmentIds(
-                q=q_segment_ids, kv=kv_segment_ids
-            ),
-        )
-        return attn_out
-
-      output = flash_attention_fn(
-          splash_attn_kernel, q, k, v, segment_ids, kv_segment_ids
-      )
-      output = jnp.swapaxes(output, 1, 2)  # Swap back.
-    else:
-      mask = create_mask(
-          segment_positions=segment_positions,
-          kv_segment_positions=kv_segment_positions,
-          segment_ids=segment_ids,
-          kv_segment_ids=kv_segment_ids,
-          window_size=self.window_size,
-      )
-      # Add the group and head dimension.
-      mask = einops.rearrange(mask, 'b l1 l2 -> b 1 1 l1 l2')
-
-      # q: [batch_size, seq_len, n_groups, self.n_kv_heads, self.per_head_dim]
-      # k, v: [batch_size, seq_len, self.n_kv_heads, self.per_head_dim]
-      if (
-          self.use_window_chunk
-          and self.window_size > 0
-          and self.window_size + 1 < kv_seq_len
-          and q_seq_len > 1
-      ):
-        # We don't do this trick at decoding time (q.shape[1] == 1), as we have
-        # better way there.
-        output = chunked_local_attn(
-            q,
-            k,
-            v,
-            mask,
-            self.window_size,
-            attn_soft_cap=self.attn_soft_cap,
-            dtype=self.activation_dtype,
-        )
-      else:
-        output, attn_mat = attn(
-            q,
-            k,
-            v,
-            mask,
-            attn_soft_cap=self.attn_soft_cap,
-            dtype=self.activation_dtype,
-        )
-        if self.add_extra_output:
-          extra_output['attn_mat'] = attn_mat
-
-      output = sharding_lib.with_sharding_constraint(output, group_sharding)
-      output = einops.rearrange(
-          output, '... n_groups n_kv_heads i -> ... (n_kv_heads n_groups) i'
-      )
-
-    output = sharding_lib.with_sharding_constraint(
-        output, self.attn_activation_partition
-    )
+    extra_output['decode_state'] = decode_state
     output = self.o_proj.apply(params['o_proj'], output)
     return output, extra_output
+
+  def init_decode_state(self, batch_size: int, max_seq_len: int) -> PyTree:
+    # TODO: We currently only support using this function for Ragged
+    # Paged Attention. We also want to support for classic attention.
+    if self.total_num_pages <= 0 or self.page_size <= 0:
+      raise ValueError(
+          f'{self.total_num_pages=} and {self.page_size=} must be positive'
+          ' integers.'
+      )
+    head_partition = sharding_lib.get_partition_axis(self.qkv_partition, 1)
+    return rpa.DecodeStateConfig(
+        total_num_pages=self.total_num_pages,
+        page_size=self.page_size,
+        n_kv_heads=self.n_kv_heads,
+        per_head_dim=self.per_head_dim,
+        batch_size=batch_size,
+        dtype=self.activation_dtype,
+        max_seq_len=max_seq_len,
+        window_size=self.window_size if self.window_size > 0 else None,
+        head_partition=head_partition,
+        # TODO: Auto tune these parameters.
+        num_kv_pages_per_block=4,
+        num_queries_per_block=32,
+    ).init()
 
 
 @module.ModuleRegistry.register
@@ -1539,8 +1613,8 @@ class TransformerBlock(module.SimplyModule):
   norm_scale_plus_one: bool = True
   attn_soft_cap: float = 50.0  # If negative, no softcap.
   rms_norm_epsilon: float = 1e-6
-  rope_max_timescale: int = 10_000
-  rope_scale_factor: float = 1.0
+  # Position encoding config (None = NoPE, no positional encoding).
+  position_encoding: pe_lib.PositionEncodingConfig | None = None
   query_scale: float = -1.0
   # tile sizes for gmm.
   tile_batch_seq: int = 128
@@ -1548,6 +1622,9 @@ class TransformerBlock(module.SimplyModule):
   tile_expand_dim: int = 128
   # Implementation of gmm.
   gmm_impl: str = 'ragged_dot'
+  # For ragged paged attention.
+  total_num_pages: int = 0
+  page_size: int = 0
 
   @property
   def expand_dim(self) -> int:
@@ -1634,9 +1711,10 @@ class TransformerBlock(module.SimplyModule):
         qkv_use_bias=self.qkv_use_bias,
         o_use_bias=self.o_use_bias,
         attn_soft_cap=self.attn_soft_cap,
-        rope_max_timescale=self.rope_max_timescale,
-        rope_scale_factor=self.rope_scale_factor,
+        position_encoding=self.position_encoding,
         query_scale=self.query_scale,
+        total_num_pages=self.total_num_pages,
+        page_size=self.page_size,
     )
     if self.use_moe:
       self.ffn = MoEFeedForward(
@@ -1702,6 +1780,7 @@ class TransformerBlock(module.SimplyModule):
       *,
       segment_ids: Array,
       segment_positions: Array,
+      extra_inputs: PyTree | None = None,
       decode_state: PyTree = None,
   ) -> tuple[Array, PyTree]:
     extra_output = {}
@@ -1713,6 +1792,7 @@ class TransformerBlock(module.SimplyModule):
         x,
         segment_ids=segment_ids,
         segment_positions=segment_positions,
+        extra_inputs=extra_inputs,
         decode_state=decode_state,
     )
     if self.use_post_ln:
@@ -1739,11 +1819,13 @@ class TransformerBlock(module.SimplyModule):
         x, self.sharding_config.activation_partition
     )
 
-    if decode_state is not None:
-      extra_output['decode_state'] = attn_extra_output['decode_state']
+    extra_output['decode_state'] = attn_extra_output['decode_state']
     if self.use_moe:
       extra_output['ffn'] = ffn_extra_output
     return x, extra_output
+
+  def init_decode_state(self, batch_size: int, max_seq_len: int) -> PyTree:
+    return self.attn.init_decode_state(batch_size, max_seq_len)
 
 
 @dataclasses.dataclass
@@ -1811,12 +1893,14 @@ class TransformerLM(module.SimplyModule):
     ), f'Duplicate input encoder name: {names}'
 
     def _create_transformer_block(pattern):
-      rope_max_timescale = config.global_rope_max_timescale
+      total_num_pages = config.global_total_num_pages
+      # Get position encoding config for this pattern (None = NoPE).
+      if isinstance(config.position_encoding, Mapping):
+        pe = config.position_encoding.get(pattern)
+      else:
+        pe = config.position_encoding  # Single config applies to all patterns
       if pattern == 'local':
-        rope_max_timescale = config.local_rope_max_timescale
-      rope_scale_factor = config.global_rope_scale_factor
-      if pattern == 'local':
-        rope_scale_factor = config.local_rope_scale_factor
+        total_num_pages = config.local_total_num_pages
       return TransformerBlock(
           config.model_dim,
           config.n_heads,
@@ -1856,9 +1940,10 @@ class TransformerLM(module.SimplyModule):
           norm_scale_plus_one=config.norm_scale_plus_one,
           attn_soft_cap=config.attn_soft_cap,
           rms_norm_epsilon=config.rms_norm_epsilon,
-          rope_max_timescale=rope_max_timescale,
-          rope_scale_factor=rope_scale_factor,
+          position_encoding=pe,
           query_scale=config.query_scale,
+          total_num_pages=total_num_pages,
+          page_size=config.page_size,
       )
 
     self.blocks = []
@@ -1934,7 +2019,7 @@ class TransformerLM(module.SimplyModule):
       *,
       segment_ids: Array | None = None,
       segment_positions: Array | None = None,
-      extra_inputs: Mapping[str, PyTree] | None = None,
+      extra_inputs: PyTree = None,
       decode_state: PyTree = None,
   ) -> tuple[Array, PyTree]:
     """Transformer forward pass.
@@ -2021,21 +2106,9 @@ class TransformerLM(module.SimplyModule):
     extra_output_list = []
     block_start_index = 0
 
-    global_decode_state = None
-    if decode_state is not None:
-      global_decode_state = {
-          k: v
-          for k, v in getattr(decode_state, 'items')()
-          if not k.startswith('block_')
-      }
-
-    def _completed_block_decode_state(block_decode_state: PyTree) -> PyTree:
-      if block_decode_state is None:
-        return global_decode_state
-      assert global_decode_state is not None
-      return block_decode_state | global_decode_state
-
     if self.config.use_scan:
+      # NOTE: This branch does not work for ragged paged attention, as its
+      # decode state is not stackable.
 
       def _prepare_stack_list(
           tree: PyTree, n_repeats: int, n_blocks_per_repeat: int = 1
@@ -2096,15 +2169,13 @@ class TransformerLM(module.SimplyModule):
                     jax.checkpoint_policies, self.config.remat_policy, None
                 ),
             )
-          block_decode_state = _completed_block_decode_state(
-              block_decode_state_list[i]
-          )
           x, block_extra_output = apply_fn(
               block_params_list[i],
               x,
               segment_ids=segment_ids,
               segment_positions=segment_positions,
-              decode_state=block_decode_state,
+              extra_inputs=extra_inputs,
+              decode_state=block_decode_state_list[i],
           )
           block_extra_output_list.append(block_extra_output)
         return x, block_extra_output_list
@@ -2166,14 +2237,13 @@ class TransformerLM(module.SimplyModule):
         block_decode_state = None
       else:
         decode_state = cast(Mapping[str, Any], decode_state)
-        block_decode_state = _completed_block_decode_state(
-            decode_state.get(f'block_{i}')
-        )
+        block_decode_state = decode_state.get(f'block_{i}')
       x, block_extra_output = self.blocks[i].apply(
           params[f'block_{i}'],
           x,
           segment_ids=segment_ids,
           segment_positions=segment_positions,
+          extra_inputs=extra_inputs,
           decode_state=block_decode_state,
       )
       extra_output_list.append(block_extra_output)
@@ -2198,6 +2268,15 @@ class TransformerLM(module.SimplyModule):
     logits = logits.astype(jnp.float32)
     logits /= temperature
     return jax.nn.softmax(logits, axis=-1)
+
+  def init_decode_state(self, max_seq_len: int) -> PyTree:
+    decode_state = {}
+    for i in range(self.config.n_layers):
+      decode_state[f'block_{i}'] = self.blocks[i].init_decode_state(
+          self.config.batch_size,
+          max_seq_len,
+      )
+    return decode_state
 
 
 ################################################################################
@@ -2508,13 +2587,13 @@ def train_one_step(
 
 
 def tree_norm(tree):
-  flat, _ = jax.tree_util.tree_flatten(tree)
+  flat = jax.tree_util.tree_leaves(tree)
   norm = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in flat]))
   return norm
 
 
 def tree_rms(tree):
-  flat, _ = jax.tree_util.tree_flatten(tree)
+  flat = jax.tree_util.tree_leaves(tree)
   # Cast to float32 to avoid overflow.
   total_size = sum([jnp.asarray(jnp.size(x), jnp.float32) for x in flat])
   rms = jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in flat]) / total_size)
@@ -2584,21 +2663,24 @@ def run_experiment(
 ):
   if create_dataset is not None:
     warnings.warn('create_dataset is deprecated.')
+    del create_dataset
   if mesh_shape is not None:
     warnings.warn('mesh_shape is deprecated.')
+    del mesh_shape
   if dcn_mesh_shape is not None:
     warnings.warn('dcn_mesh_shape is deprecated.')
+    del dcn_mesh_shape
   if decoding_mesh_shape is not None:
     warnings.warn('decoding_mesh_shape is deprecated.')
+    del decoding_mesh_shape
   if sharding_config is not None:
     warnings.warn('sharding_config is deprecated.')
-  del (
-      create_dataset, decoding_mesh_shape, dcn_mesh_shape,
-      sharding_config, mesh_shape)
+    del sharding_config
   logging.info('jax.process_index(): %s', jax.process_index())
   # Setup model, optimizer, initial state, and mesh.
-  sharding_lib.set_default_mesh_shape(
-      mesh_shape=config.mesh_shape, dcn_mesh_shape=config.dcn_mesh_shape,
+  sharding_lib.set_mesh(
+      mesh_shape=config.mesh_shape,
+      dcn_mesh_shape=config.dcn_mesh_shape,
       axis_names=config.sharding_config.mesh_axis_names,
   )
   helper = ExperimentHelper(
@@ -2663,7 +2745,7 @@ def run_experiment(
   # Start training.
   prev_step_timestamp = time.time()
   final_result = {}
-  steps = int(state['steps'].addressable_data(0))
+  steps = int(state['steps'])
 
   # Create eval_fn for validation set.
   if config.use_validation_set:
@@ -2714,7 +2796,7 @@ def run_experiment(
           lr=lr,
           add_log_info=helper.should_log_additional_info(steps),
       )
-      train_loss = float(loss.addressable_data(0))
+      train_loss = float(loss)
       train_step_time = time.time() - t1
       logging.info('train_loss: %s', train_loss)
 
@@ -2741,8 +2823,7 @@ def run_experiment(
       logging.info('%s secs per step, log_additional_info: %s',
                    step_time, helper.should_log_additional_info(steps))
       helper.add_metric('loss', train_loss)
-      helper.add_metric(
-          'accuracy', float(log_dict['accuracy'].addressable_data(0)))
+      helper.add_metric('accuracy', float(log_dict['accuracy']))
       helper.add_metric(
           'data_generation_step_time', data_generation_step_time)
 
@@ -2759,12 +2840,12 @@ def run_experiment(
             steps_per_sec=1 / agg_metrics['avg_total_step_time'],
         )
         metrics_dict.update(agg_metrics)
-        metrics_dict.update(flatten_dict(log_dict))
+        metrics_dict.update(pytree.to_flat_dict(log_dict, sep='/'))
         helper.write_scalars(steps, metrics_dict)
         helper.flush()
         event_write_time = time.time() - t1
         logging.info('%s secs per writing metrics.', event_write_time)
-      steps += 1
+      steps = int(state['steps'])
   final_result['steps'] = steps - 1
   final_result['train_loss'] = float(agg_metrics['loss'])
   final_result['train_accuracy'] = float(agg_metrics['accuracy'])
@@ -2778,7 +2859,7 @@ def run_experiment(
   return final_result
 
 
-def create_model(config, sharding_config):
+def create_model(config, sharding_config=None):
   if sharding_config is None:
     sharding_config = config.sharding_config
   if not (model := getattr(config, 'model', None)):
@@ -2795,10 +2876,9 @@ def create_model(config, sharding_config):
 def build_global_array_from_replicated(
     batch: PyTree, data_partition: PartitionAnnotation = None
 ) -> PyTree:
+  data_sharding = sharding_lib.named_sharding(data_partition)
   return jax.tree_util.tree_map(
-      lambda x: jax.lax.with_sharding_constraint(
-          jnp.asarray(x), sharding_lib.mesh_sharding(data_partition)
-      ),
+      lambda x: jax.lax.with_sharding_constraint(jnp.array(x), data_sharding),
       batch,
   )
 
@@ -2806,7 +2886,7 @@ def build_global_array_from_replicated(
 def build_global_batch_from_sharded(
     batch: PyTree, data_partition: PartitionAnnotation = None
 ) -> PyTree:
-  data_sharding = sharding_lib.mesh_sharding(data_partition)
+  data_sharding = sharding_lib.named_sharding(data_partition)
 
   def _build_global_array_from_sharded(array: np.ndarray):
     if array.ndim < 1:
@@ -2824,28 +2904,37 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   model, extra_output = create_model(config, sharding_config)
   teacher_model = extra_output.get('teacher')
   opt = config.optimizer
-  prng_key = jax.random.key(config.model_seed)
-  if (ckpt_mngr and
-      (latest_step := ckpt_mngr.latest_step()) is not None):
+  init_state_fn = common.named_jit(
+      js.explicit_axes(
+          lambda: opt.init(model.init(jax.random.key(config.model_seed))),
+          in_sharding=(),
+      ),
+      name='init_state',
+  )
+  if ckpt_mngr and (latest_step := ckpt_mngr.latest_step()) is not None:
     # Continue training from lastest ckpt.
-    abstract_state = opt.init(ckpt_lib.get_abstract_params(model))
+    abstract_state = common.eval_abstract_output(init_state_fn)
     state = ckpt_lib.load_checkpoint_from_dir(
         ckpt_dir, abstract_state, latest_step
     )
   elif config.init_ckpt_dir:
     # Initialize from a given external ckpt.
-    abstract_params = ckpt_lib.get_abstract_params(model)
-    logging.info('abstract_params: %s', abstract_params)
     if config.init_ckpt_opt_state:
       # Initialize params and opt state from a given external ckpt.
-      abstract_state = opt.init(abstract_params)
+      abstract_state = common.eval_abstract_output(init_state_fn)
       state = ckpt_lib.load_checkpoint_from_dir(
-          config.init_ckpt_dir, abstract_state, config.init_ckpt_step,
+          config.init_ckpt_dir,
+          abstract_state,
+          config.init_ckpt_step,
           ckpt_format=config.init_ckpt_format,
       )
     else:
       # Only initialize params from a given external ckpt.
-      abstract_state = {'params': abstract_params}
+      abstract_state = {
+          'params': common.eval_abstract_output(
+              lambda: model.init(jax.random.key(0))
+          )
+      }
       state = ckpt_lib.load_checkpoint_from_dir(
           config.init_ckpt_dir,
           abstract_state,
@@ -2856,12 +2945,14 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
     if config.reset_steps:
       state['steps'] = opt_lib.get_init_steps()
   else:  # initialize from scratch.
-    state = opt.init(jax.jit(model.init)(prng_key))
+    state = init_state_fn()
 
   # Add the teacher configuration if specified.
   if teacher_model is not None:
     abstract_teacher_state = {
-        'params': ckpt_lib.get_abstract_params(teacher_model)
+        'params': common.eval_abstract_output(
+            lambda: teacher_model.init(jax.random.key(0))
+        )
     }
     teacher_state = ckpt_lib.load_checkpoint_from_dir(
         config.teacher_ckpt_dir,
@@ -2890,13 +2981,10 @@ def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
     eval_batch_stats_info = compute_batch_stats_info(eval_batch)
     eval_loss, extra_output = loss_fn(
         params=state['params'], batch=eval_batch)
-    eval_loss = float(eval_loss.addressable_data(0))
-    eval_accuracy = float(
-        extra_output['accuracy'].addressable_data(0))
-    num_tokens = float(
-        eval_batch_stats_info['num_tokens'].addressable_data(0))
-    batch_weights = float(
-        eval_batch_stats_info['total_weights'].addressable_data(0))
+    eval_loss = float(eval_loss)
+    eval_accuracy = float(extra_output['accuracy'])
+    num_tokens = float(eval_batch_stats_info['num_tokens'])
+    batch_weights = float(eval_batch_stats_info['total_weights'])
     if total_weights <= 1e-6:
       mean_eval_loss = eval_loss
       mean_eval_accuracy = eval_accuracy
@@ -2927,19 +3015,10 @@ def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
 
 
 def flatten_dict(d: dict[str, Any]):
-  result_dict = {}
-  for k, v in d.items():
-    if isinstance(v, dict):
-      vd = flatten_dict(v)
-      for vk, vv in vd.items():
-        new_key = k + '/' + vk
-        if new_key in result_dict:
-          raise ValueError(f'Duplicate key: {vk}')
-        else:
-          result_dict[new_key] = vv
-    else:
-      result_dict[k] = v
-  return result_dict
+  warnings.warn(
+      'flatten_dict is deprecated. Use pytree.to_flat_dict instead.'
+  )
+  return pytree.to_flat_dict(d, sep='/')
 
 
 @jax.jit
@@ -3267,11 +3346,9 @@ class LMInterface:
         position: int,
         return_logits: bool = True,
     ) -> tuple[Array | None, PyTree]:
+      extra_inputs = (extra_inputs or {}) | {'prefill_position': position}
       logits, extra_output = model.apply(
-          params,
-          inputs,
-          extra_inputs=extra_inputs,
-          decode_state={'prefill_position': position},
+          params, inputs, extra_inputs=extra_inputs
       )
       if return_logits:
         return logits, extra_output
@@ -3361,6 +3438,7 @@ class LMInterface:
       prng_key = jax.random.key(seed=seed)
     elif isinstance(prng_key, int):
       prng_key = jax.random.key(seed=prng_key)
+
     if sampling_params is None:
       sampling_params = self.default_sampling_params
     if prefill_size > 0:
@@ -3427,7 +3505,7 @@ class LMInterface:
           logits, (('replica', 'data'), 'model', None)
       )
 
-      token_scores = compute_log_likelihood(
+      token_scores = sampling_lib.compute_log_likelihood(
           logits,
           processed_input.token_slice(1, decoding_schedule.prefill_size + 1),
           temperature=scoring_params.temperature,
@@ -3662,7 +3740,7 @@ class LMInterface:
         tokens[:, :-1],
         extra_inputs=extra_inputs,
     )
-    token_scores = compute_log_likelihood(
+    token_scores = sampling_lib.compute_log_likelihood(
         logits,
         tokens[:, 1:],
         temperature=scoring_params.temperature,
@@ -3678,91 +3756,6 @@ class LMInterface:
         sampling_lib.input_as_chunks(text)
     )
     return len(processed_input.tokens)
-
-
-def top_k_mask(logits: Array, top_k: int) -> Array:
-  inner_size = logits.shape[-1]
-  indices = jnp.argsort(logits, axis=-1, descending=True)
-  mask = jnp.arange(inner_size) < top_k
-  mask = jnp.broadcast_to(mask, indices.shape)
-  _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
-  return mask
-
-
-def top_p_mask(logits: Array, top_p: float) -> Array:
-  probs = jax.nn.softmax(logits, axis=-1)
-  indices = jnp.argsort(logits, axis=-1, descending=True)
-  sorted_probs = jnp.take_along_axis(probs, indices, axis=-1)
-  cumsum = jnp.cumsum(sorted_probs, axis=-1)
-  mask = cumsum - sorted_probs < top_p
-  _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
-  return mask
-
-
-def sample_from_logits(
-    prng_key: PRNGKey,
-    logits: Array,
-    temperature: float = 1.0,
-    top_k: int = -1,
-    top_p: float = 1.0,
-) -> tuple[Array, Array]:
-  """Samples from the last step of the logits.
-
-  Args:
-    prng_key: A PRNGKey used as the random key.
-    logits: The logits from the model.
-    temperature: The temperature for sampling.
-    top_k: The maximum number of top tokens to sample from. If top_k == -1,
-      results are sampled from the whole vocabulary.
-    top_p: The cumulate probabilty of top tokens to sample from.
-
-  Returns:
-    The sampled tokens and the corresponding logprobs.
-  """
-  logits = jnp.astype(logits[:, [-1], :], jnp.float32)
-
-  def greedy_fn(logits: Array) -> tuple[Array, Array]:
-    tokens = jnp.argmax(logits, axis=-1)
-    logprobs = jnp.zeros(logits.shape[:-1], dtype=logits.dtype)
-    return tokens, logprobs
-
-  def simple_sample_fn(logits: Array) -> tuple[Array, Array]:
-    logits = logits / temperature
-    m = distributions.Categorical(logits)
-    tokens = m.sample(prng_key)
-    logprobs = m.log_prob(tokens)
-    return tokens, logprobs
-
-  def masked_sample_fn(logits: Array) -> tuple[Array, Array]:
-    logits = logits / temperature
-
-    mask = jax.lax.cond(
-        jnp.logical_and(top_k > 0, top_p < 1),
-        lambda: (
-            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
-        ),
-        lambda: jax.lax.cond(
-            top_k > 0,
-            lambda: top_k_mask(logits, top_k=top_k),
-            lambda: top_p_mask(logits, top_p=top_p),
-        ),
-    )
-    m = distributions.MaskedCategorical(
-        logits, mask=mask, neg_inf=neg_inf(logits.dtype)
-    )
-    tokens = m.sample(prng_key)
-    logprobs = m.log_prob(tokens)
-    return tokens, logprobs
-
-  def sample_fn(logits: Array) -> tuple[Array, Array]:
-    return jax.lax.cond(
-        jnp.logical_or(top_k > 0, top_p < 1),
-        masked_sample_fn,
-        simple_sample_fn,
-        logits,
-    )
-
-  return jax.lax.cond(temperature == 0, greedy_fn, sample_fn, logits)
 
 
 def pad_along_axis(
@@ -3813,65 +3806,6 @@ def pad_decode_state_to(d: PyTree, length_to_pad: int) -> PyTree:
   return d
 
 
-# TODO: This function causes OOM when jitted. The root cause is top_p
-# masked sampling implementation needs decent number of copies of logits-shaped
-# tensors. There are two solutions:
-# 1. First locate a threshold and then mask based on threshold. It can cause
-#    inconsistent behavior when the threshold number maches multiple logits.
-# 2. Microbatching this function.
-def compute_log_likelihood(
-    logits: Array,
-    tokens: Array,
-    temperature: float = 1.0,
-    top_k: int = -1,
-    top_p: float = 1.0,
-) -> Array:
-  """Computes the log likelyhood in float32."""
-  logits = jnp.astype(logits, jnp.float32)
-
-  def greedy_score_fn(logits: Array, tokens: Array) -> Array:
-    shape = tokens.shape
-    dtype = logits.dtype
-    target_tokens = jnp.argmax(logits, axis=-1)
-    return jnp.where(
-        tokens == target_tokens,
-        jnp.zeros(shape, dtype=dtype),
-        jnp.full(shape, neg_inf(dtype), dtype=dtype),
-    )
-
-  def simple_sample_score_fn(logits: Array, tokens: Array) -> Array:
-    # The shape of logits is (batch_size, seq_len, vocab_size).
-    m = distributions.Categorical(logits / temperature)
-    return m.log_prob(tokens)
-
-  def masked_sample_score_fn(logits: Array, tokens: Array) -> Array:
-    # The shape of logits is (batch_size, seq_len, vocab_size).
-    logits = logits / temperature
-    mask = jax.lax.cond(
-        top_k > 0,
-        lambda x: top_k_mask(x, top_k=top_k),
-        lambda x: top_p_mask(x, top_p=top_p),
-        logits,
-    )
-    m = distributions.MaskedCategorical(
-        logits, mask=mask, neg_inf=neg_inf(logits.dtype)
-    )
-    return m.log_prob(tokens)
-
-  def sample_score_fn(logits: Array, tokens: Array) -> Array:
-    return jax.lax.cond(
-        jnp.logical_or(top_k > 0, top_p < 1),
-        masked_sample_score_fn,
-        simple_sample_score_fn,
-        logits,
-        tokens,
-    )
-
-  return jax.lax.cond(
-      temperature == 0, greedy_score_fn, sample_score_fn, logits, tokens
-  )
-
-
 def continue_decode(
     apply_fn: Callable[..., Array],
     params: PyTree,
@@ -3900,7 +3834,7 @@ def continue_decode(
 
     prng_key, key = jax.random.split(sampling_state.prng_key, 2)
     # output_tokens: [batch_size, 1], output_logprobs: [batch_size, 1]
-    output_tokens, output_logprobs = sample_from_logits(
+    output_tokens, output_logprobs = sampling_lib.sample_from_logits(
         key, logits, temperature=temperature, top_k=top_k, top_p=top_p
     )
 
@@ -3924,7 +3858,7 @@ def continue_decode(
     )
 
     def _score_fn(logits: Array, tokens: Array) -> Array:
-      return compute_log_likelihood(
+      return sampling_lib.compute_log_likelihood(
           logits,
           tokens,
           temperature=scoring_temperature,

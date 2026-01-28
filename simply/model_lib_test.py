@@ -26,10 +26,10 @@ import numpy as np
 from simply import config_lib
 from simply import model_lib
 from simply.utils import common
-from simply.utils import masked
 from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 from simply.utils import registry
+from simply.utils import sampling_lib
 from simply.utils import sharding as sharding_lib
 from simply.utils import tokenization
 
@@ -150,6 +150,34 @@ class ModelLibTest(parameterized.TestCase):
     logits2, _ = model.apply(params, x)
 
     np.testing.assert_array_equal(logits1, logits2, strict=True)
+
+  def test_identitical_inputs_batch_consistency(self):
+    """Tests that identical inputs yield identical outputs regardless of batch position."""
+    config = lm_test()
+    model = model_lib.TransformerLM(config)
+
+    prng_key = jax.random.key(4)
+    batch_size, seq_len = 4, 8
+
+    # Make all batch elements identical.
+    prng_key, subkey = jax.random.split(prng_key)
+    x = jnp.repeat(
+        jax.random.randint(
+            subkey,
+            shape=(1, seq_len),
+            minval=0,
+            maxval=config.vocab_size,
+        ),
+        repeats=batch_size,
+        axis=0,
+    )
+
+    params = model.init(prng_key)
+    logits, _ = model.apply(params, x)
+
+    for i in range(1, batch_size):
+      with self.subTest(f'output_{i}'):
+        np.testing.assert_allclose(logits[0], logits[i], rtol=1e-5, atol=1e-5)
 
   def test_backward_pass(self):
     # Generate test data
@@ -543,10 +571,12 @@ class ModelLibTest(parameterized.TestCase):
       inputs = np.tile(np.array([example[:k]]), (batch, 1))
       segment_positions = np.tile(np.expand_dims(np.arange(k), 0), (batch, 1))
       apply_fn = jax.jit(model.apply)
-      decode_state = {}
       init_logits, extra_output = apply_fn(
-          params, inputs, decode_state=decode_state,
-          segment_positions=segment_positions)
+          params,
+          inputs,
+          segment_positions=segment_positions,
+          extra_inputs=dict(prefill_position=k),
+      )
       decode_state = extra_output['decode_state']
       decode_state = model_lib.pad_decode_state_to(decode_state, len(example))
       all_logits = [init_logits]
@@ -572,41 +602,6 @@ class ModelLibTest(parameterized.TestCase):
     # This test would also fail on cpu for bfloat16, but works for
     # float16, float32 and int8.
     self.assertTrue(np.allclose(output_logits, target_logits, atol=1e-5))
-
-  @parameterized.named_parameters(
-      ('top_k_1', 1), ('top_k_5', 5), ('top_k_10', 10), ('top_k_12', 12)
-  )
-  def test_top_k_mask(self, top_k: int):
-    logits = np.random.randn(5, 10)
-    mask = model_lib.top_k_mask(logits, top_k=top_k)
-    self.assertEqual(mask.shape, logits.shape)
-    self.assertEqual(mask.dtype, jnp.bool)
-    np.testing.assert_array_equal(jnp.sum(mask, axis=-1), min(top_k, 10))
-    np.testing.assert_array_less(
-        masked.masked_max(logits, mask=~mask, axis=-1),
-        masked.masked_min(logits, mask=mask, axis=-1) + 1e-6,
-    )
-
-  @parameterized.named_parameters(
-      ('top_p_0.0', 0.0),
-      ('top_p_0.2', 0.2),
-      ('top_p_0.5', 0.5),
-      ('top_p_0.8', 0.8),
-      ('top_p_1.0', 1.0),
-  )
-  def test_top_p_mask(self, top_p: float):
-    logits = np.random.randn(5, 10)
-    probs = jax.nn.softmax(logits, axis=-1)
-    mask = model_lib.top_p_mask(logits, top_p=top_p)
-    self.assertEqual(mask.shape, logits.shape)
-    self.assertEqual(mask.dtype, jnp.bool)
-    np.testing.assert_array_less(
-        top_p, masked.masked_sum(probs, mask=mask, axis=-1) + 1e-6
-    )
-    np.testing.assert_array_less(
-        masked.masked_max(logits, mask=~mask, axis=-1),
-        masked.masked_min(logits, mask=mask, axis=-1) + 1e-6,
-    )
 
   def test_tree_norm(self):
     tree = {'a': np.array([3, 4]), 'b': 3, 'c': [{'d': np.array([4])}]}
@@ -843,7 +838,7 @@ class ModelLibTest(parameterized.TestCase):
           [so.input_token_ids + so.output_token_ids])
       logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
 
-      token_logprobs = model_lib.compute_log_likelihood(
+      token_logprobs = sampling_lib.compute_log_likelihood(
           logits,
           all_tokens[:, 1:],
           temperature=sampling_params.temperature,
@@ -913,7 +908,7 @@ class ModelLibTest(parameterized.TestCase):
       logits, _ = self.tfm_lm.apply(
           params, all_tokens[:, :-1], segment_ids=None, segment_positions=None
       )
-      token_ll = model_lib.compute_log_likelihood(
+      token_ll = sampling_lib.compute_log_likelihood(
           logits,
           all_tokens[:, 1:],
           temperature=scoring_params.temperature,
@@ -983,7 +978,7 @@ class ModelLibTest(parameterized.TestCase):
       logits, _ = self.tfm_lm.apply(
           params, all_tokens[:, :-1], segment_ids=None, segment_positions=None
       )
-      token_ll = model_lib.compute_log_likelihood(
+      token_ll = sampling_lib.compute_log_likelihood(
           logits,
           all_tokens[:, 1:],
           temperature=sampling_params.temperature,
@@ -1039,7 +1034,7 @@ class ModelLibTest(parameterized.TestCase):
 
         all_tokens = np.array([so.input_token_ids + so.output_token_ids])
         logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
-        token_ll = model_lib.compute_log_likelihood(
+        token_ll = sampling_lib.compute_log_likelihood(
             logits,
             all_tokens[:, 1:],
             temperature=sampling_params.temperature,
@@ -1112,7 +1107,7 @@ class ModelLibTest(parameterized.TestCase):
 
         all_tokens = np.array([so.input_token_ids + so.output_token_ids])
         logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
-        token_ll = model_lib.compute_log_likelihood(
+        token_ll = sampling_lib.compute_log_likelihood(
             logits,
             all_tokens[:, 1:],
             temperature=sampling_params.temperature,

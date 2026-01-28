@@ -275,6 +275,10 @@ class PyTreeTest(absltest.TestCase):
     tree = [None, {'z': None}, {'a': [None, {'c': [None]}]}]
     self.assertIsNone(pytree.trim_none(tree))
 
+  def test_to_flat_dict(self):
+    tree = {'a': 1, 'b': {'d': None, 'z': 'foo'}}
+    self.assertEqual(pytree.to_flat_dict(tree, sep='/'), {'a': 1, 'b/z': 'foo'})
+
   def test_save_and_load_pytree(self):
     tree = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])
     path = self.create_tempfile().full_path

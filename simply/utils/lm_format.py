@@ -27,13 +27,69 @@ class LMFormatRegistry(registry.RootRegistry):
 
 @dataclasses.dataclass
 class LMFormat(abc.ABC):
+  """Base class for Language Model formatting.
+
+  This class defines the interface for formatting a sequence of messages
+  into a single string or token sequence.
+  """
   bos_id: int | None = None
   pad_id: int | None = None
   extra_eos_tokens: tuple[str, ...] = ()
 
   @abc.abstractmethod
   def format(self, messages: Sequence[Mapping[str, Any]]) -> str:
-    """Formats the messages into string."""
+    """Formats the messages into string string (for inference)."""
+
+  def format_tokens(
+      self,
+      messages: Sequence[Mapping[str, Any]],
+      tokenizer,
+      trainable_roles: tuple[str, ...] | None = None,
+  ) -> tuple[list[int], list[float]]:
+    """Formats and tokenizes conversation with per-token loss mask.
+
+    This method processes messages the same way as format() but returns tokens
+    and loss masks instead of a string. Subclasses should override this for
+    custom tokenization behavior.
+
+    Args:
+      messages: List of message dicts with 'role' and 'content' keys.
+      tokenizer: Tokenizer with encode() method.
+      trainable_roles: Roles to include in loss. None = all roles trainable.
+
+    Returns:
+      tokens: List of token IDs
+      loss_mask: List of floats (1.0 = in loss, 0.0 = not in loss)
+    """
+    all_tokens = []
+    all_mask = []
+
+    for msg in messages:
+      role = msg['role']
+      content = msg['content']
+      is_trainable = trainable_roles is None or role in trainable_roles
+      mask_value = 1.0 if is_trainable else 0.0
+
+      # Role marker (not trainable).
+      role_marker = getattr(self, f'{role}_marker', '')
+      if role_marker:
+        role_tokens = list(tokenizer.encode(role_marker))
+        all_tokens.extend(role_tokens)
+        all_mask.extend([0.0] * len(role_tokens))
+
+      # Content (trainable based on role).
+      content_tokens = list(tokenizer.encode(content))
+      all_tokens.extend(content_tokens)
+      all_mask.extend([mask_value] * len(content_tokens))
+
+      # End marker (trainable if role is trainable, so model learns to stop).
+      end_marker = getattr(self, 'end_of_message_marker', '')
+      if end_marker:
+        end_tokens = list(tokenizer.encode(end_marker))
+        all_tokens.extend(end_tokens)
+        all_mask.extend([mask_value] * len(end_tokens))
+
+    return all_tokens, all_mask
 
 
 @LMFormatRegistry.register
@@ -111,13 +167,74 @@ class GemmaV2Chat(LMFormat):
 @LMFormatRegistry.register
 @dataclasses.dataclass
 class DeepSeekQwenR1DistillChat(LMFormat):
-  """LM format for Qwen R1 distill."""
+  """LM format for Qwen R1 distill.
+
+  Note: This format only supports user/assistant roles (no system), and only
+  adds end_of_message_marker after assistant turns.
+  """
   user_marker: str = '<｜User｜>'
   assistant_marker: str = '<｜Assistant｜>'
   # Note that `end_of_message_marker` is only used at the end of assistant turn.
   end_of_message_marker: str = '<｜end▁of▁sentence｜>'
   extra_eos_tokens: tuple[str, ...] = (
       '<｜User｜>', '<｜Assistant｜>', '<｜end▁of▁sentence｜>')
+
+  def format_tokens(
+      self,
+      messages: Sequence[Mapping[str, Any]],
+      tokenizer,
+      trainable_roles: tuple[str, ...] | None = None,
+  ) -> tuple[list[int], list[float]]:
+    """Formats and tokenizes with DeepSeek-specific handling.
+
+    Only user/assistant roles are supported. End marker only after assistant.
+
+    Args:
+      messages: List of message dicts with 'role' and 'content' keys.
+      tokenizer: Tokenizer with encode() method.
+      trainable_roles: Roles to include in loss. None = all roles trainable.
+
+    Returns:
+      tokens: List of token IDs
+      loss_mask: List of floats (1.0 = in loss, 0.0 = not in loss)
+    """
+    all_tokens = []
+    all_mask = []
+
+    for msg in messages:
+      role = msg['role']
+      content = msg['content']
+
+      # Only user/assistant supported.
+      if role == 'user':
+        role_marker = self.user_marker
+      elif role == 'assistant':
+        role_marker = self.assistant_marker
+      else:
+        raise ValueError(
+            f'DeepSeekQwenR1DistillChat does not support role: {role}'
+        )
+
+      is_trainable = trainable_roles is None or role in trainable_roles
+      mask_value = 1.0 if is_trainable else 0.0
+
+      # Role marker (not trainable).
+      role_tokens = list(tokenizer.encode(role_marker))
+      all_tokens.extend(role_tokens)
+      all_mask.extend([0.0] * len(role_tokens))
+
+      # Content (trainable based on role).
+      content_tokens = list(tokenizer.encode(content))
+      all_tokens.extend(content_tokens)
+      all_mask.extend([mask_value] * len(content_tokens))
+
+      # End marker only after assistant (trainable if assistant is trainable).
+      if role == 'assistant':
+        end_tokens = list(tokenizer.encode(self.end_of_message_marker))
+        all_tokens.extend(end_tokens)
+        all_mask.extend([mask_value] * len(end_tokens))
+
+    return all_tokens, all_mask
 
   def format(self, messages: Sequence[Mapping[str, Any]]) -> str:
     output = ''
@@ -169,15 +286,3 @@ class QwenV2Chat(LMFormat):
 @dataclasses.dataclass
 class QwQChat(QwenV2Chat):
   add_think_marker: bool = True
-
-
-@LMFormatRegistry.register
-@dataclasses.dataclass
-class GeminiChat(GemmaV2Chat):
-  """LM format for Gemini."""
-
-  system_marker: str = '<ctrl99>system\n'
-  user_marker: str = '<ctrl99>user\n'
-  assistant_marker: str = '<ctrl99>model\n'
-  end_of_message_marker: str = '<ctrl100>\n'
-  extra_eos_tokens: tuple[str, ...] = ('<ctrl100>',)

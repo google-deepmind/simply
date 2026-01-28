@@ -21,13 +21,13 @@ import json
 import logging
 from typing import Any, Mapping
 
-from clu import metric_writers
 from etils import epath
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
+from simply.utils import metric_writer as metric_writer_lib
 from simply.utils import pytree
 import yaml
 
@@ -47,6 +47,10 @@ def convert_to_scalar(x: Any) -> Any:
       return None
   except TypeError:
     return None
+
+
+def set_notes(notes: str) -> None:
+  print(f'NOTES: {notes}')
 
 
 def setup_work_unit() -> None:
@@ -134,25 +138,21 @@ class ExperimentHelper:
     return (epath.Path(self.experiment_dir) / 'tb_log').as_posix()
 
   @functools.cached_property
-  def metric_writer(self) -> metric_writers.MetricWriter | None:
-    """Creates a metric writer."""
+  def metric_writer(self) -> metric_writer_lib.BaseMetricWriter | None:
     if not self.should_save_data:
       return None
     metric_logdir = epath.Path(self.metric_logdir)
     metric_logdir.mkdir(parents=True, exist_ok=True)
-    writer = metric_writers.create_default_writer(
-        logdir=metric_logdir,
-        just_logging=not self.should_save_data,
-        asynchronous=True,
+    return metric_writer_lib.create_metric_writer(
+        logdir=str(metric_logdir), just_logging=not self.should_save_data
     )
-    return writer
 
   @functools.cached_property
   def metrics_aggregator(self) -> 'MetricsAggregator':
     return MetricsAggregator(average_last_n_steps=self.metric_log_interval)
 
   def set_notes(self, notes: str) -> None:
-    print(f'NOTES: {notes}')
+    set_notes(notes)
 
   def write_record(self, record: Mapping[str, Any]):
     logging_record = True
@@ -212,6 +212,13 @@ class ExperimentHelper:
     return self.log_additional_info and self.should_log_metrics(step)
 
   def write_scalars(self, step, scalars, filter_nonscalars=True):
+    """Writes scalar metrics.
+
+    Args:
+      step: The current step.
+      scalars: A mapping from metric name to value.
+      filter_nonscalars: Whether to filter out non-scalar values.
+    """
     scalars = common.get_raw_arrays(scalars)
     if filter_nonscalars:
       filtered_scalars = {}
@@ -225,10 +232,17 @@ class ExperimentHelper:
       metric_writer.write_scalars(step, scalars)
 
   def write_texts(self, step, texts):
+    """Writes text metrics.
+
+    Args:
+      step: The current step.
+      texts: A mapping from tag to text content.
+    """
     if metric_writer := self.metric_writer:
       metric_writer.write_texts(step, texts)
 
   def flush(self):
+    """Flushes the metric writer."""
     if metric_writer := self.metric_writer:
       metric_writer.flush()
 
@@ -281,7 +295,6 @@ class ExperimentHelper:
   def save_ckpt(self, state, step, data=None):
     if self.ckpt_mngr:
       ckpt_lib.save_checkpoint(self.ckpt_mngr, state, step, data=data)
-      logging.info('Saving checkpoint at step %s.', step)
 
   def close(self, final_result=None):
     """Closes the experiment helper and saves the final result."""
@@ -313,12 +326,7 @@ class MetricsAggregator(object):
   def add(self, name: str, value: np.typing.ArrayLike) -> None:
     """Adds a metric to the aggregator."""
     if np.size(value) > 1:
-      # raise ValueError(f'Value {value} for metric {name} must be a scalar.')
-      logging.warning(
-          'Value %s for metric %s is not a scalar, ignored in metric'
-          ' aggregation.', value, name
-      )
-      return
+      raise ValueError(f'Metric {name} has nonscalar value: {value}.')
     if isinstance(value, np.ndarray):
       value = value.item()
     self.metrics[name].append(value)

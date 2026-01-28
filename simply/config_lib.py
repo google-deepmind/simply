@@ -25,6 +25,7 @@ import jax
 from simply.utils import common
 from simply.utils import evaluation_lib
 from simply.utils import optimizers as opt_lib
+from simply.utils import position_encoding as pe_lib
 from simply.utils import registry
 
 
@@ -71,8 +72,10 @@ QWEN3_8B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-8B/ORBAX')
 QWEN3_14B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-14B/ORBAX')
 QWEN3_32B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-32B/ORBAX')
 QWEN3_30B_A3B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-30B-A3B/ORBAX')
+QWEN3_235B_A22B_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-235B-A22B/ORBAX')
 QWEN3_4B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-4B-Thinking-2507/ORBAX')
 QWEN3_30B_A3B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-30B-A3B-Thinking-2507/ORBAX')
+QWEN3_235B_A22B_THINKING_2507_CKPT_DIR = os.path.join(MODELS_DIR, 'Qwen3-235B-A22B-Thinking-2507/ORBAX')
 
 
 ################################################################################
@@ -110,6 +113,10 @@ def newlines_from_counts(counts: Iterable[int]) -> tuple[str, ...]:
 @dataclasses.dataclass(frozen=True)
 class ShardingConfig:
   """Base sharding config for others to inherit."""
+
+  def to_decoding_sharding(self) -> Self:
+    """Returns a new sharding config with decoding sharding annotations."""
+    raise NotImplementedError()
 
 
 @ShardingConfigRegistry.register
@@ -160,20 +167,17 @@ class BaseSharding(ShardingConfig):
   ep: PartitionAnnotation = None
   tp: PartitionAnnotation = ('model',)
 
+  def to_decoding_sharding(self) -> Self:
+    activation_partition = (*self.activation_partition[:-1], None)
+    return dataclasses.replace(
+        self,
+        activation_partition=activation_partition,
+    )
+
 
 @ShardingConfigRegistry.register
 def gspmd_sharding():
   return BaseSharding()
-
-
-@ShardingConfigRegistry.register
-def decode_gspmd_sharding():
-  config = gspmd_sharding()
-  return dataclasses.replace(
-      config,
-      # Shape (batch_size, seq_len, model_dim)
-      activation_partition=(('replica', 'data'), None, None)
-  )
 
 
 @ShardingConfigRegistry.register
@@ -208,16 +212,6 @@ def moe_sharding_v1():
       ffn0_activation_partition=(('replica', 'data', 'seq'), None, 'model'),
       logits_partition=(('replica', 'data', 'seq'), None, 'model'),
       data_partition=(('replica', 'data', 'seq', 'model'), None),
-  )
-
-
-@ShardingConfigRegistry.register
-def decode_moe_sharding_v1():
-  config = moe_sharding_v1()
-  return dataclasses.replace(
-      config,
-      # Shape (batch_size, seq_len, model_dim)
-      activation_partition=(('replica', 'data', 'seq'), None, None),
   )
 
 
@@ -298,10 +292,15 @@ class BaseExperimentConfig(ExperimentConfig):
   attn_soft_cap: float = 50.0  # If negative, no softcap.
   output_logits_soft_cap: float = 30.0  # If negative, no softcap.
   rms_norm_epsilon: float = 1e-6
-  local_rope_max_timescale: int = 10_000
-  global_rope_max_timescale: int = 10_000
-  local_rope_scale_factor: float = 1.0
-  global_rope_scale_factor: float = 1.0
+  # Position encoding config. Can be:
+  # - Single config (e.g., pe_lib.RoPE()) to apply to all layers
+  # - Mapping {pattern: config} for per-pattern config (e.g., 'global', 'local')
+  # - None for NoPE (no positional encoding)
+  position_encoding: (
+      Mapping[str, pe_lib.PositionEncodingConfig | None]
+      | pe_lib.PositionEncodingConfig
+      | None
+  ) = dataclasses.field(default_factory=pe_lib.RoPE)
   query_scale: float = -1.0
   # MoE related.
   use_moe: bool = False
@@ -314,6 +313,9 @@ class BaseExperimentConfig(ExperimentConfig):
   tile_model_dim: int = 1024
   tile_expand_dim: int = 1024
   gmm_impl: str = 'ragged_dot'
+  global_total_num_pages: int = 0
+  local_total_num_pages: int = 0
+  page_size: int = 0
 
   # Data config
   batch_size: int = 64 * 16
@@ -341,6 +343,10 @@ class BaseExperimentConfig(ExperimentConfig):
   # prefetch_num_workers will change the order of the data loading.
   prefetch_num_workers: int = 8
   prefetch_per_worker_buffer_size: int = 2
+
+  # WIP field for configuring datasets.
+  dataset_config: Any | None = None
+  validation_dataset_config: Any | None = None
 
   # Training config
   train_loop_name: str = 'default'
@@ -478,7 +484,9 @@ class RLExperimentConfig(BaseExperimentConfig):
   use_policy_logp_as_sampler_logp: bool = False
 
   # New fields for decoding.
-  decoding_sharding_config: SimplyConfig = decode_gspmd_sharding()
+  decoding_sharding_config: SimplyConfig = (
+      gspmd_sharding().to_decoding_sharding()
+  )
   # New fields for quantization.
   decoding_quant_scheme: str = 'bfloat16'
   ref_params_dtype: str = 'bfloat16'
@@ -534,7 +542,7 @@ def apply_simple_rl(config):
       tb_log_interval=4,
       ckpt_interval=4,
       # Sharding config.
-      decoding_sharding_config=decode_gspmd_sharding(),
+      decoding_sharding_config=gspmd_sharding().to_decoding_sharding(),
       activation_dtype_name='bfloat16',
       decoding_quant_scheme='bfloat16',
       ref_params_dtype='bfloat16',
@@ -890,8 +898,10 @@ def gemma3_1b():
       ),
       output_layer_use_bias=False,
       ffn_use_bias=False,
-      local_rope_max_timescale=10_000,
-      global_rope_max_timescale=1_000_000,
+      position_encoding={
+          'local': pe_lib.RoPE(max_timescale=10_000),
+          'global': pe_lib.RoPE(max_timescale=1_000_000),
+      },
       attn_soft_cap=-1.0,
       output_logits_soft_cap=-1.0,
       # NOTE: Data config is vocab dependent. We currently do not have dataset
@@ -929,7 +939,10 @@ def gemma3_4b():
       n_heads=8,
       n_kv_heads=4,
       window_size=1024 - 1,
-      global_rope_scale_factor=8.0,
+      position_encoding={
+          'local': pe_lib.RoPE(max_timescale=10_000),
+          'global': pe_lib.RoPE(max_timescale=1_000_000, scale_factor=8.0),
+      },
       init_ckpt_dir=GEMMA3_4B_PT_CKPT_DIR,
   )
 
@@ -945,7 +958,10 @@ def gemma3_12b():
       n_heads=16,
       n_kv_heads=8,
       window_size=1024 - 1,
-      global_rope_scale_factor=8.0,
+      position_encoding={
+          'local': pe_lib.RoPE(max_timescale=10_000),
+          'global': pe_lib.RoPE(max_timescale=1_000_000, scale_factor=8.0),
+      },
       init_ckpt_dir=GEMMA3_12B_PT_CKPT_DIR,
   )
 
@@ -962,7 +978,10 @@ def gemma3_27b():
       n_heads=32,
       n_kv_heads=16,
       window_size=1024 - 1,
-      global_rope_scale_factor=8.0,
+      position_encoding={
+          'local': pe_lib.RoPE(max_timescale=10_000),
+          'global': pe_lib.RoPE(max_timescale=1_000_000, scale_factor=8.0),
+      },
       query_scale=math.sqrt(5376 / 32),
       init_ckpt_dir=GEMMA3_27B_PT_CKPT_DIR,
   )
@@ -987,41 +1006,11 @@ def gemma3_12b_it_dsr40k_b2k_l10k_rl():  # PF_4x4x8
       use_flash_attention=True,
       flash_attention_block_size=512,
       use_window_chunk=False,
-      lm_format_name='GeminiChat',
-      vocab_name='gemini3_v6',
+      lm_format_name='GemmaV2Chat',
       init_ckpt_dir=GEMMA3_12B_IT_CKPT_DIR,
       tb_log_interval=1,
       ckpt_interval=5,
       use_validation_set=False,
-  )
-  return config
-
-
-@ExperimentConfigRegistry.register
-def gemma3_27b_it_dsr40k_b2k_l10k_rl():  # VF_4x4x8
-  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v3()
-  base_config = deepseek_qwen2_1p5b()
-  new_base_config = gemma3_27b()
-  config = apply_config_diff(config, base_config, new_base_config)
-  config = dataclasses.replace(
-      config,
-      train_max_seq_len=1024 * 10,
-      sampling_prefill_size=1024 * 2,
-      sampling_intermediate_decode_steps=1024 * 2,
-      train_batch_size=2048,
-      batch_size=64,  # number of prompts
-      num_samples_per_example=16,
-      grad_accum_steps=4,
-      use_flash_attention=True,
-      flash_attention_block_size=512,
-      use_window_chunk=False,
-      activation_dtype_name='bfloat16',
-      decoding_quant_scheme='bfloat16',
-      ref_params_dtype='bfloat16',
-      lm_format_name='GemmaV2Chat',
-      init_ckpt_dir=GEMMA3_27B_IT_CKPT_DIR,
-      tb_log_interval=1,
-      ckpt_interval=5,
   )
   return config
 
@@ -1251,7 +1240,7 @@ def gemma3_4b_it_simple_qa_number_only_tool_use_rl():
       tb_log_interval=10,
       ckpt_interval=100,
       # Sharding config.
-      decoding_sharding_config=decode_gspmd_sharding(),
+      decoding_sharding_config=gspmd_sharding().to_decoding_sharding(),
   )
 
 
@@ -1323,7 +1312,7 @@ def deepseek_qwen2_14b():
       n_layers=48,
       n_heads=40,
       n_kv_heads=8,
-      global_rope_max_timescale=1_000_000,
+      position_encoding=pe_lib.RoPE(max_timescale=1_000_000),
       rms_norm_epsilon=1e-5,
       init_ckpt_dir=DEEPSEEK_QWEN_14B_CKPT_DIR,
   )
@@ -1340,7 +1329,7 @@ def deepseek_qwen2_32b():
       n_layers=64,
       n_heads=40,
       n_kv_heads=8,
-      global_rope_max_timescale=1_000_000,
+      position_encoding=pe_lib.RoPE(max_timescale=1_000_000),
       rms_norm_epsilon=1e-5,
       init_ckpt_dir=DEEPSEEK_QWEN_32B_CKPT_DIR,
   )
@@ -1373,7 +1362,7 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
       tb_log_interval=4,
       ckpt_interval=4,
       # Sharding config.
-      decoding_sharding_config=decode_gspmd_sharding(),
+      decoding_sharding_config=gspmd_sharding().to_decoding_sharding(),
       # Use train_max_seq_len to control the max decode steps.
       sampling_max_decode_steps=32768,
       train_max_seq_len=9 * 1024,
@@ -1704,7 +1693,7 @@ def qwen3_0p6b():
       norm_scale_plus_one=False,
       attn_soft_cap=-1.0,
       output_logits_soft_cap=-1.0,
-      global_rope_max_timescale=1_000_000,
+      position_encoding=pe_lib.RoPE(max_timescale=1_000_000),
       # NOTE: Data config is vocab dependent. We currently do not have dataset
       # prepared with qwen vocab.
       vocab_name='Qwen3',
@@ -1745,7 +1734,7 @@ def qwen3_4b_thinking_2507():
   config = qwen3_4b()
   return dataclasses.replace(
       config,
-      global_rope_max_timescale=5_000_000,
+      position_encoding=pe_lib.RoPE(max_timescale=5_000_000),
       init_ckpt_dir=QWEN3_4B_THINKING_2507_CKPT_DIR,
   )
 
@@ -1824,10 +1813,30 @@ def qwen3_30b_a3b():
 def qwen3_30b_a3b_thinking_2507():
   return dataclasses.replace(
       qwen3_30b_a3b(),
-      global_rope_max_timescale=10_000_000,
+      position_encoding=pe_lib.RoPE(max_timescale=10_000_000),
       init_ckpt_dir=QWEN3_30B_A3B_THINKING_2507_CKPT_DIR,
   )
 
+
+@ExperimentConfigRegistry.register
+def qwen3_235b_a22b() -> BaseExperimentConfig:
+  return dataclasses.replace(
+      qwen3_30b_a3b(),
+      model_dim=4096,
+      ffn_expand_dim=1536,
+      n_heads=64,
+      n_layers=94,
+      init_ckpt_dir=QWEN3_235B_A22B_CKPT_DIR,
+  )
+
+
+@ExperimentConfigRegistry.register
+def qwen3_235b_a22b_thinking_2507() -> BaseExperimentConfig:
+  return dataclasses.replace(
+      qwen3_235b_a22b(),
+      position_encoding=pe_lib.RoPE(max_timescale=5_000_000),
+      init_ckpt_dir=QWEN3_235B_A22B_THINKING_2507_CKPT_DIR,
+  )
 
 ################################################################################
 ## Tiny experiments for tests.
@@ -1948,7 +1957,7 @@ def lm_rl_test():
           warmup_steps=100,
       ),
       extra_eos_tokens=newlines_from_counts(range(1, 2)),
-      decoding_sharding_config=decode_gspmd_sharding(),
+      decoding_sharding_config=gspmd_sharding().to_decoding_sharding(),
       # RL algorithm configs.
       gamma=1.0,
       kl_coeff=0.01,

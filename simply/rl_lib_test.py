@@ -13,20 +13,39 @@
 # limitations under the License.
 """Unit test for rl_lib.py."""
 
-from collections.abc import Sequence
 import dataclasses
 import functools
-from typing import TypedDict
+import tempfile
+from typing import Any, TypedDict
 
 from absl.testing import absltest
 from etils import epath
 import numpy as np
-import seqio
 from simply import config_lib
 from simply import data_lib
 from simply import rl_lib
 from simply.utils import lm_format
 from simply.utils import tokenization
+
+
+class ByteVocab:
+  """Simple byte-level vocabulary for testing."""
+
+  def __init__(self):
+    self.bos_id = 0
+    self.eos_id = 1
+    self.pad_id = 2
+    self.unk_id = 3
+    self.vocab_size = 259  # 256 bytes + bos + eos + pad
+
+  def encode(self, text: str) -> list[int]:
+    # Offset by 3 to reserve 0=bos, 1=eos, 2=pad
+    return [b + 3 for b in text.encode('utf-8')]
+
+  def decode(self, token_ids: list[int]) -> str:
+    # Filter special tokens and decode
+    bytes_list = [t - 3 for t in token_ids if t >= 3 and t < 259]
+    return bytes(bytes_list).decode('utf-8', errors='replace')
 
 
 _MOCK_VOCAB_NAME = 'mock_vocab'
@@ -41,7 +60,7 @@ class MockSimplyV1Chat(lm_format.SimplyV1Chat):
 
 
 class MockDeepScaleRJSONExample(TypedDict):
-  """Type definition for a single example in MockDeepScaleRJSONTrain."""
+  """Type definition for a single example in MockDeepScaleRSource."""
 
   question: str
   short_answer: str
@@ -54,10 +73,14 @@ class MockDeepScaleRJSONExample(TypedDict):
     data_lib.DataSourceRegistry.register, name='simply_json:mock_dsr40k_train'
 )
 @dataclasses.dataclass(frozen=True)
-class MockDeepScaleRJSONTrain(data_lib.DeepScaleRJSONTrain):
-  """Mock DeepScaleRJSONTrain with 100 examples."""
+class MockDeepScaleRSource:
+  """Mock DeepScaleRSource with 100 examples."""
 
-  def load(self) -> Sequence[MockDeepScaleRJSONExample]:
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _examples(self) -> list[MockDeepScaleRJSONExample]:
     examples: list[MockDeepScaleRJSONExample] = [
         {
             'question': f'random question {i}',
@@ -68,7 +91,13 @@ class MockDeepScaleRJSONTrain(data_lib.DeepScaleRJSONTrain):
         }
         for i in range(100)
     ]
-    return examples[self.example_start_index : self.example_end_index]
+    return examples[self.start_index : self.end_index]
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> MockDeepScaleRJSONExample:
+    return self._examples[index]
 
 
 class RewardNormalizerTest(absltest.TestCase):
@@ -106,7 +135,7 @@ class RunExperimentTest(absltest.TestCase):
 
   def setUp(self) -> None:
     super().setUp()
-    self._mock_vocab = seqio.ByteVocabulary()
+    self._mock_vocab = ByteVocab()
     tokenization.TokenizerRegistry.register_value(
         self._mock_vocab, name=_MOCK_VOCAB_NAME
     )
@@ -121,14 +150,20 @@ class RunExperimentTest(absltest.TestCase):
         config_lib.lm_rl_test(),
         num_train_steps=num_train_steps,
         ckpt_interval=num_train_steps,
-        dataset_name='simply_json:mock_dsr40k_train',
+        dataset_config=data_lib.DatasetConfig(
+            source='simply_json:mock_dsr40k_train',
+            # RL pipeline expects raw data - it handles formatting via
+            # evaluation.get_sampling_input().
+            lm_format_name=None,
+            packing='none',
+        ),
         vocab_name=_MOCK_VOCAB_NAME,
         vocab_size=self._mock_vocab.vocab_size,
         # EOS strings must tokenize as a single token. Since the mock vocabulary
         # lacks `SimplyV1Chat.extra_eos_tokens` we override the latter to empty.
         lm_format_name='MockSimplyV1Chat',
     )
-    experiment_dir = epath.Path(self.create_tempdir().full_path)
+    experiment_dir = epath.Path(tempfile.mkdtemp())
 
     rl_lib.run_experiment(
         config=config,

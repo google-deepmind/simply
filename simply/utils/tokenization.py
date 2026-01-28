@@ -19,10 +19,11 @@ import json
 from typing import Any, ClassVar, Generic, Protocol, cast
 
 from etils import epath
-import seqio
 from simply.utils import common
 from simply.utils import registry
 import tokenizers
+
+import sentencepiece as spm
 
 
 class TokenizerRegistry(registry.RootRegistry):
@@ -65,19 +66,20 @@ class TestVocab(SimplyVocab[str]):
 
 
 class SimplySentencePieceVocab(SimplyVocab[str]):
-  """Wrapper around seqio.SentencePieceVocabulary."""
+  """Wrapper around sentencepiece.SentencePieceProcessor."""
 
   def __init__(self, vocab_path: str):
-    self._vocab = seqio.SentencePieceVocabulary(vocab_path)
-    self.bos_id = self._vocab.bos_id
-    self.pad_id = self._vocab.pad_id
-    self.eos_id = self._vocab.eos_id
+    self._sp = spm.SentencePieceProcessor()
+    self._sp.Load(vocab_path)
+    self.bos_id = self._sp.bos_id()
+    self.pad_id = self._sp.pad_id()
+    self.eos_id = self._sp.eos_id()
 
   def encode(self, text: str) -> list[int]:
-    return self._vocab.encode(text)  # pytype: disable=bad-return-type
+    return self._sp.EncodeAsIds(text)
 
   def decode(self, token_ids: list[int]) -> str:
-    return self._vocab.decode(token_ids)
+    return self._sp.DecodeIds(token_ids)
 
 
 class HuggingFaceVocab(SimplyVocab[str]):
@@ -126,4 +128,4 @@ class HuggingFaceVocab(SimplyVocab[str]):
     return cast(tokenizers.Encoding, encoded).ids
 
   def decode(self, token_ids: list[int]) -> str:
-    return self.tokenizer.decode(token_ids)
+    return self.tokenizer.decode(token_ids, skip_special_tokens=False)

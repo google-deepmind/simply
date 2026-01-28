@@ -38,10 +38,13 @@ import dataclasses
 import functools
 import time
 from typing import Any, Tuple
+import warnings
 
 from absl import logging
+import deprecated
 import einops
 import jax
+import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
@@ -55,6 +58,7 @@ from simply.utils import evaluation_lib as eval_lib
 from simply.utils import experiment_helper as exp_helper
 from simply.utils import lm_format as lm_format_lib
 from simply.utils import masked
+from simply.utils import pytree
 from simply.utils import registry
 from simply.utils import replay_buffers
 from simply.utils import sampling_lib
@@ -455,7 +459,7 @@ def compute_stats(
       ),
       'eval_count': np.sum(eval_count),
       'train_sample_ratio': (
-          np.sum(stats['train_count']) / np.maximum(eval_count, 1e-5)
+          np.sum(stats['train_count']) /  np.sum(eval_count)
       ),
   }
   for reward_type in getattr(evaluation, 'reward_types', ()):
@@ -549,8 +553,8 @@ def create_train_batch(
       example_per_response = example_per_response.pad_sequences(max_seq_len)
 
       pytree_shape = example_per_response.tree_structure()
-      example_per_response.assert_no_nan()
       if example_per_response.is_valid_for_training:
+        example_per_response.assert_no_nan()
         local_train_rows.append(example_per_response)
 
   logging.info('pytree_shape=%s', pytree_shape)
@@ -781,12 +785,13 @@ def mesh_in_params(params: common.PyTree) -> js.Mesh | None:
   return None
 
 
+@deprecated.deprecated('Use jax.tree_util.tree_map instead.')
 @functools.partial(jax.jit, static_argnames=['dtype'])
-def tree_convert_dtype(x: PyTree, dtype: jax.typing.DTypeLike):
-  return jax.tree_util.tree_map(lambda x: x.astype(dtype), x)
+def tree_convert_dtype(tree: PyTree, dtype: jax.typing.DTypeLike):
+  return jax.tree_util.tree_map(lambda x: x.astype(dtype), tree)
 
 
-# TODO: Move this to serving_lib.py.
+@deprecated.deprecated('Use common.convert_array_with_abstract instead.')
 def prepare_params_for_decoding(
     params: common.PyTree,
     abstract_decoding_params: common.PyTree = None,
@@ -794,19 +799,18 @@ def prepare_params_for_decoding(
 ):
   """Quantizes params and then reshards them to the current mesh."""
   # Convert to bfloat16 to reduce allgather cost.
-  if quant_scheme in ['bfloat16', 'float32']:
-    params = tree_convert_dtype(params, quant_scheme)
   if abstract_decoding_params:
-    if sharding_lib.get_default_mesh() != mesh_in_params(params):
-      params = jax.experimental.multihost_utils.process_allgather(
-          params, tiled=True
-      )
-    params = jax.tree_util.tree_map(
-        lambda x, y: sharding_lib.with_sharding_constraint(x, y.sharding),
+    abstracts = jax.tree_util.tree_map(
+        lambda x, a: jax.ShapeDtypeStruct(
+            x.shape, quant_scheme, sharding=a.sharding
+        ),
         params,
         abstract_decoding_params,
     )
-  return params
+    return jax.tree_util.tree_map(
+        common.convert_array_with_abstract, params, abstracts
+    )
+  return jax.tree_util.tree_map(lambda x: jnp.astype(x, quant_scheme), params)
 
 
 @functools.partial(model_lib.TrainLoopRegistry.register, name='rl')
@@ -823,21 +827,27 @@ def run_experiment(
     create_dataset=None,
 ):
   if create_dataset is not None:
-    raise ValueError('create_dataset is deprecated.')
-  del (
-      create_dataset,
-      decoding_mesh_shape,
-      dcn_mesh_shape,
-      sharding_config,
-      mesh_shape,
-  )
+    warnings.warn('create_dataset is deprecated.')
+    del create_dataset
+  if mesh_shape is not None:
+    warnings.warn('mesh_shape is deprecated.')
+    del mesh_shape
+  if dcn_mesh_shape is not None:
+    warnings.warn('dcn_mesh_shape is deprecated.')
+    del dcn_mesh_shape
+  if decoding_mesh_shape is not None:
+    warnings.warn('decoding_mesh_shape is deprecated.')
+    del decoding_mesh_shape
+  if sharding_config is not None:
+    warnings.warn('sharding_config is deprecated.')
+    del sharding_config
   logging.info('jax.process_index(): %s', jax.process_index())
   # Setup model, optimizer, initial state, and mesh.
-  sharding_lib.set_default_mesh_shape(
+  sharding_lib.set_mesh(
       mesh_shape=config.mesh_shape,
       dcn_mesh_shape=config.dcn_mesh_shape,
-      # Currently assumes the mesh axis names are the same as for training and
-      # decoding, but this can be decoupled in the future.
+      # Currently assumes the mesh axis names are the same as for training
+      # and decoding, but this can be decoupled in the future.
       axis_names=config.sharding_config.mesh_axis_names,
   )
   helper = ExperimentHelper(
@@ -879,7 +889,9 @@ def run_experiment(
   else:
     ref_params = state['params']
 
-  ref_params = tree_convert_dtype(ref_params, config.ref_params_dtype)
+  ref_params = jax.tree_util.tree_map(
+      lambda x: jnp.array(x, config.ref_params_dtype), ref_params
+  )
 
   # Compile loss, train and learning rate functions.
   t1 = time.time()
@@ -939,7 +951,7 @@ def run_experiment(
   logging.info('%s secs used for compiling train, loss and lr functions.', dt)
 
   # Prepare datasets.
-  start_steps = int(state['steps'].addressable_data(0))
+  start_steps = int(state['steps'])
   logging.info('Initializing dataset.')
   train_set = data_lib.create_iter_dataset(config, training=True)
 
@@ -980,15 +992,19 @@ def run_experiment(
       sort_by=None,
   )
   lm_format = lm_format_lib.LMFormatRegistry.get(config.lm_format_name)()
-  model_for_decoding, _ = model_lib.create_model(
-      dataclasses.replace(
-          config,
-          use_scan=False,
-          use_remat=False,
-          activation_dtype_name=config.activation_dtype_name,
-      ),
-      config.decoding_sharding_config or config.sharding_config,
+  decoding_config = dataclasses.replace(
+      config,
+      use_scan=False,
+      use_remat=False,
+      mesh_shape=config.decoding_mesh_shape or config.mesh_shape,
+      sharding_config=config.decoding_sharding_config or config.sharding_config,
   )
+  decoding_mesh = sharding_lib.create_mesh(
+      decoding_config.mesh_shape,
+      decoding_config.dcn_mesh_shape,
+      axis_names=decoding_config.sharding_config.mesh_axis_names,
+  )
+  decoding_model, _ = model_lib.create_model(decoding_config)
   extra_eos_tokens = list(
       set(config.extra_eos_tokens) | set(lm_format.extra_eos_tokens)
   )
@@ -999,11 +1015,9 @@ def run_experiment(
       pad_id_override=lm_format.pad_id,
       extra_eos_tokens=extra_eos_tokens,
   )
-  with decoding_mesh_context(
-      config.decoding_mesh_shape, config.dcn_mesh_shape,
-      axis_names=config.decoding_sharding_config.mesh_axis_names):
+  with js.set_mesh(decoding_mesh):
     lm_interface = model_lib.LMInterface(
-        model_for_decoding,
+        decoding_model,
         params=None,
         vocab=tokenizer,
         input_processor=input_processor,
@@ -1012,14 +1026,14 @@ def run_experiment(
         default_sampling_params=sampling_params,
         extra_eos_tokens=extra_eos_tokens,
     )
-    abstract_decoding_params = None
-    if config.decoding_mesh_shape or config.decoding_sharding_config:
-      # That means we need to do reshard.
-      abstract_decoding_params = ckpt_lib.get_abstract_params(
-          model_for_decoding
-      )
+    abstract_decoding_params = common.eval_abstract_output(
+        lambda: jax.tree_util.tree_map(
+            lambda x: jnp.astype(x, config.decoding_quant_scheme),
+            decoding_model.init(jax.random.key(0)),
+        )
+    )
+    prng_key = jax.random.key(seed=config.model_seed)
 
-  seed = config.model_seed
   train_batch_size = config.train_batch_size
   train_max_seq_len = config.train_max_seq_len
   num_train_steps_per_batch = config.num_train_steps_per_batch
@@ -1034,7 +1048,6 @@ def run_experiment(
 
   # Start training.
   steps = start_steps
-  prng_key = jax.random.key(seed=seed)
   stats = {}
   should_early_stop = False
   final_result = {}
@@ -1044,14 +1057,14 @@ def run_experiment(
     train_iter_state = train_iter.get_state()
     logging.info('train_iter_state=%s', train_iter_state)
     start_time = time.time()
-    with jax.profiler.StepTraceAnnotation('sampling'), decoding_mesh_context(
-        config.decoding_mesh_shape, config.dcn_mesh_shape,
-        axis_names=config.decoding_sharding_config.mesh_axis_names
+    with (
+        jax.profiler.StepTraceAnnotation('sampling'),
+        js.set_mesh(decoding_mesh),
     ):
-      decoding_params = prepare_params_for_decoding(
-          params=state['params'],
-          abstract_decoding_params=abstract_decoding_params,
-          quant_scheme=config.decoding_quant_scheme,
+      decoding_params = jax.tree_util.tree_map(
+          common.convert_array_with_abstract,
+          state['params'],
+          abstract_decoding_params,
       )
       prepare_decoding_params_time = time.time() - start_time
       print(
@@ -1089,7 +1102,7 @@ def run_experiment(
         )
 
         sampling_inputs: list[RewardedSample] = []
-        for example in next(train_iter):
+        for example in common.convert_columns_to_rows(next(train_iter)):
           sampling_inputs.append(
               RewardedSample(
                   raw_example=example,
@@ -1313,7 +1326,7 @@ def run_experiment(
       train_start_time = time.time()
       for batch in replay_buffer.iterator(train_batch_size, shuffle=True):
         logging.info('batch: %s', jax.tree.map(np.shape, batch))
-        steps = int(state['steps'].addressable_data(0))
+        steps = int(state['steps'])
         helper.set_notes(f'{steps=}, training')
         print(f'steps: {steps}')
         assert train_iter_state is not None
@@ -1331,13 +1344,11 @@ def run_experiment(
           eval_sampling_params = dataclasses.replace(
               sampling_params, num_samples=1
           )
-
-          with decoding_mesh_context(
-              config.decoding_mesh_shape, config.dcn_mesh_shape):
-            decoding_params = prepare_params_for_decoding(
-                params=state['params'],
-                abstract_decoding_params=abstract_decoding_params,
-                quant_scheme=config.decoding_quant_scheme,
+          with js.set_mesh(decoding_mesh):
+            decoding_params = jax.tree_util.tree_map(
+                common.convert_array_with_abstract,
+                state['params'],
+                abstract_decoding_params,
             )
             prng_key, subkey = jax.random.split(prng_key)
             eval_verdicts = []
@@ -1356,7 +1367,7 @@ def run_experiment(
               ):
                 break
               eval_prompt_batch = []
-              for example in eval_batch:
+              for example in common.convert_columns_to_rows(eval_batch):
                 eval_prompt_batch.append(
                     evaluation.get_sampling_input(example, lm_format)
                 )
@@ -1379,6 +1390,7 @@ def run_experiment(
                     params=decoding_params,
                     sampling_params=eval_sampling_params,
                     prefill_size=config.sampling_prefill_size,
+                    scoring_inputs=False,
                     batch_size=eval_batch_size,
                 )
               for example, eval_so in zip(
@@ -1411,13 +1423,13 @@ def run_experiment(
           lr = lr_fn(state['steps'])
           loss, state, log_dict = train_one_step_fn(state, batch, lr=lr)
 
-        loss = float(loss.addressable_data(0))
+        loss = float(loss)
         helper.add_metric('loss', loss)
         train_step_time = time.time() - train_step_start_time
         print(f'train_step_time: {train_step_time} sec')
         helper.add_metric('train_step_time', train_step_time)
 
-        entropy = log_dict['entropy'].addressable_data(0)
+        entropy = float(log_dict['entropy'])
         print(f'entropy: {entropy}')
         helper.add_metric('entropy', entropy)
 
@@ -1431,7 +1443,7 @@ def run_experiment(
           metrics_dict = dict(lr=lr)
           print(f'agg_metrics: {agg_metrics}')
           metrics_dict.update(agg_metrics)
-          metrics_dict.update(model_lib.flatten_dict(log_dict))
+          metrics_dict.update(pytree.to_flat_dict(log_dict, sep='/'))
           helper.write_scalars(steps, metrics_dict)
           helper.flush()
           event_write_time = time.time() - log_start_time
@@ -1441,7 +1453,7 @@ def run_experiment(
       print(f'Training time: {training_time} sec')
       helper.add_metric('training_time', training_time)
 
-    steps = int(state['steps'].addressable_data(0))
+    steps = int(state['steps'])
     print(f'{steps} train steps passed.')
     total_time = time.time() - start_time
     print(f'Total time: {total_time} sec')

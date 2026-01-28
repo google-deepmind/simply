@@ -13,7 +13,7 @@
 # limitations under the License.
 """Utils that process pytree."""
 
-from collections.abc import Sequence, Set
+from collections.abc import Mapping, Sequence, Set
 import dataclasses
 import enum
 import json
@@ -24,8 +24,10 @@ import warnings
 from etils import epath
 import jax
 import numpy as np
+from simply.utils import common
 from simply.utils import registry
-from simply.utils.common import PyTree  # pylint: disable=g-importing-member
+
+PyTree = common.PyTree
 
 
 def convert_string_path_to_key_path(path: str) -> jax.tree_util.KeyPath:
@@ -228,6 +230,44 @@ def tree_leaves_with_tag(tree, tag='loss'):
   for path, leaf in jax.tree_util.tree_leaves_with_path(tree):
     if tag in _get_raw(path):
       yield leaf, path
+
+
+def to_flat_dict(
+    tree: PyTree,
+    sep: str = '',
+    is_leaf: Callable[[Any], bool] | None = None,
+) -> Mapping[str, Any] | Mapping[jax.tree_util.KeyPath, Any]:
+  """Converts a tree into a flattened dictionary.
+
+  Basically the same as `orbax.checkpoint.utils.to_flat_dict`.
+
+  Args:
+    tree: A PyTree to be flattened.
+    sep: If provided, keys will be returned as `sep`-separated strings.
+      Otherwise, keys are returned as tuples.
+    is_leaf: If provided, a function that returns True if a value is a leaf.
+      Overrides `keep_empty_nodes` if that is also provided.
+
+  Returns:
+    A flattened dictionary.
+  """
+  tree = common.get_raw_arrays(tree)
+  path_leaves = jax.tree_util.tree_leaves_with_path(tree, is_leaf=is_leaf)
+  print(f'{tree=}')
+  output = {}
+  for path, leaf in path_leaves:
+    keytuple = []
+    for entry in path:
+      if isinstance(entry, jax.tree_util.DictKey):
+        keytuple.append(entry.key)
+      else:
+        raise ValueError(f'Unknown path type {entry=}')
+    if sep:
+      keytuple = sep.join(keytuple)
+    else:
+      keytuple = tuple(keytuple)
+    output[keytuple] = leaf
+  return output
 
 
 def load(jtree: PyTree) -> Any:

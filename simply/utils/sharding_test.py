@@ -16,6 +16,7 @@ import os
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+import jax.sharding as js
 from unittest import mock
 import numpy as np
 from simply.utils import sharding
@@ -156,6 +157,33 @@ class ShardingTest(absltest.TestCase):
     multihost_data = sharding.MultihostData.load(testdir)
     self.assertEqual(multihost_data.global_data, global_data)
     self.assertEqual(multihost_data.local_data, {'c': 1, 'd': [1, 2, 3]})
+
+  def test_partition_spec(self):
+    self.assertEqual(
+        sharding.partition_spec(None), js.PartitionSpec()
+    )
+    self.assertEqual(
+        sharding.partition_spec(['replica', 'data']),
+        js.PartitionSpec('replica', 'data'),
+    )
+
+  def test_get_array_sharding(self):
+    with js.set_mesh(js.Mesh(jax.devices(), 'x')):
+      x = jax.lax.with_sharding_constraint(
+          jnp.array([[1, 2], [3, 4]]), jax.sharding.PartitionSpec('x')
+      )
+      self.assertEqual(
+          sharding.get_array_sharding(x),
+          jax.sharding.NamedSharding(js.get_mesh(), js.PartitionSpec('x')),
+      )
+
+      def _f(x):
+        return sharding.with_sharding_constraint(
+            x, sharding.get_array_sharding(x)
+        )
+
+      y = jax.jit(js.explicit_axes(_f, in_sharding=(js.PartitionSpec('x'),)))(x)
+      self.assertEqual(y.sharding, x.sharding)
 
 
 if __name__ == '__main__':

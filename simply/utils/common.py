@@ -26,12 +26,13 @@ import re
 import threading
 import time
 import types
-from typing import Any, Callable, ClassVar, TypeAlias, TypeVar, Union
+from typing import Any, Callable, ClassVar, TypeAlias, Self, TypeVar, Union
 
 from absl import logging
 from etils import epath
 import jax
 import jax.numpy as jnp
+import jax.sharding as js
 import numpy as np
 
 PartitionAnnotation: TypeAlias = None | Sequence[None | str | Sequence[str]]
@@ -234,6 +235,17 @@ def convert_rows_to_columns(
   return {k: np.array(v) for k, v in column_view.items()}
 
 
+def convert_columns_to_rows(
+    columns: Mapping[str, np.typing.ArrayLike],
+) -> list[dict[str, Any]]:
+  """Converts a column view to a sequence of rows."""
+  keys = list(columns.keys())
+  if not keys:
+    return []
+  batch_size = len(columns[keys[0]])
+  return [{k: columns[k][i] for k in keys} for i in range(batch_size)]
+
+
 def find_unused_argpaths(
     func: Callable[[Any], Any], argtree: PyTree
 ) -> Sequence[jax.tree_util.KeyPath]:
@@ -298,3 +310,287 @@ def unsorted(
   for i, v in zip(indices, sorted_x, strict=True):
     unsorted_x[i] = v
   return unsorted_x
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RaggedArray:
+  """A ragged 2d array."""
+
+  data: jax.Array  # [capacity, *subshape]
+  lens: jax.Array  # i32[batch_size]
+
+  def __post_init__(self):
+    if len(self.lens.shape) != 1:
+      raise ValueError(f'Lens must be 1d. {self.lens.shape=}')
+
+  @functools.cached_property
+  def is_valid(self) -> jax.Array:  # bool[]
+    # User should guarantee this is always true.
+    return self.total_length <= self.capacity
+
+  @functools.cached_property
+  def total_length(self) -> jax.Array:  # int32[]
+    return jnp.sum(self.lens)
+
+  @property
+  def ndim(self) -> int:
+    return len(self.data.shape) + 1
+
+  @property
+  def subshape(self) -> tuple[int, ...]:
+    return self.data.shape[1:]
+
+  @property
+  def capacity(self) -> int:
+    return self.data.shape[0]
+
+  @property
+  def dtype(self) -> jax.typing.DTypeLike:
+    return self.data.dtype
+
+  @property
+  def batch_size(self) -> int:
+    return self.lens.shape[0]
+
+  @functools.cached_property
+  def row_starts(self) -> jax.Array:  # int32[batch_size]
+    return self.row_starts_with_end[:-1]
+
+  @functools.cached_property
+  def row_starts_with_end(self) -> jax.Array:  # int32[batch_size+1]
+    return jnp.cumulative_sum(self.lens, include_initial=True)
+
+  @functools.cached_property
+  def row_ids(self) -> jax.Array:  # int32[capacity]
+    # input: a1, a2, a3, b1, c1, c2
+    # output: 0,  0,  0,  1,  2,  2, | 2, 2, 2, ...
+    # numbers after | are padded with `batch_size - 1``
+    return jnp.repeat(
+        jnp.arange(self.batch_size),
+        self.lens,
+        total_repeat_length=self.capacity,
+    )
+
+  def row(self, idx: jax.typing.ArrayLike) -> jax.Array:
+    """Returns the row at the given index."""
+    if jnp.ndim(idx) != 0:
+      raise ValueError(f'Row index must be 0d: {jnp.shape(idx)=}')
+    return self.data[
+        self.row_starts_with_end[idx] : self.row_starts_with_end[idx + 1]
+    ]
+
+  @functools.cached_property
+  def intra_offset(self) -> jax.Array:  # int32[batch_size]
+    # input: a1, a2, a3, b1, c1, c2
+    # output: 0,  1,  2,  0,  0,  1, | 2, 3, 4, ...
+    # numbers after | are padded as if the last row is infinite.
+    return jnp.arange(self.capacity) - self.row_starts[self.row_ids]
+
+  def to_numpy_list(self) -> Sequence[np.ndarray]:
+    np_data = np.asarray(self.data)
+    lens = np.asarray(self.lens)
+    if lens.size == 0:
+      return []
+    indices = np.cumsum(lens)
+    return np.split(np_data, indices, axis=0)[:-1]
+
+  def to_padded_dense(
+      self, max_len: int, padding_value: jax.typing.ArrayLike = 0
+  ) -> jax.Array:
+    """Converts to a padded dense array."""
+    if jnp.ndim(padding_value) != 0:
+      raise ValueError(f'Padding must be 0d. {jnp.shape(padding_value)=}')
+
+    # 1. Create a 2D grid of column indices: shape (1, max_len)
+    # [0, 1, 2, ..., max_len-1]
+    col_idx = jnp.arange(max_len)[None, :]
+
+    # 2. Create a mask determining which positions are valid
+    # Broadcast compares (1, max_len) vs (batch, 1) -> (batch, max_len)
+    mask = col_idx < self.lens[:, None]
+
+    # 4. Calculate the flat index for every cell in the 2D output
+    # cell_index = start_of_row + column_index
+    # Shape: (batch, 1) + (1, max_len) -> (batch, max_len)
+    flat_indices = self.row_starts[:, None] + col_idx
+
+    # 5. Handle Out-of-Bounds safe reading
+    # We replace invalid indices with 0 temporarily so the gather doesn't crash.
+    # We will overwrite these values with fill_value in the next step anyway.
+    safe_indices = jnp.where(mask, flat_indices, 0)
+
+    # 6. Gather data and apply padding
+    dense = self.data[safe_indices]
+    dense = jnp.where(mask, dense, padding_value)
+    return dense
+
+  @classmethod
+  def from_numpy_list(cls, np_list: Sequence[np.typing.ArrayLike]) -> Self:
+    data = jnp.concatenate([jnp.asarray(x) for x in np_list], axis=0)
+    lens = jnp.array([np.shape(x)[0] for x in np_list])
+    return RaggedArray(data=data, lens=lens)
+
+  def set_padding_value(self, padding_value: jax.typing.ArrayLike) -> Self:
+    if jnp.ndim(padding_value) != 0:
+      raise ValueError(f'Padding must be 0d. {jnp.shape(padding_value)=}')
+    mask = jnp.arange(self.capacity) < self.total_length
+    mask = jnp.expand_dims(mask, np.arange(1, len(self.data.shape)))
+    data = jnp.where(mask, self.data, padding_value)
+    return RaggedArray(data=data, lens=self.lens)
+
+  def extend_capacity_to(self, capacity: int) -> Self:
+    if capacity < self.capacity:
+      raise ValueError(
+          f'Capacity must be >= {self.capacity}. {capacity=} <'
+          f' {self.capacity=}.'
+      )
+    pad_widths = [(0, 0)] * len(self.subshape)
+    data = jnp.pad(self.data, [(0, capacity - self.capacity), *pad_widths])
+    return RaggedArray(data=data, lens=self.lens)
+
+  def concat(self, other: Self, capacity: int | None = None) -> Self:
+    """Concatenates with another ragged array."""
+    if self.batch_size != other.batch_size:
+      raise ValueError(
+          'All ragged arrays must have the same batch size. Got'
+          f' {self.batch_size=} and {other.batch_size=}.'
+      )
+    if self.dtype != other.dtype:
+      raise ValueError(
+          'All ragged arrays must have the same dtype. Got'
+          f' {self.dtype=} and {other.dtype=}.'
+      )
+    if self.subshape != other.subshape:
+      raise ValueError(
+          'All ragged arrays must have the same subshape. Got'
+          f' {self.subshape=} and {other.subshape=}.'
+      )
+
+    if capacity is None:
+      capacity = self.capacity + other.capacity
+
+    z_lens = self.lens + other.lens
+    z_starts = jnp.cumulative_sum(z_lens, include_initial=True)
+
+    ragged_z = jax.lax.empty((capacity, *self.subshape), dtype=self.dtype)
+    self_target_idx = z_starts[self.row_ids] + self.intra_offset
+    other_target_idx = (
+        z_starts[other.row_ids] + self.lens[other.row_ids] + other.intra_offset
+    )
+    ragged_z = ragged_z.at[self_target_idx].set(self.data, mode='drop')
+    ragged_z = ragged_z.at[other_target_idx].set(other.data, mode='drop')
+    return RaggedArray(data=ragged_z, lens=z_lens)
+
+  def keep_rows(self, row_mask: jax.typing.ArrayLike) -> Self:
+    """Keeps the rows that satisfy the row mask."""
+    row_mask = jnp.asarray(row_mask)
+    if len(row_mask.shape) != 1 or row_mask.dtype != jnp.bool:
+      raise ValueError(
+          f'Keep mask must be 1d bool: {row_mask.shape=}, {row_mask.dtype=}'
+      )
+    if row_mask.shape[0] != self.batch_size:
+      raise ValueError(f'{jnp.shape(row_mask)=} must match {self.batch_size=}')
+    element_keep_mask = row_mask[self.row_ids] & (
+        jnp.arange(self.capacity) < self.total_length
+    )
+    indices = jnp.flatnonzero(
+        element_keep_mask, size=self.capacity, fill_value=0
+    )
+    new_data = self.data[indices]
+    new_lens = jnp.where(row_mask, self.lens, 0)
+    return RaggedArray(data=new_data, lens=new_lens)
+
+  def keep_last_ncols(self, ncols: int) -> Self:
+    """Keeps the last n columns of each row."""
+    is_last_n = self.intra_offset >= self.lens[self.row_ids] - ncols
+    indices = jnp.flatnonzero(is_last_n, size=self.capacity, fill_value=0)
+    return RaggedArray(
+        data=self.data[indices], lens=jnp.minimum(self.lens, ncols)
+    )
+
+
+def convert_array_with_abstract(
+    x: jax.Array, abstract: jax.ShapeDtypeStruct
+) -> jax.Array:
+  """Converts an array to the given abstract specified dtype/sharding."""
+  if not isinstance(x.sharding, js.NamedSharding):
+    raise ValueError(f'Unsupported sharding type: {x.sharding=}')
+  if not isinstance(abstract.sharding, js.NamedSharding):
+    raise ValueError(f'Unsupported sharding type: {abstract.sharding=}')
+  if x.shape != abstract.shape:
+    raise ValueError(f'Shape mismatch: {x.shape=} vs {abstract.shape=}')
+
+  if x.sharding.mesh == abstract.sharding.mesh:
+    return jax.lax.with_sharding_constraint(
+        jnp.astype(x, abstract.dtype), abstract.sharding
+    )
+
+  replicated_sharding = x.sharding.update(spec=js.PartitionSpec())
+  with js.set_mesh(replicated_sharding.mesh):
+    if abstract.dtype.itemsize < x.dtype.itemsize:
+      x = jnp.astype(x, abstract.dtype)
+    x_replicated = jax.lax.with_sharding_constraint(x, replicated_sharding)
+    x_np = np.asarray(x_replicated)
+
+  y = jax.lax.with_sharding_constraint(
+      jnp.asarray(x_np, abstract.dtype), abstract.sharding
+  )
+  return y
+
+
+def prng_key_in_current_mesh(prng_key: jax.Array):
+  # Check if input is already key data (raw array) or a PRNG key
+  try:
+    # Try to get key_data - if it succeeds, it's a PRNG key
+    key_data = jax.random.key_data(prng_key)
+    is_prng_key = True
+  except (TypeError, AttributeError):
+    # If it fails, it's already key data
+    key_data = prng_key
+    is_prng_key = False
+
+  if is_prng_key:
+    if not prng_key.is_fully_replicated:
+      logging.warning(
+          'Prng key is not fully replicated. This may cause non-determinism.'
+      )
+    if getattr(prng_key.sharding, 'mesh', None) != js.get_mesh():
+      prng_key = jax.random.wrap_key_data(
+          jnp.asarray(np.asarray(key_data))
+      )
+  else:
+    # Wrap raw key data
+    prng_key = jax.random.wrap_key_data(jnp.asarray(np.asarray(key_data)))
+
+  return prng_key
+
+
+def neg_inf(dtype: jax.typing.DTypeLike) -> float:
+  if jnp.issubdtype(dtype, jnp.inexact):
+    dtype_max = jnp.finfo(dtype).max
+  elif jnp.issubdtype(dtype, jnp.integer):
+    dtype_max = jnp.iinfo(dtype).max
+  else:
+    raise ValueError(f'Unsupported dtype: {dtype}')
+  # NOTE: Gemma uses -0.7 * dtype_max
+  return -0.5 * dtype_max
+
+
+def reduce_same(seq: Sequence[Any]) -> Any:
+  """Reduces a list of same values to a single value."""
+  first = seq[0]
+  for x in seq[1:]:
+    if x != first:
+      raise ValueError(f'Sequence must be same. {x=} != {first=}')
+  return first
+
+
+def pad_to_len(
+    arr: np.ndarray, seq_len: int, pad_value: Any, dtype: Any
+) -> np.ndarray:
+  """Pads array to target length. Does not truncate."""
+  if len(arr) >= seq_len:
+    return arr.astype(dtype)
+  pad_width = seq_len - len(arr)
+  return np.pad(arr, (0, pad_width), constant_values=pad_value).astype(dtype)

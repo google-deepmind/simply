@@ -60,7 +60,7 @@ _MESH_SHAPE = flags.DEFINE_list(
 )
 
 _CKPT_DIR = flags.DEFINE_string(
-    'ckpt_dir', None, 'Path to the checkpoints directory.', required=True
+    'ckpt_dir', None, 'Path to the checkpoints directory.'
 )
 
 _CKPT_STEP = flags.DEFINE_integer(
@@ -105,8 +105,14 @@ _PREFILL_SIZE = flags.DEFINE_integer(
     ' set it to frame the jit into limited programs.',
 )
 
+_MAX_SEQ_LEN = flags.DEFINE_integer(
+    'max_seq_len', 65537, 'Max sequence length for the model.'
+)
+
 _MAX_DECODE_STEPS = flags.DEFINE_integer(
-    'max_decode_steps', 32768, 'Max decode steps for the model.'
+    'max_decode_steps',
+    np.iinfo(np.int32).max // 2,
+    'Max decode steps for the model.',
 )
 
 _INTERMEDIATE_DECODE_STEPS = flags.DEFINE_integer(
@@ -176,19 +182,39 @@ def main(argv: Sequence[str]) -> None:
       _EXPERIMENT_CONFIG.value
   )
 
+  config_replace_kwargs = {}
   if mesh_shape := _MESH_SHAPE.value:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_default_mesh_shape(
-      mesh_shape=mesh_shape, axis_names=config.sharding_config.mesh_axis_names
-  )
+  sharding.set_mesh(mesh_shape)
+  config_replace_kwargs['mesh_shape'] = mesh_shape
+
+  if vocab_name := _VOCAB_NAME.value:
+    config_replace_kwargs['vocab_name'] = vocab_name
+  if batch_size := _BATCH_SIZE.value:
+    config_replace_kwargs['batch_size'] = batch_size
+  if activation_dtype := _ACTIVATION_DTYPE.value:
+    config_replace_kwargs['activation_dtype_name'] = activation_dtype
+  if checkpoint_dir := _CKPT_DIR.value:
+    config_replace_kwargs['init_ckpt_dir'] = checkpoint_dir
+    config_replace_kwargs['init_ckpt_step'] = _CKPT_STEP.value
+    if (ckpt_format := _CKPT_FORMAT.value) is not None:
+      config_replace_kwargs['init_ckpt_format'] = ckpt_format
+
+  decoding_sharding_config = getattr(config, 'decoding_sharding_config', None)
+  if decoding_sharding_config is None:
+    decoding_sharding_config = config.sharding_config.to_decoding_sharding()
+
+  if not (lm_format_name := _LM_FORMAT.value):
+    lm_format_name = getattr(config, 'lm_format_name')
 
   config = dataclasses.replace(
       config,
       use_scan=False,
       use_remat=False,
-      activation_dtype_name=_ACTIVATION_DTYPE.value,
+      sharding_config=decoding_sharding_config,
+      **config_replace_kwargs,
   )
 
   experiment_dir = _EXPERIMENT_DIR.value
@@ -198,7 +224,7 @@ def main(argv: Sequence[str]) -> None:
 
   model = model_lib.TransformerLM(config)
   helper.save_config_info(config, config.sharding_config, model=model)
-  helper.set_notes('Initializing model.')
+  experiment_helper.set_notes('Initializing model.')
 
   def _init_fn():
     params = model.init(jax.random.key(0))
@@ -209,13 +235,13 @@ def main(argv: Sequence[str]) -> None:
     return {'params': params}
 
   abstract_state = common.eval_abstract_output(_init_fn)
-  state = checkpoint_lib.load_checkpoint_from_dir(
-      _CKPT_DIR.value,
+  model_state = checkpoint_lib.load_checkpoint_from_dir(
+      config.init_ckpt_dir,
       abstract_state,
-      _CKPT_STEP.value,
-      ckpt_format=_CKPT_FORMAT.value,
+      config.init_ckpt_step,
+      ckpt_format=config.init_ckpt_format,
   )
-  params = state['params']
+  params = model_state['params']
 
   if not (vocab_name := _VOCAB_NAME.value):
     vocab_name = config.vocab_name
@@ -225,12 +251,14 @@ def main(argv: Sequence[str]) -> None:
       temperature=_TEMPERATURE.value,
       top_k=_TOP_K.value,
       top_p=_TOP_P.value,
+      max_seq_len=_MAX_SEQ_LEN.value,
       max_decode_steps=_MAX_DECODE_STEPS.value,
       num_samples=1,
       intermediate_decode_steps=_INTERMEDIATE_DECODE_STEPS.value,
+      prefill_size=_PREFILL_SIZE.value,
   )
 
-  lm_format = lm_format_lib.LMFormatRegistry.get_instance(_LM_FORMAT.value)
+  lm_format = lm_format_lib.LMFormatRegistry.get_instance(lm_format_name)
   evaluation = evaluation_lib.EvaluationRegistry.get_instance(_EVALUATION.value)
 
   input_processor = sampling_lib.create_input_processor(
@@ -279,7 +307,9 @@ def main(argv: Sequence[str]) -> None:
   logging.info('num_past_examples=%d', num_past_examples)
   logging.info('prng_key=%s', prng_key)
 
-  helper.set_notes(f'Starting to decode from example {num_past_examples}.')
+  experiment_helper.set_notes(
+      f'Starting to decode from example {num_past_examples}.'
+  )
 
   history = []
   total_generation_time = 0.0
@@ -299,7 +329,6 @@ def main(argv: Sequence[str]) -> None:
     prng_key, subkey = jax.random.split(prng_key)
     sampling_outputs = lm_interface.generate(
         sampling_inputs,
-        prefill_size=_PREFILL_SIZE.value,
         prng_key=subkey,
         batch_size=_BATCH_SIZE.value,
         scoring_inputs=False,
@@ -371,7 +400,7 @@ def main(argv: Sequence[str]) -> None:
         avg_generation_time = total_generation_time / (
             num_past_examples - num_saved_examples
         )
-        helper.set_notes(
+        experiment_helper.set_notes(
             f'Completed {num_past_examples}/{num_total_examples} examples,'
             f' {avg_generation_time:.2f} s/example'
         )
@@ -422,7 +451,7 @@ def main(argv: Sequence[str]) -> None:
     total = results['total']
     total_generation_time = results['total_generation_time']
 
-    helper.set_notes(
+    experiment_helper.set_notes(
         f'Finished: accuracy is {correct=}/{total=} ='
         f' {correct / total * 100:.2f}%,'
         f' {total_generation_time / total:.2f} s/example'

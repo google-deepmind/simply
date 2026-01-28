@@ -13,12 +13,15 @@
 # limitations under the License.
 
 from absl.testing import absltest
+from absl.testing import parameterized
+import jax
+import jax.numpy as jnp
 import numpy as np
 from simply.utils import pytree
 from simply.utils import sampling_lib
 
 
-class SamplingLibTest(absltest.TestCase):
+class SamplingLibTest(parameterized.TestCase):
 
   def test_decoding_schedule(self):
     schedule = sampling_lib.DecodingSchedule(
@@ -49,15 +52,15 @@ class SamplingLibTest(absltest.TestCase):
   def test_processed_input_batching(self):
     input1 = sampling_lib.ProcessedInput(
         tokens=[1, 2],
-        extra_inputs={"extra_field": np.ones((1, 3))},
+        extra_inputs={'extra_field': np.ones((1, 3))},
     )
     input2 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3, 4],
-        extra_inputs={"extra_field": np.ones((2, 2))},
+        extra_inputs={'extra_field': np.ones((2, 2))},
     )
     input3 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3],
-        extra_inputs={"extra_field": np.ones((3, 1))},
+        extra_inputs={'extra_field': np.ones((3, 1))},
     )
 
     batch = sampling_lib.ProcessedInputBatch.from_unpadded_inputs(
@@ -80,19 +83,84 @@ class SamplingLibTest(absltest.TestCase):
     )
     np.testing.assert_equal(batch.lengths, np.array([2, 4, 3]))
     np.testing.assert_equal(
-        batch.extra_inputs["extra_field"], expected_extra_field
+        batch.extra_inputs['extra_field'], expected_extra_field
     )
 
   def test_chunk_dump_and_load(self):
     chunk = sampling_lib.Chunk(
         type=sampling_lib.Chunk.Type.TEXT,
-        content="chunk",
+        content='chunk',
     )
     tmp_path = self.create_tempfile().full_path
     pytree.save_pytree_to(chunk, tmp_path)
     loaded = pytree.load_pytree_from(tmp_path)
     self.assertEqual(chunk, loaded)
 
+  @parameterized.named_parameters(
+      ('top_k=1', 1), ('top_k=5', 5), ('top_k=10', 10), ('top_k=12', 12)
+  )
+  def test_top_k_mask(self, top_k: int):
+    logits = jax.random.normal(jax.random.key(0), (5, 4, 10))
+    mask = sampling_lib.top_k_mask(logits, top_k=top_k)
+    self.assertEqual(mask.shape, logits.shape)
+    self.assertEqual(mask.dtype, jnp.bool)
+    np.testing.assert_array_equal(
+        jnp.sum(mask, initial=0, axis=-1), min(top_k, 10)
+    )
+    dtype = logits.dtype
+    np.testing.assert_array_less(
+        jnp.max(logits, axis=-1, initial=jnp.finfo(dtype).min, where=~mask),
+        jnp.min(logits, axis=-1, initial=jnp.finfo(dtype).max, where=mask),
+    )
 
-if __name__ == "__main__":
+  @parameterized.named_parameters(
+      ('top_p=0.0', 0.0),
+      ('top_p=0.2', 0.2),
+      ('top_p=0.5', 0.5),
+      ('top_p=0.8', 0.8),
+      ('top_p=1.0', 1.0),
+  )
+  def test_top_p_mask(self, top_p: float):
+    logits = jax.random.normal(jax.random.key(0), (5, 4, 10))
+    probs = jax.nn.softmax(logits, axis=-1)
+    mask = sampling_lib.top_p_mask(logits, top_p=top_p)
+    self.assertEqual(mask.shape, logits.shape)
+    self.assertEqual(mask.dtype, jnp.bool)
+    np.testing.assert_array_less(
+        top_p, jnp.sum(probs, axis=-1, initial=0, where=mask) + 1e-6
+    )
+    dtype = logits.dtype
+    np.testing.assert_array_less(
+        jnp.max(logits, axis=-1, initial=jnp.finfo(dtype).min, where=~mask),
+        jnp.min(logits, axis=-1, initial=jnp.finfo(dtype).max, where=mask),
+    )
+
+  def test_sample_from_logits(self):
+    logits = jax.random.normal(jax.random.key(0), (5, 3, 10))
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(0), logits, top_k=3, top_p=0.5
+    )
+    tokens_onehot = jax.nn.one_hot(tokens, 10, dtype=jnp.bool)
+    self.assertEqual(tokens.shape, logits.shape[:-1])
+    self.assertEqual(logprobs.shape, logits.shape[:-1])
+    np.testing.assert_array_equal(
+        tokens_onehot & sampling_lib.top_k_mask(logits, top_k=3), tokens_onehot
+    )
+    np.testing.assert_array_equal(
+        tokens_onehot & sampling_lib.top_p_mask(logits, top_p=0.5),
+        tokens_onehot,
+    )
+
+  def test_compute_log_likelihood(self):
+    logits = jax.random.normal(jax.random.key(0), (5, 3, 10))
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(0), logits, top_k=3, top_p=0.5
+    )
+    log_likelihood = sampling_lib.compute_log_likelihood(
+        logits, tokens, top_k=3, top_p=0.5
+    )
+    np.testing.assert_array_equal(log_likelihood, logprobs)
+
+
+if __name__ == '__main__':
   absltest.main()

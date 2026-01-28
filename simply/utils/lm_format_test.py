@@ -120,29 +120,5 @@ class LmFormatTest(absltest.TestCase):
         ),
     )
 
-  def test_gemini_chat(self):
-    lm_format = lm_format_lib.GeminiChat()
-    self.assertEqual(
-        lm_format.format([
-            dict(role='system', content='test'),
-            dict(role='user', content='foo'),
-            dict(role='assistant', content='bar'),
-        ]),
-        (
-            '<ctrl99>system\ntest<ctrl100>\n'
-            '<ctrl99>user\nfoo<ctrl100>\n'
-            '<ctrl99>model\nbar<ctrl100>\n<ctrl99>model\n'
-        ),
-    )
-    self.assertEqual(
-        lm_format.format([
-            dict(role='user', content='bar'),
-        ]),
-        (
-            '<ctrl99>user\nbar<ctrl100>\n<ctrl99>model\n'
-        ),
-    )
-
-
 if __name__ == '__main__':
   absltest.main()

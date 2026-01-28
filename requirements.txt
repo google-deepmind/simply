@@ -10,3 +10,5 @@ tensorboard
 sympy
 pylatexenc
 pytest
+tensorboardX
+deprecated
