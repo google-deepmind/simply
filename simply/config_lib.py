@@ -1882,7 +1882,6 @@ def lm_test():
       # Data config
       num_train_steps=50,
       batch_size=4,
-      vocab_size=32_000,
       seq_len=64,
       prefetch_num_workers=0,
       prefetch_per_worker_buffer_size=2,
