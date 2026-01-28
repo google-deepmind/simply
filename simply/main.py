@@ -13,19 +13,6 @@
 # limitations under the License.
 """Simply a language model."""
 
-# Force tensorflow to ignore the GPUs to avoid conflicts with jax.
-# 1. Import TensorFlow FIRST
-import tensorflow as tf
-# 2. Configure TF's device visibility IMMEDIATELY
-# This hides the GPU from TensorFlow and all libraries that use it.
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-  try:
-    tf.config.set_visible_devices([], 'GPU')
-    print('GPU is now hidden from TensorFlow.')
-  except RuntimeError as e:
-    print(e)
-
 import dataclasses
 import json
 import os
