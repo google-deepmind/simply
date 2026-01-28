@@ -73,6 +73,7 @@ OPENMIX_V3_100864_V1_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r10
 OPENMIX_V3_100864_V2_VOCAB = os.path.join(VOCABS_DIR, 'spm-100864-openmix_v3-r100-v2-08312024.model')
 GEMMA2_VOCAB = os.path.join(VOCABS_DIR, 'gemma2_tokenizer.model')
 GEMMA3_VOCAB = os.path.join(VOCABS_DIR, 'gemma3_cleaned_262144_v2.spiece.model')
+QWEN3_VOCAB = os.path.join(VOCABS_DIR, 'Qwen3')
 
 OPENMIX_V1_VOCABS = [
     ('vb100864_openmix_v1', OPENMIX_V1_100864_VOCAB),
@@ -107,6 +108,11 @@ tokenization.TokenizerRegistry.register(
         name='vb262144_gemma3'
 )
 
+# Qwen vocabs
+tokenization.TokenizerRegistry.register(
+    lambda: tokenization.HuggingFaceVocab(QWEN3_VOCAB),
+    name='Qwen3',
+)
 
 ################################################################################
 # Registries.
