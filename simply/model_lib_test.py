@@ -634,6 +634,54 @@ class ModelLibTest(parameterized.TestCase):
       self.assertLen(so.input_token_ids, 4)
       self.assertLen(so.input_token_scores, 3)
 
+  def test_lm_interface_generate_stream(self):
+    """Test streaming generation produces consistent results with generate()."""
+    vocab = tokenization.TestVocab([str(i) for i in range(60)])
+    prng_key = jax.random.key(0)
+    params = self.tfm_lm.init(prng_key)
+    max_decode_steps = 10
+    sampling_params = model_lib.SamplingParams(
+        top_k=-1, top_p=1.0, temperature=0.0,  # Use temp=0 for determinism
+        max_decode_steps=max_decode_steps)
+    lm_interface = model_lib.LMInterface(self.tfm_lm, params, vocab)
+
+    # Get streaming output
+    streaming_tokens = []
+    for token in lm_interface.generate_stream(
+        input_text='1 2 3',
+        prng_key=jax.random.key(seed=25),
+        sampling_params=sampling_params,
+    ):
+      streaming_tokens.append(token)
+      # Verify token structure
+      self.assertIsInstance(token.token_id, int)
+      self.assertIsInstance(token.token_text, str)
+      self.assertIsInstance(token.token_logprob, float)
+      self.assertIsInstance(token.token_score, float)
+      self.assertIsInstance(token.position, int)
+      self.assertFalse(token.is_input)  # All yielded tokens are output
+
+    # Should have output tokens
+    self.assertGreater(len(streaming_tokens), 0)
+
+    # Check is_final is set correctly on last token
+    if streaming_tokens:
+      self.assertTrue(streaming_tokens[-1].is_final)
+
+    # Verify token IDs match non-streaming generation
+    outputs = lm_interface.generate(
+        input_text='1 2 3',
+        prng_key=jax.random.key(seed=25),
+        sampling_params=sampling_params,
+    )
+    outputs = cast(list[model_lib.SamplingOutput], outputs)
+    streaming_token_ids = [t.token_id for t in streaming_tokens]
+
+    self.assertEqual(
+        streaming_token_ids[:len(outputs[0].output_token_ids)],
+        outputs[0].output_token_ids[:len(streaming_token_ids)],
+    )
+
   def test_lm_interface_batch(self):
     vocab = tokenization.TestVocab([str(i) for i in range(20)])
     prng_key = jax.random.key(0)
