@@ -3865,7 +3865,9 @@ class LMInterface:
 
         is_eos = token_id in eos_ids_set
         num_output_tokens += 1
-        is_final = is_eos or num_output_tokens >= max_output_tokens
+        # Mark as final if: eos, max tokens reached, or loop will exit
+        will_loop_exit = position >= decoding_schedule.end_position
+        is_final = is_eos or num_output_tokens >= max_output_tokens or will_loop_exit
 
         # Decode token to text
         try:
