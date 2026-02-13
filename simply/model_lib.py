@@ -613,6 +613,7 @@ class MoEFeedForward(FeedForward):
   tile_model_dim: int = 128
   tile_expand_dim: int = 128
   gmm_impl: str = 'ragged_dot'
+  routing_mode: str = 'token_choice'
 
   def setup(self):
     if self.ffn_use_bias:
@@ -688,45 +689,68 @@ class MoEFeedForward(FeedForward):
     # router_logits: [batch_size, seq_len, num_experts]
     router_logits = self.router.apply(params['router'], inputs)
     router_logits = router_logits.astype(jnp.float32)
-    # router_probs: [batch_size, seq_len, num_experts]
+    # Both routing modes use the same softmax router probs,
+    # they just consume them differently: token choice does
+    # topk per token, expert choice does topk per expert.
     router_probs = jax.nn.softmax(router_logits, axis=-1)
-    if self.num_experts_per_token == 1:
-      # Apply `softmax => topk` when k == 1 to avoid zero gradient
-      # on the router logits.
-      # selected_router_probs, selected_indices:
-      # [batch_size, seq_len, num_experts_per_token]
-      selected_router_probs, selected_indices = jax.lax.top_k(
-          router_probs, k=self.num_experts_per_token
-      )
+
+    if self.routing_mode not in ('token_choice', 'expert_choice'):
+      raise ValueError(
+          f'Unknown routing_mode: {self.routing_mode!r}')
+
+    if self.routing_mode == 'expert_choice':
+      outputs, ffn_extra_output = (
+          self._apply_expert_choice_moe(
+              params,
+              inputs,
+              router_probs=router_probs,
+              inputs_mask=inputs_mask,
+          ))
     else:
-      # Perform `topk => softmax` to get a normalized probability distribution.
-      # selected_router_logits, selected_indices:
-      # [batch_size, seq_len, num_experts_per_token]
-      selected_router_logits, selected_indices = jax.lax.top_k(
-          router_logits, k=self.num_experts_per_token
+      if self.num_experts_per_token == 1:
+        # Apply `softmax => topk` when k == 1 to avoid zero
+        # gradient on the router logits.
+        # selected_router_probs, selected_indices:
+        # [batch_size, seq_len, num_experts_per_token]
+        selected_router_probs, selected_indices = (
+            jax.lax.top_k(
+                router_probs,
+                k=self.num_experts_per_token,
+            ))
+      else:
+        # Perform `topk => softmax` to get a normalized
+        # probability distribution.
+        # selected_router_logits, selected_indices:
+        # [batch_size, seq_len, num_experts_per_token]
+        selected_router_logits, selected_indices = (
+            jax.lax.top_k(
+                router_logits,
+                k=self.num_experts_per_token,
+            ))
+        selected_router_probs = jax.nn.softmax(
+            selected_router_logits, axis=-1)
+      selected_router_probs = jnp.asarray(
+          selected_router_probs, self.activation_dtype
       )
-      selected_router_probs = jax.nn.softmax(selected_router_logits, axis=-1)
-    selected_router_probs = jnp.asarray(
-        selected_router_probs, self.activation_dtype
-    )
-    router_probs = jnp.asarray(router_probs, self.activation_dtype)
-    if self.expert_capacity_factor is None:
-      outputs, ffn_extra_output = self._apply_sparse_moe(
-          params,
-          inputs,
-          selected_indices=selected_indices,
-          selected_weights=selected_router_probs,
-          inputs_mask=inputs_mask,
-      )
-    else:
-      outputs, ffn_extra_output = self._apply_dense_moe(
-          params,
-          inputs,
-          selected_indices=selected_indices,
-          selected_weights=selected_router_probs,
-          inputs_mask=inputs_mask,
-      )
+      if self.expert_capacity_factor is None:
+        outputs, ffn_extra_output = self._apply_sparse_moe(
+            params,
+            inputs,
+            selected_indices=selected_indices,
+            selected_weights=selected_router_probs,
+            inputs_mask=inputs_mask,
+        )
+      else:
+        outputs, ffn_extra_output = self._apply_dense_moe(
+            params,
+            inputs,
+            selected_indices=selected_indices,
+            selected_weights=selected_router_probs,
+            inputs_mask=inputs_mask,
+        )
     load = ffn_extra_output['load']
+    router_probs = jnp.asarray(
+        router_probs, self.activation_dtype)
     extra_output.update(ffn_extra_output)
     router_entropy = - jnp.sum(router_probs * jnp.where(
         router_probs > 0, jnp.log(router_probs), 0.0), axis=-1)
@@ -738,7 +762,10 @@ class MoEFeedForward(FeedForward):
         ),
         'gini': jnp.sum(load ** 2) * self.num_experts - 1,
     })
-    if self.lbl_loss_weight > 0:
+    # Expert choice guarantees uniform load across experts, so
+    # the load balancing loss would just add a constant term.
+    if (self.lbl_loss_weight > 0
+        and self.routing_mode != 'expert_choice'):
       if inputs_mask is None:
         inputs_mask = jnp.ones(shape=x.shape[:2], dtype=self.activation_dtype)
       else:
@@ -762,6 +789,119 @@ class MoEFeedForward(FeedForward):
         outputs, self.sharding_config.activation_partition
     )
     return outputs, extra_output
+
+  def _apply_expert_choice_moe(
+      self,
+      params: PyTree,
+      inputs: Array,
+      router_probs: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    """Expert choice routing (Zhou et al., 2022).
+
+    Instead of each token picking its top k experts, each expert
+    picks its top C tokens from the full sequence. This flips
+    the selection axis: the router prob matrix is transposed
+    before topk. Every expert ends up with the same number of
+    tokens, so load is perfectly balanced without needing
+    lbl_loss.
+
+    Uses dense dispatch (one_hot + einsum), same approach as
+    _apply_dense_moe. Could be extended to sparse dispatch later.
+    """
+    extra_outputs = {}
+    batch_size, seq_len, _ = inputs.shape
+    num_tokens = batch_size * seq_len
+
+    # In token choice, each of the T tokens picks k experts,
+    # giving k*T total (token, expert) assignments. To keep the
+    # same total work, each of the E experts gets a budget of
+    # C = k*T/E tokens.
+    expert_capacity = max(
+        1,
+        int(self.num_experts_per_token * num_tokens
+            / self.num_experts),
+    )
+
+    inputs = einops.rearrange(inputs, 'b s d -> (b s) d')
+    router_probs_flat = einops.rearrange(
+        router_probs, 'b s e -> (b s) e')
+
+    # Kill padding token probs so experts don't burn capacity
+    # on them. Without this, pad tokens can outcompete real
+    # tokens for expert slots.
+    if inputs_mask is not None:
+      token_mask = einops.rearrange(
+          inputs_mask, 'b s -> (b s) 1')
+      router_probs_flat = router_probs_flat * token_mask
+
+    # Transpose to [E, T] so top_k operates per expert across
+    # all tokens, instead of per token across experts.
+    expert_probs = router_probs_flat.T
+
+    # Each expert independently selects its top C tokens.
+    # selected_probs[e, c] = router prob for expert e's c'th
+    # pick, selected_indices[e, c] = which token it picked.
+    selected_probs, selected_indices = jax.lax.top_k(
+        expert_probs, k=expert_capacity)
+    selected_probs = jnp.asarray(
+        selected_probs, self.activation_dtype)
+
+    # Every expert processes exactly C tokens, so load is
+    # trivially 1/E for each. The downstream metrics code
+    # still expects a load vector so we provide one.
+    extra_outputs['load'] = jnp.ones(
+        self.num_experts, dtype=self.activation_dtype
+    ) / self.num_experts
+
+    # One hot encode token indices for einsum gather.
+    # dispatch_onehot[e, c, t] = 1 iff expert e picked token t
+    # as its c'th slot.
+    dispatch_onehot = jax.nn.one_hot(
+        selected_indices, num_tokens,
+        dtype=self.activation_dtype)
+
+    # Gather selected tokens into expert buffers.
+    # expert_inputs[e, c, d] = input embedding of the token
+    # sitting in expert e's c'th slot.
+    expert_inputs = jnp.einsum(
+        'ect,td->ecd', dispatch_onehot, inputs)
+    expert_inputs = jnp.asarray(
+        expert_inputs, self.activation_dtype)
+
+    # Expert FFN, same as _apply_dense_moe.
+    projected_inputs = self.ffn_0.apply(
+        params['ffn_0'], expert_inputs)
+    activation_fn = registry.FunctionRegistry.get(
+        self.ffn_activation)
+    if self.use_gated_activation_in_ffn:
+      gate = self.ffn_0_gate.apply(
+          params['ffn_0_gate'], expert_inputs)
+      gate = jnp.asarray(
+          activation_fn(gate), self.activation_dtype)
+      middle = gate * projected_inputs
+    else:
+      middle = jnp.asarray(
+          activation_fn(projected_inputs),
+          self.activation_dtype,
+      )
+    expert_outputs = self.ffn_1.apply(
+        params['ffn_1'], middle)
+
+    # Scatter back: weight each expert output by the router
+    # prob that caused the selection, then sum across experts.
+    # If a token was picked by multiple experts it gets a
+    # weighted combination; if picked by none it stays zero.
+    dispatch_weights = jnp.einsum(
+        'ec,ect->ect', selected_probs, dispatch_onehot)
+    outputs = jnp.einsum(
+        'ecd,ect->td', expert_outputs, dispatch_weights)
+
+    outputs = einops.rearrange(
+        outputs, '(b s) d -> b s d',
+        b=batch_size, s=seq_len,
+    )
+    return outputs, extra_outputs
 
   def _apply_sparse_moe(
       self,
@@ -1562,6 +1702,7 @@ class TransformerBlock(module.SimplyModule):
   expert_capacity_factor: float | None = 0.0
   lbl_loss_weight: float = 0.0
   router_z_loss_weight: float = 0.0
+  routing_mode: str = 'token_choice'
   # Mixed precision related.
   activation_dtype: DTypeLike = 'bfloat16'
   # Below are for experimental usage.
@@ -1688,6 +1829,7 @@ class TransformerBlock(module.SimplyModule):
           expert_capacity_factor=self.expert_capacity_factor,
           router_z_loss_weight=self.router_z_loss_weight,
           lbl_loss_weight=self.lbl_loss_weight,
+          routing_mode=self.routing_mode,
           model_dim=self.model_dim,
           expand_factor=self.expand_factor,
           use_gated_activation_in_ffn=self.use_gated_activation_in_ffn,
@@ -1887,6 +2029,7 @@ class TransformerLM(module.SimplyModule):
           num_experts_per_token=config.num_experts_per_token,
           lbl_loss_weight=config.lbl_loss_weight,
           router_z_loss_weight=config.router_z_loss_weight,
+          routing_mode=config.routing_mode,
           tile_batch_seq=config.tile_batch_seq,
           tile_model_dim=config.tile_model_dim,
           tile_expand_dim=config.tile_expand_dim,

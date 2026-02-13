@@ -315,6 +315,7 @@ class BaseExperimentConfig(ExperimentConfig):
   tile_model_dim: int = 1024
   tile_expand_dim: int = 1024
   gmm_impl: str = 'ragged_dot'
+  routing_mode: str = 'token_choice'
   global_total_num_pages: int = 0
   local_total_num_pages: int = 0
   page_size: int = 0
@@ -1979,6 +1980,39 @@ def lm_rl_test():
               (20, ('<', 'accuracy', 0.5)),
           )
       ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def lm_moe_test():
+  """Tiny token-choice MoE config for local testing."""
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      sharding_config=moe_sharding(),
+      use_moe=True,
+      num_experts=4,
+      num_experts_per_token=2,
+      expert_capacity_factor=None,
+      lbl_loss_weight=0.01,
+      ffn_use_bias=False,
+  )
+
+
+@ExperimentConfigRegistry.register
+def lm_moe_expert_choice_test():
+  """Tiny expert-choice MoE config for local testing."""
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      sharding_config=moe_sharding(),
+      use_moe=True,
+      num_experts=4,
+      num_experts_per_token=1,
+      expert_capacity_factor=None,
+      routing_mode='expert_choice',
+      lbl_loss_weight=0.0,
+      ffn_use_bias=False,
   )
 
 

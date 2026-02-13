@@ -1285,6 +1285,73 @@ def simple_moe(
   return outputs
 
 
+def simple_expert_choice_moe(
+    params, inputs, inputs_mask,
+    num_experts_per_token, num_experts,
+    ffn_activation,
+    use_gated_activation_in_ffn,
+    activation_dtype):
+  # Reference expert choice impl for equivalence testing. Same
+  # math as _apply_expert_choice_moe but with raw param einsums
+  # instead of going through the module apply() machinery.
+  params = model_lib.get_raw_arrays(params)
+  router_w = jnp.asarray(
+      params['router']['w'], activation_dtype)
+  router_logits = jnp.einsum(
+      'ie,bsi->bse', router_w, inputs)
+  router_probs = jax.nn.softmax(router_logits, axis=-1)
+  b, s, e = router_probs.shape
+  num_tokens = b * s
+  expert_capacity = max(
+      1, num_experts_per_token * num_tokens // num_experts)
+  # Flip to [E, T] so top_k selects per expert.
+  probs_flat = router_probs.reshape(num_tokens, e)
+  if inputs_mask is not None:
+    probs_flat = (
+        probs_flat * inputs_mask.reshape(num_tokens, 1))
+  expert_probs = probs_flat.T  # [E, T]
+  selected_probs, selected_indices = jax.lax.top_k(
+      expert_probs, k=expert_capacity)
+  selected_probs = jnp.asarray(
+      selected_probs, activation_dtype)
+  inputs_flat = inputs.reshape(num_tokens, -1)
+  # One hot dispatch, gather, FFN, weighted scatter.
+  dispatch_onehot = jax.nn.one_hot(
+      selected_indices, num_tokens, dtype=activation_dtype)
+  expert_inputs = jnp.einsum(
+      'ect,td->ecd', dispatch_onehot, inputs_flat)
+  # Apply expert FFNs with raw weight einsums.
+  ffn0_w = jnp.asarray(
+      params['ffn_0']['w'], activation_dtype)
+  projected = jnp.einsum(
+      'eio,ebi->ebo', ffn0_w, expert_inputs)
+  activation_fn = registry.FunctionRegistry.get(
+      ffn_activation)
+  if use_gated_activation_in_ffn:
+    ffn0_gate_w = jnp.asarray(
+        params['ffn_0_gate']['w'], activation_dtype)
+    gate = jnp.einsum(
+        'eio,ebi->ebo', ffn0_gate_w, expert_inputs)
+    middle = (
+        jnp.asarray(activation_fn(gate), activation_dtype)
+        * projected)
+  else:
+    middle = jnp.asarray(
+        activation_fn(projected), activation_dtype)
+  ffn1_w = jnp.asarray(
+      params['ffn_1']['w'], activation_dtype)
+  expert_outputs = jnp.einsum(
+      'eio,ebi->ebo', ffn1_w, middle)
+  dispatch_weights = jnp.einsum(
+      'ec,ect->ect', selected_probs, dispatch_onehot)
+  outputs = jnp.einsum(
+      'ecd,ect->td', expert_outputs, dispatch_weights)
+  outputs = outputs.reshape(b, s, -1)
+  if inputs_mask is not None:
+    outputs = outputs * inputs_mask[..., None]
+  return outputs
+
+
 class MoETest(parameterized.TestCase):
 
   @parameterized.named_parameters(
@@ -1397,6 +1464,147 @@ class MoETest(parameterized.TestCase):
     jax.tree.map(
         lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2),
         grad1, grad2)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='_expert_choice_no_gate',
+          use_gated_activation_in_ffn=False,
+          num_experts=4,
+          num_experts_per_token=1,
+      ),
+      dict(
+          testcase_name='_expert_choice_gated',
+          use_gated_activation_in_ffn=True,
+          num_experts=4,
+          num_experts_per_token=2,
+      ),
+      dict(
+          testcase_name='_expert_choice_single_expert',
+          use_gated_activation_in_ffn=True,
+          num_experts=1,
+          num_experts_per_token=1,
+      ),
+  )
+  def test_expert_choice_moe_equivalence(
+      self, use_gated_activation_in_ffn, num_experts,
+      num_experts_per_token,
+      activation_dtype='bfloat16',
+  ):
+    sharding_config = config_lib.moe_sharding()
+    sharding_lib.set_default_mesh_shape(
+        mesh_shape=(1, 1, 1, 1),
+        axis_names=sharding_config.mesh_axis_names)
+    batch_size, seq_len, model_dim, expand_factor = (
+        2, 4, 4, 2)
+    segment_ids = jnp.array(
+        [[1, 2, 3, 0], [1, 0, 0, 1]])
+    key = jax.random.PRNGKey(0)
+    input_key, prng_key = jax.random.split(key)
+    inputs = jax.random.normal(
+        input_key,
+        shape=(batch_size, seq_len, model_dim),
+        dtype=activation_dtype,
+    )
+    inputs_mask = segment_ids != 0
+
+    moe_ffn = model_lib.MoEFeedForward(
+        model_dim=model_dim,
+        expand_factor=expand_factor,
+        sharding_config=sharding_config,
+        num_experts=num_experts,
+        num_experts_per_token=num_experts_per_token,
+        expert_capacity_factor=None,
+        ffn_use_bias=False,
+        use_gated_activation_in_ffn=(
+            use_gated_activation_in_ffn),
+        activation_dtype=activation_dtype,
+        routing_mode='expert_choice',
+    )
+
+    params = moe_ffn.init(prng_key)
+    moe_output, _ = moe_ffn.apply(
+        params, inputs, inputs_mask=inputs_mask)
+    simple_ec_fn = functools.partial(
+        simple_expert_choice_moe,
+        num_experts_per_token=num_experts_per_token,
+        num_experts=num_experts,
+        ffn_activation=moe_ffn.ffn_activation,
+        use_gated_activation_in_ffn=(
+            use_gated_activation_in_ffn),
+        activation_dtype=activation_dtype,
+    )
+    simple_ec_output = simple_ec_fn(
+        params, inputs, inputs_mask=inputs_mask)
+    self.assertEqual(
+        moe_output.shape, simple_ec_output.shape)
+    self.assertEqual(
+        moe_output.dtype, simple_ec_output.dtype)
+    np.testing.assert_allclose(
+        moe_output, simple_ec_output,
+        rtol=1e-2, atol=1e-2)
+
+    # Also check that gradients match, not just forward outputs.
+    def loss1(params, inputs, inputs_mask):
+      out, _ = moe_ffn.apply(
+          params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(out) / (batch_size * seq_len)
+
+    def loss2(params, inputs, inputs_mask):
+      out = simple_ec_fn(
+          params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(out) / (batch_size * seq_len)
+
+    grad1 = jax.grad(loss1)(
+        params, inputs, inputs_mask)
+    grad2 = jax.grad(loss2)(
+        params, inputs, inputs_mask)
+    jax.tree.map(
+        lambda x, y: np.testing.assert_allclose(
+            x, y, rtol=1e-2, atol=1e-2),
+        grad1, grad2)
+
+  def test_token_choice_routing_mode_regression(self):
+    """Explicit routing_mode='token_choice' matches default."""
+    sharding_config = config_lib.moe_sharding()
+    sharding_lib.set_default_mesh_shape(
+        mesh_shape=(1, 1, 1, 1),
+        axis_names=sharding_config.mesh_axis_names)
+    batch_size, seq_len, model_dim, expand_factor = (
+        2, 4, 4, 2)
+    segment_ids = jnp.array(
+        [[1, 2, 3, 0], [1, 0, 0, 1]])
+    key = jax.random.PRNGKey(0)
+    input_key, prng_key = jax.random.split(key)
+    inputs = jax.random.normal(
+        input_key,
+        shape=(batch_size, seq_len, model_dim),
+        dtype='bfloat16',
+    )
+    inputs_mask = segment_ids != 0
+
+    common_kwargs = dict(
+        model_dim=model_dim,
+        expand_factor=expand_factor,
+        sharding_config=sharding_config,
+        num_experts=4,
+        num_experts_per_token=2,
+        expert_capacity_factor=None,
+        ffn_use_bias=False,
+        use_gated_activation_in_ffn=True,
+        activation_dtype='bfloat16',
+    )
+    moe_default = model_lib.MoEFeedForward(
+        **common_kwargs)
+    moe_explicit = model_lib.MoEFeedForward(
+        routing_mode='token_choice', **common_kwargs)
+
+    params = moe_default.init(prng_key)
+    out_default, _ = moe_default.apply(
+        params, inputs, inputs_mask=inputs_mask)
+    out_explicit, _ = moe_explicit.apply(
+        params, inputs, inputs_mask=inputs_mask)
+    np.testing.assert_array_equal(
+        out_default, out_explicit)
 
 
 if __name__ == '__main__':
