@@ -205,6 +205,19 @@ class RLTrainingExampleBatch:
     return self.input_tokens.shape[0]
 
   def pad_sequences(self, to_length):
+    extra_inputs = self.extra_inputs
+    if extra_inputs:
+      extra_inputs = dict(extra_inputs)
+      if 'routing_indices' in extra_inputs:
+        extra_inputs['routing_indices'] = {
+            k: model_lib.pad_to_along_axis(v, to_length, axis=0)
+            for k, v in extra_inputs['routing_indices'].items()
+        }
+      if 'sampling_mask_indices' in extra_inputs:
+        extra_inputs['sampling_mask_indices'] = (
+            model_lib.pad_to_along_axis(
+                extra_inputs['sampling_mask_indices'],
+                to_length, axis=0))
     return dataclasses.replace(
         self,
         input_tokens=model_lib.pad_to_along_axis(
@@ -220,6 +233,7 @@ class RLTrainingExampleBatch:
         answer_mask=model_lib.pad_to_along_axis(
             self.answer_mask, to_length, axis=-1
         ),
+        extra_inputs=extra_inputs,
     )
 
   def normalize_reward(self, normalizer: RewardNormalizer.Base):
@@ -261,6 +275,19 @@ class RewardedSample:
     )
 
 
+def _make_categorical(logits, extra_inputs):
+  """Create Categorical or MaskedCategorical from extra_inputs."""
+  sampling_mask_indices = (extra_inputs or {}).get(
+      'sampling_mask_indices')
+  if sampling_mask_indices is not None:
+    vocab_mask = sampling_lib.indices_to_mask(
+        sampling_mask_indices, logits.shape[-1])
+    return distributions.MaskedCategorical(
+        logits, mask=vocab_mask,
+        neg_inf=common.neg_inf(logits.dtype))
+  return distributions.Categorical(logits)
+
+
 def compute_logprobs(
     model,
     params: common.PyTree,
@@ -285,7 +312,7 @@ def compute_logprobs(
         extra_inputs=extra_inputs,
     )
     logits = jnp.astype(logits, jnp.float32)
-    m = distributions.Categorical(logits)
+    m = _make_categorical(logits, extra_inputs)
     logprobs = masked.masked(m.log_prob(targets), mask=mask)
     return logprobs
 
@@ -665,7 +692,7 @@ def compute_ppo_loss(
       extra_inputs=batch.extra_inputs,
   )
   logits = jnp.astype(logits, jnp.float32)
-  m = distributions.Categorical(logits)
+  m = _make_categorical(logits, batch.extra_inputs)
 
   logpi = masked.masked(m.log_prob(targets), mask=answer_mask)
   logpi_old = masked.masked(batch.logprobs, mask=answer_mask)
@@ -1025,6 +1052,9 @@ def run_experiment(
         pad_id=lm_format.pad_id,
         default_sampling_params=sampling_params,
         extra_eos_tokens=extra_eos_tokens,
+        keep_routing=config.keep_routing,
+        keep_sampling_mask=config.keep_sampling_mask,
+        max_sampling_mask_size=config.max_sampling_mask_size,
     )
     abstract_decoding_params = common.eval_abstract_output(
         lambda: jax.tree_util.tree_map(

@@ -435,7 +435,8 @@ def sample_from_logits(
     temperature: float = 1.0,
     top_k: int = -1,
     top_p: float = 1.0,
-) -> tuple[jax.Array, jax.Array]:
+    return_mask: bool = False,
+):
   """Samples from the last step of the logits.
 
   Args:
@@ -445,25 +446,31 @@ def sample_from_logits(
     top_k: The maximum number of top tokens to sample from. If top_k == -1,
       results are sampled from the whole vocabulary.
     top_p: The cumulate probabilty of top tokens to sample from.
+    return_mask: If True, also return the sampling mask.
 
   Returns:
-    The sampled tokens and the corresponding logprobs.
+    If return_mask is False: (tokens, logprobs).
+    If return_mask is True: (tokens, logprobs, mask).
   """
   logits = jnp.astype(logits, jnp.float32)
 
-  def greedy_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+  def greedy_fn(logits: jax.Array):
     tokens = jnp.argmax(logits, axis=-1)
     logprobs = jnp.zeros(logits.shape[:-1], dtype=logits.dtype)
-    return tokens, logprobs
+    # All-False = no masking was applied (all tokens allowed).
+    mask = jnp.zeros(logits.shape, dtype=jnp.bool_)
+    return tokens, logprobs, mask
 
-  def simple_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+  def simple_sample_fn(logits: jax.Array):
     logits = logits / temperature
     m = distributions.Categorical(logits)
     tokens = m.sample(prng_key)
     logprobs = m.log_prob(tokens)
-    return tokens, logprobs
+    # All-False = no masking was applied (all tokens allowed).
+    mask = jnp.zeros(logits.shape, dtype=jnp.bool_)
+    return tokens, logprobs, mask
 
-  def masked_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+  def masked_sample_fn(logits: jax.Array):
     logits = logits / temperature
 
     mask = jax.lax.cond(
@@ -482,18 +489,53 @@ def sample_from_logits(
     )
     tokens = m.sample(prng_key)
     logprobs = m.log_prob(tokens)
-    return tokens, logprobs
+    return tokens, logprobs, mask
 
-  def sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
+  def sample_fn(logits: jax.Array):
     return jax.lax.cond(
         jnp.logical_or(top_k > 0, top_p < 1),
         masked_sample_fn,
         simple_sample_fn,
         logits,
     )
-  return jax.lax.cond(
-      jnp.logical_or(temperature == 0, top_k == 1), greedy_fn, sample_fn, logits
+  result = jax.lax.cond(
+      jnp.logical_or(temperature == 0, top_k == 1),
+      greedy_fn, sample_fn, logits,
   )
+  if return_mask:
+    return result
+  return result[0], result[1]
+
+
+def mask_to_indices(
+    mask: jax.Array, max_size: int
+) -> jax.Array:
+  """Convert bool mask [..., vocab] -> compact indices [..., max_size].
+
+  Unset positions are padded with vocab_size (out-of-range sentinel).
+  """
+  vocab = mask.shape[-1]
+  # Replace False with vocab (sentinel), True with index.
+  keyed = jnp.where(mask, jnp.arange(vocab), vocab)
+  sorted_indices = jnp.sort(keyed, axis=-1)
+  return sorted_indices[..., :max_size]
+
+
+def indices_to_mask(
+    indices: jax.Array, vocab_size: int
+) -> jax.Array:
+  """Convert compact indices [..., max_size] -> bool mask [..., vocab_size].
+
+  Indices >= vocab_size are treated as padding (ignored).
+  Positions where ALL indices are padding (no mask recorded) are
+  treated as unmasked (all-True).
+  """
+  one_hot = jax.nn.one_hot(
+      indices, vocab_size + 1, dtype=jnp.bool_)
+  mask = jnp.any(one_hot[..., :vocab_size], axis=-2)
+  # All-sentinel = no masking constraint → allow all tokens.
+  no_constraint = ~jnp.any(mask, axis=-1, keepdims=True)
+  return mask | no_constraint
 
 
 def compute_log_likelihood(

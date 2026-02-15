@@ -489,6 +489,16 @@ class RLExperimentConfig(BaseExperimentConfig):
   max_abs_advantage: float | None = None
   filter_truncated: bool = False
   use_policy_logp_as_sampler_logp: bool = False
+  # Keep Routing: replay MoE routing indices from sampling during
+  # training.
+  keep_routing: bool = False
+  # Keep Sampling Mask: replay top-p/top-k masks from sampling
+  # during training.
+  keep_sampling_mask: bool = False
+  # Max number of token indices to store per position for
+  # keep_sampling_mask. Should be >= effective mask size (top_k, or
+  # upper bound for top_p).
+  max_sampling_mask_size: int = 256
 
   # New fields for decoding.
   decoding_sharding_config: SimplyConfig = (

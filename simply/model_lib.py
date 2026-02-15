@@ -679,7 +679,11 @@ class MoEFeedForward(FeedForward):
     return params
 
   def apply(
-      self, params: PyTree, x: Array, inputs_mask: Array | None = None
+      self,
+      params: PyTree,
+      x: Array,
+      inputs_mask: Array | None = None,
+      forced_routing_indices: Array | None = None,
   ) -> PyTree:
     inputs = x
     extra_output = {'loss': {}, 'metric': {}}
@@ -690,7 +694,19 @@ class MoEFeedForward(FeedForward):
     router_logits = router_logits.astype(jnp.float32)
     # router_probs: [batch_size, seq_len, num_experts]
     router_probs = jax.nn.softmax(router_logits, axis=-1)
-    if self.num_experts_per_token == 1:
+    if forced_routing_indices is not None:
+      # Use forced indices but compute router weights normally
+      # so the router still gets gradients.
+      selected_indices = forced_routing_indices
+      if self.num_experts_per_token == 1:
+        selected_router_probs = jnp.take_along_axis(
+            router_probs, selected_indices, axis=-1)
+      else:
+        selected_router_logits = jnp.take_along_axis(
+            router_logits, selected_indices, axis=-1)
+        selected_router_probs = jax.nn.softmax(
+            selected_router_logits, axis=-1)
+    elif self.num_experts_per_token == 1:
       # Apply `softmax => topk` when k == 1 to avoid zero gradient
       # on the router logits.
       # selected_router_probs, selected_indices:
@@ -706,6 +722,7 @@ class MoEFeedForward(FeedForward):
           router_logits, k=self.num_experts_per_token
       )
       selected_router_probs = jax.nn.softmax(selected_router_logits, axis=-1)
+    extra_output['routing_indices'] = selected_indices
     selected_router_probs = jnp.asarray(
         selected_router_probs, self.activation_dtype
     )
@@ -1773,8 +1790,17 @@ class TransformerBlock(module.SimplyModule):
     if self.use_pre_ln:
       x = self.pre_ln_1.apply(params['pre_ln_1'], x)
     # Assumes pad id for segment_ids is 0.
-    x, ffn_extra_output = self.ffn.apply(
-        params['ffn'], x, inputs_mask=segment_ids != 0)
+    if self.use_moe:
+      forced_routing = None
+      if extra_inputs:
+        forced_routing = extra_inputs.get(
+            '_block_routing_indices')
+      x, ffn_extra_output = self.ffn.apply(
+          params['ffn'], x, inputs_mask=segment_ids != 0,
+          forced_routing_indices=forced_routing)
+    else:
+      x, ffn_extra_output = self.ffn.apply(
+          params['ffn'], x, inputs_mask=segment_ids != 0)
     if self.use_post_ln:
       x = self.post_ln_1.apply(params['post_ln_1'], x)
     x += x_res
@@ -2099,6 +2125,11 @@ class TransformerLM(module.SimplyModule):
       decode_state_stack_list = _prepare_stack_list(
           decode_state, n_repeats, len(self.config.block_attn_pattern)
       )
+      routing_indices_dict = (extra_inputs or {}).get(
+          'routing_indices')
+      routing_stack_list = _prepare_stack_list(
+          routing_indices_dict, n_repeats,
+          len(self.config.block_attn_pattern))
       # decode_state_stack_list is formatted as:
       # [
       #   {  # block_0_stack
@@ -2115,17 +2146,28 @@ class TransformerLM(module.SimplyModule):
       # ]
 
       def _process_per_repeat(
-          inputs: jax.Array, p: tuple[Sequence[PyTree], Sequence[PyTree]]
+          inputs: jax.Array,
+          p: tuple[Sequence[PyTree], Sequence[PyTree],
+                   Sequence[PyTree]],
       ) -> tuple[jax.Array, Sequence[PyTree]]:
         # This function will process a set of blocks that will be repeated
         # multiple times. The number of blocks in this set is determined by the
         # `block_attn_pattern`` in the config. For example, if the pattern is
         # ('global', 'local', 'local'), then this function will process 3 blocks
         # that will be repeated (n_layers // 3) times.
-        block_params_list, block_decode_state_list = p
+        (block_params_list, block_decode_state_list,
+            block_routing_list) = p
         x = inputs
         block_extra_output_list = []
         for i in range(len(self.config.block_attn_pattern)):
+          block_extra_inputs = extra_inputs
+          # None = routing disabled; {} = non-MoE block.
+          if block_routing_list[i] not in (None, {}):
+            block_extra_inputs = {
+                **(extra_inputs or {}),
+                '_block_routing_indices':
+                    block_routing_list[i],
+            }
           apply_fn = self.blocks[i].apply
           if self.config.use_remat:
             apply_fn = jax.remat(
@@ -2139,7 +2181,7 @@ class TransformerLM(module.SimplyModule):
               x,
               segment_ids=segment_ids,
               segment_positions=segment_positions,
-              extra_inputs=extra_inputs,
+              extra_inputs=block_extra_inputs,
               decode_state=block_decode_state_list[i],
           )
           block_extra_output_list.append(block_extra_output)
@@ -2148,7 +2190,8 @@ class TransformerLM(module.SimplyModule):
       x, extra_output_stack_list = jax.lax.scan(
           _process_per_repeat,
           init=x,
-          xs=(params_stack_list, decode_state_stack_list),
+          xs=(params_stack_list, decode_state_stack_list,
+              routing_stack_list),
           length=n_repeats,
       )
 
@@ -2197,18 +2240,27 @@ class TransformerLM(module.SimplyModule):
       block_start_index = n_repeats * len(self.config.block_attn_pattern)
 
     # Process the remaining blocks that are not in scan.
+    ri_dict = (extra_inputs or {}).get('routing_indices')
     for i in range(block_start_index, self.config.n_layers):
       if decode_state is None:
         block_decode_state = None
       else:
         decode_state = cast(Mapping[str, Any], decode_state)
         block_decode_state = decode_state.get(f'block_{i}')
+      block_extra_inputs = extra_inputs
+      if ri_dict is not None:
+        ri = ri_dict.get(f'block_{i}')
+        if ri is not None:
+          block_extra_inputs = {
+              **(extra_inputs or {}),
+              '_block_routing_indices': ri,
+          }
       x, block_extra_output = self.blocks[i].apply(
           params[f'block_{i}'],
           x,
           segment_ids=segment_ids,
           segment_positions=segment_positions,
-          extra_inputs=extra_inputs,
+          extra_inputs=block_extra_inputs,
           decode_state=block_decode_state,
       )
       extra_output_list.append(block_extra_output)
@@ -3050,6 +3102,12 @@ class SamplingState:
   input_lens: Array  # [batch, 1], bos counted
   max_decode_steps: Array  # [batch, 1]
   eos_ids: Array  # [n_eos]
+  # Keep Routing: per-block routing indices accumulated during decoding.
+  # dict: {'block_i': Array [batch, decode_state_length+1, n_experts_per_tok]}
+  routing_indices: PyTree | None = None
+  # Keep Sampling Mask: compact indices of allowed tokens per position.
+  # [batch, decode_state_length+1, max_sampling_mask_size], int32
+  sampling_mask_indices: Array | None = None
 
   def __post_init__(self):
     assert not self.position.shape
@@ -3114,6 +3172,25 @@ class SamplingState:
         self.token_scores, output_scores, self.position + 1, axis=1
     )
 
+  def updated_routing_indices(self, step_routing):
+    """Update routing buffers with step routing at position+1."""
+    if self.routing_indices is None:
+      return None
+    return jax.tree.map(
+        lambda buf, val: jax.lax.dynamic_update_slice_in_dim(
+            buf, val, self.position + 1, axis=1),
+        self.routing_indices, step_routing)
+
+  def updated_sampling_mask_indices(
+      self, step_mask_indices: Array
+  ) -> Array | None:
+    """Update sampling mask buffer at position+1."""
+    if self.sampling_mask_indices is None:
+      return None
+    return jax.lax.dynamic_update_slice_in_dim(
+        self.sampling_mask_indices, step_mask_indices,
+        self.position + 1, axis=1)
+
   @property
   def decode_state_length(self) -> int:
     return self.token_scores.shape[1] - 1
@@ -3129,12 +3206,23 @@ class SamplingState:
     token_logprobs = pad_to_along_axis(self.token_logprobs, length + 1, axis=1)
     token_scores = pad_to_along_axis(self.token_scores, length + 1, axis=1)
     decode_state = pad_decode_state_to(self.decode_state, length)
+    routing_indices = self.routing_indices
+    if routing_indices is not None:
+      routing_indices = jax.tree.map(
+          lambda x: pad_to_along_axis(x, length + 1, axis=1),
+          routing_indices)
+    sampling_mask_indices = self.sampling_mask_indices
+    if sampling_mask_indices is not None:
+      sampling_mask_indices = pad_to_along_axis(
+          sampling_mask_indices, length + 1, axis=1)
     return dataclasses.replace(
         self,
         decode_state=decode_state,
         tokens=tokens,
         token_logprobs=token_logprobs,
         token_scores=token_scores,
+        routing_indices=routing_indices,
+        sampling_mask_indices=sampling_mask_indices,
     )
 
 
@@ -3271,6 +3359,9 @@ class LMInterface:
       pad_id: int | None = None,
       extra_eos_ids: Sequence[int] | None = None,
       extra_eos_tokens: Sequence[str] | None = None,
+      keep_routing: bool = False,
+      keep_sampling_mask: bool = False,
+      max_sampling_mask_size: int = 256,
   ) -> None:
     """An interface to interact with a language model.
 
@@ -3303,6 +3394,9 @@ class LMInterface:
           extra_eos_tokens=extra_eos_tokens,
       )
     self.default_sampling_params = default_sampling_params or SamplingParams()
+    self.keep_routing = keep_routing
+    self.keep_sampling_mask = keep_sampling_mask
+    self.max_sampling_mask_size = max_sampling_mask_size
 
     def prefill_fn(
         params: PyTree,
@@ -3488,6 +3582,36 @@ class LMInterface:
     token_scores = pad_along_axis(token_scores, (1, 0), axis=1)
     token_logprobs = jnp.zeros_like(token_scores)
 
+    decode_state_length = processed_input.tokens.shape[1] - 1
+    model_config = getattr(self.model, 'config', None)
+    buf_shape = (processed_input.batch_size, decode_state_length + 1)
+
+    # Initialize keep_routing buffers.
+    routing_indices = None
+    if self.keep_routing and model_config and getattr(
+        model_config, 'use_moe', False):
+      routing_indices = {}
+      for i in range(model_config.n_layers):
+        if getattr(self.model.blocks[i], 'use_moe', False):
+          routing_indices[f'block_{i}'] = jnp.zeros(
+              buf_shape + (model_config.num_experts_per_token,),
+              dtype=jnp.int32)
+      # Write prefill routing from extra_output.
+      for key in routing_indices:
+        ffn = extra_output.get('ffn', {}).get(key, {})
+        if 'routing_indices' in ffn:
+          routing_indices[key] = (
+              jax.lax.dynamic_update_slice_in_dim(
+                  routing_indices[key],
+                  ffn['routing_indices'], 0, axis=1))
+
+    # Initialize keep_sampling_mask buffers.
+    sampling_mask_indices = None
+    if self.keep_sampling_mask and model_config:
+      sampling_mask_indices = jnp.full(
+          buf_shape + (self.max_sampling_mask_size,),
+          model_config.vocab_size, dtype=jnp.int32)
+
     sampling_state = SamplingState(
         prng_key=jnp.copy(prng_key),
         position=jnp.array(position),
@@ -3502,6 +3626,8 @@ class LMInterface:
             b=processed_input.batch_size,
         ),
         eos_ids=jnp.array(self.input_processor.eos_ids, dtype=jnp.int32),
+        routing_indices=routing_indices,
+        sampling_mask_indices=sampling_mask_indices,
     )
 
     # NOTE that `position + 1` is the output position.
@@ -3543,6 +3669,20 @@ class LMInterface:
     all_raw_token_scores = jax.experimental.multihost_utils.process_allgather(
         sampling_state.token_scores, tiled=True
     ).tolist()
+
+    # Allgather routing indices and sampling mask indices.
+    all_routing = None
+    if sampling_state.routing_indices is not None:
+      all_routing = jax.tree.map(
+          lambda x: np.asarray(
+              jax.experimental.multihost_utils.process_allgather(
+                  x, tiled=True)),
+          sampling_state.routing_indices)
+    all_sampling_mask = None
+    if sampling_state.sampling_mask_indices is not None:
+      all_sampling_mask = np.asarray(
+          jax.experimental.multihost_utils.process_allgather(
+              sampling_state.sampling_mask_indices, tiled=True))
 
     sample_outputs = []
     num_outputs = len(raw_inputs) * sampling_params.num_samples
@@ -3591,7 +3731,24 @@ class LMInterface:
       else:
         output_chunks = self.input_processor.decode(output_token_ids)
 
+      # Build extra_inputs with routing and sampling mask data.
+      total_len = len(input_token_ids) + len(output_token_ids)
       input_index = i // sampling_params.num_samples
+      sample_extra_inputs = dict(
+          unpadded_inputs[input_index].extra_inputs or {})
+      if all_routing is not None:
+        sample_extra_inputs['routing_indices'] = {
+            k: v[i, :total_len, :]
+            for k, v in all_routing.items()
+        }
+      if all_sampling_mask is not None:
+        sample_extra_inputs['sampling_mask_indices'] = (
+            all_sampling_mask[i, :total_len, :])
+      sample_processed_input = dataclasses.replace(
+          unpadded_inputs[input_index],
+          extra_inputs=sample_extra_inputs or None,
+      )
+
       sample_outputs.append(
           SamplingOutput(
               input_chunks=raw_inputs[input_index],
@@ -3602,7 +3759,7 @@ class LMInterface:
               input_token_scores=input_token_scores,
               output_token_scores=output_token_scores,
               is_truncated=(not ends_in_eos),
-              processed_input=unpadded_inputs[input_index],
+              processed_input=sample_processed_input,
           )
       )
 
@@ -3783,6 +3940,12 @@ def continue_decode(
     scoring_top_k: int = -1,
     scoring_top_p: float = 1.0,
 ) -> SamplingState:
+  keep_routing = init_sampling_state.routing_indices is not None
+  keep_sampling_mask = (
+      init_sampling_state.sampling_mask_indices is not None)
+  if keep_sampling_mask:
+    max_sampling_mask_size = (
+        init_sampling_state.sampling_mask_indices.shape[-1])
 
   def body_fn(sampling_state: SamplingState) -> SamplingState:
     # logits: [batch_size, 1, vocab_size]
@@ -3799,9 +3962,10 @@ def continue_decode(
 
     prng_key, key = jax.random.split(sampling_state.prng_key, 2)
     # output_tokens: [batch_size, 1], output_logprobs: [batch_size, 1]
-    output_tokens, output_logprobs = sampling_lib.sample_from_logits(
-        key, logits, temperature=temperature, top_k=top_k, top_p=top_p
-    )
+    output_tokens, output_logprobs, sample_mask = (
+        sampling_lib.sample_from_logits(
+            key, logits, temperature=temperature,
+            top_k=top_k, top_p=top_p, return_mask=True))
 
     # Three cases:
     # - Sequence is done generating, just output again the current
@@ -3846,6 +4010,27 @@ def continue_decode(
         output_tokens,
     )
 
+    # Extract routing indices from extra_output for keep_routing.
+    updated_routing = sampling_state.routing_indices
+    if keep_routing:
+      ffn = extra_output.get('ffn', {})
+      step_routing = {
+          k: v['routing_indices']
+          for k, v in ffn.items()
+          if isinstance(v, dict) and 'routing_indices' in v
+      }
+      updated_routing = (
+          sampling_state.updated_routing_indices(step_routing))
+
+    # Extract sampling mask for keep_sampling_mask.
+    updated_mask_indices = sampling_state.sampling_mask_indices
+    if keep_sampling_mask:
+      step_mask_indices = sampling_lib.mask_to_indices(
+          sample_mask, max_sampling_mask_size)
+      updated_mask_indices = (
+          sampling_state.updated_sampling_mask_indices(
+              step_mask_indices))
+
     # logprobs might be computed for input tokens and extra beyond eos tokens.
     # scores might be computed for extra beyond eos tokens.
     # We have to ignore those values during post-processing.
@@ -3857,6 +4042,8 @@ def continue_decode(
         tokens=sampling_state.updated_tokens(output_tokens),
         token_logprobs=sampling_state.updated_token_logprobs(output_logprobs),
         token_scores=sampling_state.updated_token_scores(output_scores),
+        routing_indices=updated_routing,
+        sampling_mask_indices=updated_mask_indices,
     )
 
   def cond_fn(sampling_state: SamplingState) -> jax.typing.ArrayLike:
