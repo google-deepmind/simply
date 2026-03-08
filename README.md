@@ -26,15 +26,15 @@ See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment o
 
 #### Automated AI research with agents
 
-You can use agents like [Google Antigravity](https://antigravity.google/), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) to run automated research experiments. For example, paste the following prompt into your agent from the repo root to have it design and benchmark new optimizers:
+You can use agents like [Google Antigravity](https://antigravity.google/), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) to run automated research experiments. For example, paste the following prompt into your agent from the repo root to have it design and benchmark new optimizers on a toy setting:
 
 ```
 You are an AI research agent.
 Design and benchmark new optimizers for training a small transformer.
 Read simply/utils/optimizers.py to understand the interface.
-Propose and implement 10-20 novel optimizer variants,
-tune their hyperparameters, and compare to the Adam baseline using the lm_test config.
-You can have 3 experiments running in parallel, and use the result of finished experiments to inform your later proposals.
+First, run the Adam baseline using the lm_test config and record the final loss.
+In multiple research iterations, propose novel optimizers, tune their hyperparameters, and run experiments to compare with the baseline.
+In each iteration, you can propose and run 3 experiments, wait for results and then start the next iteration based on the results of finished experiments. Keep running new iterations until you have finished 15 experiments or proposed 10 new optimizers.
 Write a report to /tmp/optimizer_report.md.
 ```
 
