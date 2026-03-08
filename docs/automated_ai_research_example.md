@@ -147,6 +147,7 @@ Research question: Can you design an optimizer that outperforms Adam for LLM pre
 
 Setup:
 - Read CLAUDE.md / AGENTS.md / GEMINI.md for a codebase overview.
+- Read docs/gcloud.md for TPU setup, multi-host training, and preemption handling.
 - Read simply/utils/optimizers.py carefully.
   Each optimizer is a frozen dataclass registered via @OptimizerRegistry.register,
   with init(params) and apply(state, grad) -> (update, state) methods.
@@ -198,6 +199,7 @@ Research question: Can you design an RL loss function that improves on GRPO for 
 
 Setup:
 - Read CLAUDE.md / AGENTS.md / GEMINI.md for a codebase overview.
+- Read docs/gcloud.md for TPU setup, multi-host training, and preemption handling.
 - Read simply/rl_lib.py carefully, especially the compute_ppo_loss function.
   It computes the RL loss and is the core algorithm —
   it handles advantage estimation, KL penalties, and PPO clipping.
