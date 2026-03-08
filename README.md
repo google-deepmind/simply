@@ -1,10 +1,11 @@
 <!-- mdlint off(LINE_OVER_80) -->
 # Simply: Minimal Code for Frontier LLM Research in JAX
 
-*Simply* is a minimal and scalable research codebase in JAX, designed for rapid iteration on frontier research in LLM and other autoregressive models.
+*Simply* is a minimal and scalable research codebase in JAX, designed as an environment where both humans and AI agents can rapidly iterate on frontier LLM research.
 
-- *Quick to [fork and hack](#getting-started)* for fast iteration. You should be able to implement your research ideas (e.g., new architecture, optimizer, training loss, etc) in a few hours.
-- *Minimal abstractions and dependencies* for a simple and self-contained codebase. Learn [Jax](https://jax.readthedocs.io/en/latest/index.html) (if you haven't), and you are ready to read and hack the code.
+- *Quick to [fork and hack](#getting-started)* for fast iteration. We aim at minimizing the time to implement new ideas (e.g., optimizer, training loss, RL algorithms, etc) by humans and AI agents.
+- *Minimal abstractions and dependencies* for a simple and self-contained codebase. Learn [Jax](https://jax.readthedocs.io/en/latest/index.html), and you are ready to read and hack the code.
+- *An environment for automated AI research* — An AI agent, which can itself be powered by an LLM served with *Simply*, can read the code, propose new ideas, run experiments, and iterate autonomously or under the guidance of human researchers. See [automated AI research with agents](#automated-ai-research-with-agents) for some simple examples. More on the way.
 - That's it, *simply* [get started](#getting-started) with hacking now :)
 
 ## Getting started
