@@ -23,6 +23,22 @@ export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python
 #### Running on Google Cloud TPUs
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
+#### Automated AI research with agents
+
+You can use agents like [Google Antigravity](https://antigravity.google/), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) to run automated research experiments. For example, paste the following prompt into your agent from the repo root to have it design and benchmark new optimizers:
+
+```
+You are an AI research agent.
+Design and benchmark new optimizers for training a small transformer.
+Read simply/utils/optimizers.py to understand the interface.
+Propose and implement 10-20 novel optimizer variants,
+tune their hyperparameters, and compare to the Adam baseline using the lm_test config.
+You can have 3 experiments running in parallel, and use the result of finished experiments to inform your later proposals.
+Write a report to /tmp/optimizer_report.md.
+```
+
+See the [full guide](docs/automated_ai_research_example.md) for more interesting examples including RL algorithm search for post-training. Have fun playing around with different prompts and interacting with the agent for longer research.
+
 ## Dependencies
 
 The main dependencies are:
