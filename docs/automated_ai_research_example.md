@@ -23,7 +23,7 @@ pip install ".[tfds]"
 The pretraining example uses IMDB reviews (auto-downloaded by TFDS).
 The GCP RL example below needs GSM8K: `python setup/setup_assets.py --datasets-only`.
 
-## Example 1: Optimizer Search
+## CPU example: Optimizer Search
 
 Paste into your agent from the repo root directory:
 
