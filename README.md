@@ -1,5 +1,5 @@
 <!-- mdlint off(LINE_OVER_80) -->
-# Simply: Minimal Code for Frontier LLM Research in JAX
+# Simply: Minimal Code for End-to-End Frontier LLM Research
 
 *Simply* is a minimal and scalable research codebase in JAX, designed as an environment where both humans and AI agents can rapidly iterate on frontier LLM research.
 
