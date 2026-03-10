@@ -614,6 +614,160 @@ gcloud compute instances delete bastion \
 The GCS bucket, VPC, NAT, and firewall rules persist across
 experiments and don't need to be recreated.
 
+## 11. Running on GKE with XPK
+
+As an alternative to managing TPU VMs directly, you can run Simply
+on GKE (Google Kubernetes Engine) clusters with TPU node pools using
+[XPK](https://github.com/google/xpk). XPK handles Docker image
+building, job scheduling, and multi-host coordination automatically.
+
+### Prerequisites
+
+- A GKE cluster with TPU node pools (created via `xpk cluster
+  create` or manually)
+- [XPK](https://github.com/google/xpk) installed (`pip install xpk`)
+- Docker installed and accessible
+- `kubectl` configured to access your cluster
+
+### Building the Docker Image
+
+Simply provides a Dockerfile at `scripts/Dockerfile.simply` that
+pre-installs JAX with TPU support and all Simply dependencies:
+
+```bash
+# Build the image
+docker build -f scripts/Dockerfile.simply \
+    -t gcr.io/$PROJECT/simply-jax-tpu:latest .
+
+# Push to your project's container registry
+docker push gcr.io/$PROJECT/simply-jax-tpu:latest
+```
+
+The Dockerfile installs dependencies in a separate layer for fast
+rebuilds. When the workload starts, the launch script runs
+`pip install .` inside the container to install Simply itself from
+the source tree copied by XPK.
+
+### Launching a Workload
+
+Use `scripts/launch_gke.sh` to submit training jobs:
+
+```bash
+./scripts/launch_gke.sh --config qwen3_0p6b \
+    --project my-project \
+    --cluster my-cluster \
+    --zone us-central1 \
+    --tpu-type v4-8 \
+    --image gcr.io/my-project/simply-jax-tpu:latest
+```
+
+The script builds a Docker image (overlaying the Simply source onto
+the base image), pushes it, and submits the workload via
+`xpk workload create`. XPK uses its `--script-dir` flag to copy the
+Simply repo into the container's working directory.
+
+#### Required Flags
+
+| Flag | Env Variable | Description |
+|------|-------------|-------------|
+| `--config CONFIG` | | Simply experiment config name |
+| `--project PROJECT` | `SIMPLY_XPK_PROJECT` | GCP project ID |
+| `--cluster CLUSTER` | `SIMPLY_XPK_CLUSTER` | GKE cluster name |
+| `--image IMAGE` | `SIMPLY_XPK_IMAGE` | Base Docker image |
+
+#### Common Options
+
+| Flag | Env Variable | Default | Description |
+|------|-------------|---------|-------------|
+| `--zone ZONE` | `SIMPLY_XPK_ZONE` | `us-central1` | GCP zone/region |
+| `--tpu-type TYPE` | `SIMPLY_XPK_TPU_TYPE` | `v4-8` | TPU accelerator type |
+| `--num-slices N` | `SIMPLY_XPK_NUM_SLICES` | `1` | Number of TPU slices |
+| `--priority PRI` | `SIMPLY_XPK_PRIORITY` | `medium` | Workload priority |
+| `--name NAME` | | auto | Custom workload name |
+| `--spot` | | (default) | Use spot/preemptible instances |
+| `--on-demand` | | | Use on-demand instances |
+| `--dry-run` | | | Print the xpk command without running |
+
+#### Passing Simply Arguments
+
+Pass additional flags to `simply.main` after `--`:
+
+```bash
+./scripts/launch_gke.sh --config lm_test \
+    --project my-project --cluster my-cluster \
+    --image gcr.io/my-project/simply-jax-tpu:latest \
+    -- --mesh_shape 1,4,32 --experiment_dir gs://my-bucket/exp1
+```
+
+### Using Environment Variables
+
+To avoid repeating flags, set environment variables in your shell
+profile:
+
+```bash
+export SIMPLY_XPK_PROJECT=my-project
+export SIMPLY_XPK_CLUSTER=my-cluster
+export SIMPLY_XPK_ZONE=us-central1
+export SIMPLY_XPK_IMAGE=gcr.io/my-project/simply-jax-tpu:latest
+
+# Now just specify the config:
+./scripts/launch_gke.sh --config qwen3_0p6b --tpu-type v4-8
+```
+
+### Profiling with XProf
+
+To collect XProf traces, pass `--profile` and set a GCS bucket for
+trace storage:
+
+```bash
+export SIMPLY_XPK_GCS_BUCKET=gs://my-bucket/profiles
+
+./scripts/launch_gke.sh --config qwen3_0p6b --profile \
+    --project my-project --cluster my-cluster \
+    --image gcr.io/my-project/simply-jax-tpu:latest
+```
+
+This sets `JAX_PROFILER_LOG_DIR` inside the container and saves
+worker logs to the GCS bucket. By default, profiling starts after
+5 warmup steps and captures 3 steps (configurable via
+`--profile-warmup` and `--profile-steps`).
+
+### Managing Workloads
+
+List, monitor, and delete workloads:
+
+```bash
+# List all simply-* workloads on the cluster
+./scripts/launch_gke.sh --list
+
+# Stream logs from a running workload
+./scripts/launch_gke.sh --logs simply-qwen3-0p6b-0310
+
+# Delete a workload
+./scripts/launch_gke.sh --delete simply-qwen3-0p6b-0310
+```
+
+You can also use `kubectl` directly for more detailed inspection:
+
+```bash
+# View logs from a specific worker
+kubectl logs -l jobset.sigs.k8s.io/jobset-name=simply-qwen3-0p6b-0310 \
+    --all-containers --tail=100
+
+# Check pod status
+kubectl get pods -l jobset.sigs.k8s.io/jobset-name=simply-qwen3-0p6b-0310
+```
+
+### Docker Access
+
+The launch script checks for Docker access and falls back to
+`sg docker` if the current user isn't in the docker group. If
+Docker is not accessible at all, run:
+
+```bash
+sudo usermod -aG docker $USER && newgrp docker
+```
+
 ## Future Work
 
 - **GPU VMs** -- A100/H100 setup
