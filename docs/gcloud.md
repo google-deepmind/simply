@@ -614,20 +614,36 @@ gcloud compute instances delete bastion \
 The GCS bucket, VPC, NAT, and firewall rules persist across
 experiments and don't need to be recreated.
 
-## 11. Running on GKE with XPK
+## Running on GKE with XPK
 
 As an alternative to managing TPU VMs directly, you can run Simply
 on GKE (Google Kubernetes Engine) clusters with TPU node pools using
-[XPK](https://github.com/google/xpk). XPK handles Docker image
-building, job scheduling, and multi-host coordination automatically.
+[XPK](https://github.com/AI-Hypercomputer/xpk). XPK handles Docker
+image building, job scheduling, and multi-host coordination
+automatically.
 
 ### Prerequisites
 
-- A GKE cluster with TPU node pools (created via `xpk cluster
-  create` or manually)
-- [XPK](https://github.com/google/xpk) installed (`pip install xpk`)
-- Docker installed and accessible
-- `kubectl` configured to access your cluster
+- A GKE cluster with a TPU node pool already provisioned
+- [XPK](https://github.com/AI-Hypercomputer/xpk) installed
+  (`pip install xpk`)
+- Docker installed and authenticated to push to GCR/Artifact
+  Registry
+- `kubectl` configured for your cluster
+  (`gcloud container clusters get-credentials ...`)
+
+### Setting Environment Variables
+
+Set these once per shell session (or in your shell profile).
+Replace the values with your own project, cluster, and bucket:
+
+```bash
+export PROJECT=your-gcp-project-id
+export CLUSTER=your-gke-cluster-name
+export ZONE=us-central1
+export TPUTYPE=v4-8
+export BUCKET=your-gcs-bucket-name
+```
 
 ### Building the Docker Image
 
@@ -635,6 +651,8 @@ Simply provides a Dockerfile at `scripts/Dockerfile.simply` that
 pre-installs JAX with TPU support and all Simply dependencies:
 
 ```bash
+cd /path/to/simply
+
 # Build the image
 docker build -f scripts/Dockerfile.simply \
     -t gcr.io/$PROJECT/simply-jax-tpu:latest .
@@ -645,74 +663,39 @@ docker push gcr.io/$PROJECT/simply-jax-tpu:latest
 
 The Dockerfile installs dependencies in a separate layer for fast
 rebuilds. When the workload starts, the launch script runs
-`pip install .` inside the container to install Simply itself from
-the source tree copied by XPK.
+`uv pip install --system .` inside the container to install Simply
+itself from the source tree copied by XPK's `--script-dir` flag.
 
-### Launching a Workload
+### Launching a Workload with a Registered Config
 
-Use `scripts/launch_gke.sh` to submit training jobs:
+The simplest way to launch is with a registered config name. The
+`lm_test_gke_training` config is designed for GKE testing -- it
+uses a small model with no checkpoint loading:
 
 ```bash
-./scripts/launch_gke.sh --config qwen3_0p6b \
-    --project my-project \
-    --cluster my-cluster \
-    --zone us-central1 \
-    --tpu-type v4-8 \
-    --image gcr.io/my-project/simply-jax-tpu:latest
+./scripts/launch_gke.sh \
+    --config lm_test_gke_training \
+    --project $PROJECT \
+    --cluster $CLUSTER \
+    --zone $ZONE \
+    --tpu-type $TPUTYPE \
+    --image gcr.io/$PROJECT/simply-jax-tpu:latest
 ```
 
-The script builds a Docker image (overlaying the Simply source onto
-the base image), pushes it, and submits the workload via
-`xpk workload create`. XPK uses its `--script-dir` flag to copy the
-Simply repo into the container's working directory.
-
-#### Required Flags
-
-| Flag | Env Variable | Description |
-|------|-------------|-------------|
-| `--config CONFIG` | | Simply experiment config name |
-| `--project PROJECT` | `SIMPLY_XPK_PROJECT` | GCP project ID |
-| `--cluster CLUSTER` | `SIMPLY_XPK_CLUSTER` | GKE cluster name |
-| `--image IMAGE` | `SIMPLY_XPK_IMAGE` | Base Docker image |
+To preview the XPK command without submitting, add `--dry-run`.
 
 #### Common Options
 
 | Flag | Env Variable | Default | Description |
 |------|-------------|---------|-------------|
 | `--zone ZONE` | `SIMPLY_XPK_ZONE` | `us-central1` | GCP zone/region |
-| `--tpu-type TYPE` | `SIMPLY_XPK_TPU_TYPE` | `v4-8` | TPU accelerator type |
-| `--num-slices N` | `SIMPLY_XPK_NUM_SLICES` | `1` | Number of TPU slices |
-| `--priority PRI` | `SIMPLY_XPK_PRIORITY` | `medium` | Workload priority |
+| `--tpu-type TYPE` | `SIMPLY_XPK_TPU_TYPE` | `v4-8` | TPU accelerator |
+| `--num-slices N` | `SIMPLY_XPK_NUM_SLICES` | `1` | Number of slices |
+| `--priority PRI` | `SIMPLY_XPK_PRIORITY` | `medium` | Priority |
 | `--name NAME` | | auto | Custom workload name |
-| `--spot` | | (default) | Use spot/preemptible instances |
+| `--spot` | | (default) | Use spot instances |
 | `--on-demand` | | | Use on-demand instances |
-| `--dry-run` | | | Print the xpk command without running |
-
-#### Passing Simply Arguments
-
-Pass additional flags to `simply.main` after `--`:
-
-```bash
-./scripts/launch_gke.sh --config lm_test \
-    --project my-project --cluster my-cluster \
-    --image gcr.io/my-project/simply-jax-tpu:latest \
-    -- --mesh_shape 1,4,32 --experiment_dir gs://my-bucket/exp1
-```
-
-### Using Environment Variables
-
-To avoid repeating flags, set environment variables in your shell
-profile:
-
-```bash
-export SIMPLY_XPK_PROJECT=my-project
-export SIMPLY_XPK_CLUSTER=my-cluster
-export SIMPLY_XPK_ZONE=us-central1
-export SIMPLY_XPK_IMAGE=gcr.io/my-project/simply-jax-tpu:latest
-
-# Now just specify the config:
-./scripts/launch_gke.sh --config qwen3_0p6b --tpu-type v4-8
-```
+| `--dry-run` | | | Print xpk command only |
 
 ### Profiling with XProf
 
@@ -722,9 +705,9 @@ trace storage:
 ```bash
 export SIMPLY_XPK_GCS_BUCKET=gs://my-bucket/profiles
 
-./scripts/launch_gke.sh --config qwen3_0p6b --profile \
-    --project my-project --cluster my-cluster \
-    --image gcr.io/my-project/simply-jax-tpu:latest
+./scripts/launch_gke.sh --config lm_test_gke_training --profile \
+    --project $PROJECT --cluster $CLUSTER \
+    --image gcr.io/$PROJECT/simply-jax-tpu:latest
 ```
 
 This sets `JAX_PROFILER_LOG_DIR` inside the container and saves
@@ -738,24 +721,33 @@ List, monitor, and delete workloads:
 
 ```bash
 # List all simply-* workloads on the cluster
-./scripts/launch_gke.sh --list
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --list
 
 # Stream logs from a running workload
-./scripts/launch_gke.sh --logs simply-qwen3-0p6b-0310
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --logs simply-lm-test-gke-training-0311
 
 # Delete a workload
-./scripts/launch_gke.sh --delete simply-qwen3-0p6b-0310
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --delete simply-lm-test-gke-training-0311
 ```
 
-You can also use `kubectl` directly for more detailed inspection:
+You can also use `kubectl` directly for lower-level diagnostics:
 
 ```bash
-# View logs from a specific worker
-kubectl logs -l jobset.sigs.k8s.io/jobset-name=simply-qwen3-0p6b-0310 \
-    --all-containers --tail=100
+# List pods for a workload
+kubectl get pods \
+    -l "jobset.sigs.k8s.io/jobset-name=simply-lm-test-gke-training-0311"
 
-# Check pod status
-kubectl get pods -l jobset.sigs.k8s.io/jobset-name=simply-qwen3-0p6b-0310
+# Check container logs (replace POD_NAME with actual pod name)
+kubectl logs POD_NAME --all-containers 2>&1 | tail -50
+
+# Describe a pod for event details (image pull errors, scheduling)
+kubectl describe pod POD_NAME
 ```
 
 ### Docker Access
@@ -767,6 +759,40 @@ Docker is not accessible at all, run:
 ```bash
 sudo usermod -aG docker $USER && newgrp docker
 ```
+
+### GKE Troubleshooting
+
+#### Container can't find local files
+
+XPK workloads run inside containers with their own filesystem.
+Local paths like `/tmp/config.json` on your machine are not
+accessible. Upload config files and assets to GCS and use
+`gs://` paths.
+
+#### `ModuleNotFoundError` for a Python package
+
+If a package is missing in the container, add it to
+`scripts/Dockerfile.simply`, rebuild, push, and relaunch. Common
+packages that may be needed depending on your data pipeline:
+
+#### `Found incomplete checkpoint` / Orbax validation error
+
+Orbax uses `commit_success.txt` marker files to validate
+checkpoints on GCS. HuggingFace-hosted checkpoints don't include
+this file. Create it manually:
+
+```bash
+touch /tmp/commit_success.txt
+gcloud storage cp /tmp/commit_success.txt \
+    gs://$BUCKET/path/to/checkpoint/1/commit_success.txt
+```
+
+#### `FileNotFoundError: tokenizer_config.json`
+
+The launch script downloads Qwen3 tokenizer files at runtime.
+If you use a different tokenizer, you may need to add a similar
+download step to `launch_gke.sh` or pre-bake the tokenizer files
+into the Docker image.
 
 ## Future Work
 

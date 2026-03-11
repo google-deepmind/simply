@@ -120,7 +120,10 @@ do_logs() {
     kubectl logs \
         -l "jobset.sigs.k8s.io/jobset-name=${name}" \
         --all-containers --follow --tail=200 2>/dev/null \
-        || echo "No logs found. The job may not have started yet."
+    || kubectl logs \
+        -l "jobset.sigs.k8s.io/jobset-name=${name}" \
+        --all-containers --tail=200 2>/dev/null \
+    || echo "No logs found. The job may not have started yet."
 }
 
 do_delete() {
@@ -231,7 +234,12 @@ fi
 # ------------------------------------------
 # Build the Simply command
 # ------------------------------------------
-INSTALL_CMD="pip install --no-cache-dir . 2>/dev/null"
+INSTALL_CMD="uv pip install --system --no-cache . 2>/dev/null"
+
+# Download vocab/tokenizer files that Simply needs at runtime.
+# Qwen3 tokenizer is fetched from HuggingFace into the default
+# vocabs directory (~/.cache/simply/vocabs/Qwen3/).
+VOCAB_SETUP="python3 -c \"import os; from huggingface_hub import hf_hub_download; d=os.path.expanduser('~/.cache/simply/vocabs/Qwen3'); os.makedirs(d,exist_ok=True); [hf_hub_download('Qwen/Qwen3-0.6B',f,local_dir=d) for f in ['tokenizer.json','tokenizer_config.json']]\""
 
 SIMPLY_CMD="python3 -u -m simply.main"
 SIMPLY_CMD="${SIMPLY_CMD} --experiment_config=${CONFIG}"
@@ -249,15 +257,16 @@ if [ "${PROFILE}" = true ] && [ -n "${GCS_BUCKET}" ]; then
     PROFILE_ENV="JAX_PROFILER_LOG_DIR=${PROFILE_DIR}"
     PROFILE_ENV="${PROFILE_ENV} SIMPLY_PROFILE_START_STEP=${PROFILE_WARMUP}"
     PROFILE_ENV="${PROFILE_ENV} SIMPLY_PROFILE_END_STEP=$((PROFILE_WARMUP + PROFILE_STEPS))"
-    FULL_CMD="${INSTALL_CMD} && (${PROFILE_ENV} ${SIMPLY_CMD}"
+    FULL_CMD="${INSTALL_CMD} && ${VOCAB_SETUP}"
+    FULL_CMD="${FULL_CMD} && (${PROFILE_ENV} ${SIMPLY_CMD}"
     FULL_CMD="${FULL_CMD} 2>&1 | tee /tmp/simply_output.log;"
     FULL_CMD="${FULL_CMD} ${LOG_SAVE})"
 elif [ "${PROFILE}" = true ]; then
     echo "Warning: --profile requires SIMPLY_XPK_GCS_BUCKET." \
         "Profiling disabled." >&2
-    FULL_CMD="${INSTALL_CMD} && ${SIMPLY_CMD}"
+    FULL_CMD="${INSTALL_CMD} && ${VOCAB_SETUP} && ${SIMPLY_CMD}"
 else
-    FULL_CMD="${INSTALL_CMD} && ${SIMPLY_CMD}"
+    FULL_CMD="${INSTALL_CMD} && ${VOCAB_SETUP} && ${SIMPLY_CMD}"
 fi
 
 # ------------------------------------------
@@ -338,8 +347,8 @@ echo "  Workload submitted: ${WORKLOAD_NAME}"
 echo "============================================"
 echo ""
 echo "Monitor:"
-echo "  ./scripts/launch_gke.sh --list"
-echo "  ./scripts/launch_gke.sh --logs ${WORKLOAD_NAME}"
+echo "  ./scripts/launch_gke.sh --project $PROJECT --cluster $CLUSTER --zone $ZONE --list"
+echo "  ./scripts/launch_gke.sh --project $PROJECT --cluster $CLUSTER --zone $ZONE --logs ${WORKLOAD_NAME}"
 echo ""
 echo "Cleanup:"
-echo "  ./scripts/launch_gke.sh --delete ${WORKLOAD_NAME}"
+echo "  ./scripts/launch_gke.sh --project $PROJECT --cluster $CLUSTER --zone $ZONE --delete ${WORKLOAD_NAME}"

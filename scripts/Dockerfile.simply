@@ -1,13 +1,16 @@
 FROM python:3.12-slim
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Install JAX with TPU support
-RUN pip install --no-cache-dir \
+RUN uv pip install --system --no-cache \
     "jax[tpu]>=0.8.2" \
     "jaxlib>=0.8.1" \
     "libtpu>=0.0.30"
 
 # Simply dependencies (from pyproject.toml)
-RUN pip install --no-cache-dir \
+RUN uv pip install --system --no-cache \
     "absl-py>=2.3.1" \
     datasets \
     deprecated \
@@ -22,6 +25,9 @@ RUN pip install --no-cache-dir \
     "wandb>=0.25.0" \
     gcsfs \
     etils \
-    huggingface_hub
+    huggingface_hub \
+    importlib_resources \
+    tensorflow-cpu \
+    tensorflow-datasets
 
 WORKDIR /app

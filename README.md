@@ -25,25 +25,7 @@ export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
 #### Running on GKE with XPK
-For GKE clusters with TPU node pools, use the provided launch script:
-
-```bash
-# Build the base Docker image
-docker build -f scripts/Dockerfile.simply -t gcr.io/$PROJECT/simply-jax-tpu:latest .
-docker push gcr.io/$PROJECT/simply-jax-tpu:latest
-
-# Launch a training workload
-./scripts/launch_gke.sh --config qwen3_0p6b \
-    --project my-project --cluster my-cluster \
-    --tpu-type v4-8 --image gcr.io/$PROJECT/simply-jax-tpu:latest
-
-# Manage workloads
-./scripts/launch_gke.sh --list        # list workloads
-./scripts/launch_gke.sh --logs NAME   # stream logs
-./scripts/launch_gke.sh --delete NAME # delete a workload
-```
-
-See the [GKE section in the full GCloud guide](docs/gcloud.md#11-running-on-gke-with-xpk) for details.
+Google Kubernetes Engine (GKE) is supported. See [GKE quick start](gcloud_quickstart.md#optional-running-on-gke-with-xpk) to run your first experiment on GKE, and [GKE section in the full GCloud guide](docs/gcloud.md#11-running-on-gke-with-xpk) for details.
 
 #### Automated AI research with agents
 
