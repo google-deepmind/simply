@@ -51,7 +51,7 @@ gcloud compute networks subnets update default \
 ### Cloud NAT
 
 If your VMs use internal-only IPs (no external IP), they need Cloud
-NAT to reach the internet for pip installs and downloading assets:
+NAT to reach the internet for package installs and downloading assets:
 
 ```bash
 gcloud compute routers create simply-router \
@@ -182,27 +182,10 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --worker=0
 ```
 
-### Install Python 3.11
-
-TPU VMs ship with Python 3.10, but Simply requires 3.11+ (uses
-`typing.Self`):
+### Install uv
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
-```
-
-### Virtual Environment and Dependencies
-
-```bash
-python3.11 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install -r requirements.txt
-pip install google-cloud-storage  # for TensorBoard gs:// support
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ### Download Code from GCS
@@ -211,6 +194,13 @@ pip install google-cloud-storage  # for TensorBoard gs:// support
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
+```
+
+### Install Dependencies
+
+```bash
+uv sync --extra tpu --extra tfds --extra gcloud
+source .venv/bin/activate
 ```
 
 ### Set Asset Paths
@@ -233,7 +223,7 @@ SSH in and run directly:
 
 ```bash
 cd /tmp/simply
-source /tmp/simply_venv/bin/activate
+source .venv/bin/activate
 export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
@@ -272,7 +262,7 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --worker=all \
     --command="
 cd /tmp/simply
-source /tmp/simply_venv/bin/activate
+source .venv/bin/activate
 export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
@@ -356,19 +346,11 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --zone=$ZONE --project=$PROJECT \
     --worker=all \
     --command="
-sudo apt-get update -qq
-sudo apt-get install -y -qq software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
-python3.11 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -q -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+curl -LsSf https://astral.sh/uv/install.sh | sh
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
-pip install -q -r requirements.txt
-pip install -q google-cloud-storage
+uv sync --extra tpu --extra tfds --extra gcloud
 "
 
 # Run experiment (GCS for assets and experiment dir)
@@ -378,7 +360,7 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --ssh-flag="-o ServerAliveInterval=30" \
     --command="
 cd /tmp/simply
-source /tmp/simply_venv/bin/activate
+source .venv/bin/activate
 export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
@@ -500,24 +482,16 @@ EXPERIMENT_DIR=$BUCKET/experiments/my_experiment
 NUM_WORKERS=4
 
 SETUP_CMD="
-sudo apt-get update -qq
-sudo apt-get install -y -qq software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
-python3.11 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -q -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+curl -LsSf https://astral.sh/uv/install.sh | sh
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
-pip install -q -r /tmp/simply/requirements.txt
-pip install -q google-cloud-storage
+uv sync --extra tpu --extra tfds --extra gcloud
 "
 
 RUN_CMD="
 cd /tmp/simply
-source /tmp/simply_venv/bin/activate
+source .venv/bin/activate
 export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
@@ -616,4 +590,5 @@ experiments and don't need to be recreated.
 
 ## Future Work
 
-- **GPU VMs** -- A100/H100 setup
+- **GKE (TPU + GPU)** -- See the [GKE guide](gke.md) for running
+  Simply on GKE with XPK, including GPU support.

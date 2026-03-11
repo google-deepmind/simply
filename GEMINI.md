@@ -10,13 +10,13 @@ Simply is a minimal JAX-based research codebase for LLM training and inference. 
 
 ### Installation
 ```bash
-# Install JAX (environment-specific)
-pip install -U jax              # CPU
-pip install -U "jax[cuda13]"    # GPU
-pip install -U "jax[tpu]"       # TPU
+# Install uv (https://docs.astral.sh/uv/)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install other dependencies
-pip install -r requirements.txt
+# Install simply with JAX (environment-specific)
+uv sync                    # CPU
+uv sync --extra gpu        # GPU
+uv sync --extra tpu        # TPU
 
 # Download models and datasets
 python setup/setup_assets.py

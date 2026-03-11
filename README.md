@@ -24,6 +24,9 @@ export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python
 #### Running on Google Cloud TPUs
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
+#### Running on GKE (Google Kubernetes Engine)
+See the [GKE Quickstart](gke_quickstart.md) to run your first experiment on GKE using XPK, or the [full GKE guide](docs/gke.md) for multi-host TPU and multi-node GPU training.
+
 #### Automated AI research with agents
 
 You can use agents like [Google Antigravity](https://antigravity.google/), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) to run automated research experiments. For example, paste the following prompt into your agent from the repo root to have it design and benchmark new optimizers on a toy setting:
@@ -50,20 +53,17 @@ The main dependencies are:
 Install dependencies:
 
 ```bash
-# JAX installation is environment-specific. See https://docs.jax.dev/en/latest/installation.html
-# CPU:
-pip install -U jax
-# GPU:
-pip install -U "jax[cuda13]"
-# TPU:
-pip install -U "jax[tpu]"
+# Install uv (https://docs.astral.sh/uv/):
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install simply and its dependencies:
-pip install .
+uv sync
 # With optional dependencies:
-pip install ".[tfds]"       # for TensorFlow Datasets
-pip install ".[math-eval]"  # for simply/utils/math_eval.py
-pip install ".[dev]"        # for testing (pytest)
+uv sync --extra tfds       # for TensorFlow Datasets
+uv sync --extra gpu        # for GPU (CUDA)
+uv sync --extra tpu        # for TPU
+uv sync --extra math-eval  # for simply/utils/math_eval.py
+uv sync --extra dev        # for testing (pytest)
 ```
 
 ## Setup Model Checkpoints and Datasets
@@ -72,7 +72,7 @@ Download datasets and model checkpoints in format supported by Simply from Huggi
 
 ```bash
 # Install huggingface_hub
-pip install huggingface_hub
+uv pip install huggingface_hub
 
 # Download both models and datasets
 python setup/setup_assets.py

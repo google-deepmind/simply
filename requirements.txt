@@ -1,3 +1,0 @@
-# This file is a thin wrapper around pyproject.toml.
-# Prefer: pip install . or pip install ".[tfds,dev]"
-.

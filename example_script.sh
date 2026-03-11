@@ -1,6 +1,10 @@
 #!/bin/bash
 
 # Example command for installing dependencies.
+# Requires uv: https://docs.astral.sh/uv/
+# Install uv if not available:
+#   curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # JAX installation is environment-specific (CPU, GPU, TPU). Check the official JAX installation guide at https://docs.jax.dev/en/latest/installation.html.
 echo "Select JAX installation type:"
 echo "1) CPU"
@@ -10,25 +14,21 @@ read -p "Enter your choice (1-3): " jax_type
 
 case $jax_type in
   1)
-    echo "Installing JAX for CPU..."
-    pip install -U jax
+    echo "Installing for CPU..."
+    uv sync
     ;;
   2)
-    echo "CUDA versions supported by JAX can be found at https://docs.jax.dev/en/latest/installation.html#cuda-cudnn-installation."
-    read -p "Enter your CUDA version (e.g., cuda12): " cuda_version
-    echo "Installing JAX for GPU with $cuda_version..."
-    pip install -U "jax[$cuda_version]"
+    echo "Installing for GPU..."
+    uv sync --extra gpu
     ;;
   3)
-    echo "Installing JAX for TPU..."
-    pip install -U "jax[tpu]"
+    echo "Installing for TPU..."
+    uv sync --extra tpu
     ;;
   *)
-    echo "Invalid choice. Skipping JAX installation."
+    echo "Invalid choice. Skipping installation."
     ;;
 esac
-
-pip install -r requirements.txt
 
 # Example command for local run.
 # Add "export JAX_DISABLE_JIT=True;" to disable `jit` for easier debugging.

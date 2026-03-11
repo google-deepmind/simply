@@ -17,8 +17,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: astral-sh/setup-uv@v5
+
       - name: Install dependencies
-        run: pip install -e ".[dev,tfds,math-eval]"
+        run: uv pip install --system -e ".[dev,tfds,math-eval]"
 
       - name: Run tests
         run: pytest simply/ -v --tb=short

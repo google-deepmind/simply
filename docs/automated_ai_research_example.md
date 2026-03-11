@@ -17,7 +17,7 @@ cloud (or locally if you have GPUs available).
 ## Prerequisites
 
 ```bash
-pip install ".[tfds]"
+uv sync --extra tfds
 ```
 
 The pretraining example uses IMDB reviews (auto-downloaded by TFDS).

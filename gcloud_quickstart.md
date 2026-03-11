@@ -100,23 +100,19 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 Then on the VM:
 
 ```bash
-# Install Python 3.12 (Simply requires 3.12+)
-sudo apt-get update
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
-
-# Create venv and install deps
-python3.12 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Download code from GCS
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
-pip install ".[tpu,tfds,gcloud]"
+
+# Install deps (uv sync uses the lockfile)
+uv sync --extra tpu --extra tfds --extra gcloud
+
+# Activate venv
+source .venv/bin/activate
 
 # Point Simply at GCS assets
 export SIMPLY_MODELS=$BUCKET/models/
@@ -132,7 +128,7 @@ persist across SSH sessions.
 
 ```bash
 cd /tmp/simply
-source /tmp/simply_venv/bin/activate
+source .venv/bin/activate
 export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/

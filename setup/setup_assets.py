@@ -30,7 +30,7 @@ try:
   from huggingface_hub import snapshot_download
 except ImportError:
   print("Error: huggingface_hub not found. Install with:")
-  print("  pip install huggingface_hub")
+  print("  uv pip install huggingface_hub")
   sys.exit(1)
 
 
