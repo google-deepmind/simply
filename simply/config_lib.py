@@ -1914,6 +1914,16 @@ def lm_test():
       tb_log_interval=2,
   )
 
+@ExperimentConfigRegistry.register
+def lm_test_gke_training() -> BaseExperimentConfig:
+  """Synthetic config for testing GKE training."""
+  return dataclasses.replace(
+      lm_test(),
+      init_ckpt_dir='',
+      batch_size=128,
+      should_save_ckpt=False,
+      gmm_impl='ragged_dot',
+  )
 
 @ExperimentConfigRegistry.register
 def lm_no_scan_test():

@@ -24,6 +24,9 @@ export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python
 #### Running on Google Cloud TPUs
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
+#### Running on GKE with XPK
+Google Kubernetes Engine (GKE) is supported. See [GKE quick start](gcloud_quickstart.md#optional-running-on-gke-with-xpk) to run your first experiment on GKE, and [GKE section in the full GCloud guide](docs/gcloud.md#11-running-on-gke-with-xpk) for details.
+
 #### Automated AI research with agents
 
 You can use agents like [Google Antigravity](https://antigravity.google/), [Claude Code](https://docs.anthropic.com/en/docs/claude-code), or [Gemini CLI](https://github.com/google-gemini/gemini-cli) to run automated research experiments. For example, paste the following prompt into your agent from the repo root to have it design and benchmark new optimizers on a toy setting:

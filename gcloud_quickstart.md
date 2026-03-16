@@ -150,6 +150,92 @@ gcloud compute tpus tpu-vm delete $TPU_NAME \
     --zone=$ZONE --project=$PROJECT --quiet
 ```
 
+## (Optional) Running on GKE with XPK
+
+For GKE clusters with TPU node pools, you can use
+[XPK](https://github.com/AI-Hypercomputer/xpk) to launch Simply
+training workloads. This section walks through the full workflow.
+For advanced topics (details, profiling, troubleshooting), see the
+[full guide](docs/gcloud.md#11-running-on-gke-with-xpk).
+
+### Prerequisites
+
+- A GKE cluster with a TPU node pool already provisioned
+- [XPK](https://github.com/AI-Hypercomputer/xpk) installed
+  (`pip install xpk`)
+- Docker installed and authenticated to push to GCR/Artifact
+  Registry
+- `kubectl` configured for your cluster
+  (`gcloud container clusters get-credentials ...`)
+
+### Quick Commands
+
+Set these once per shell session. Replace the values with your own
+project and cluster details.
+
+```bash
+export PROJECT=your-gcp-project-id
+export CLUSTER=your-gke-cluster-name
+export ZONE=us-central1
+export TPUTYPE=tpu7x-128
+```
+
+Build the Simply base image and push it to your project's container
+registry. This image has JAX with TPU support and all Simply
+dependencies pre-installed.
+
+```bash
+cd /path/to/simply
+
+# Build the Docker image
+docker build -f scripts/Dockerfile.simply \
+    -t gcr.io/$PROJECT/simply-jax-tpu:latest .
+
+# Push to Google Container Registry
+docker push gcr.io/$PROJECT/simply-jax-tpu:latest
+```
+
+Use the launcher script to submit the workload via XPK. The
+`lm_test_gke_training` config is a small model designed for
+testing GKE training -- it uses no checkpoint and disables
+checkpoint saving, so no GCS asset upload is needed.
+
+```bash
+./scripts/launch_gke.sh \
+    --config lm_test_gke_training \
+    --project $PROJECT \
+    --cluster $CLUSTER \
+    --zone $ZONE \
+    --tpu-type $TPUTYPE \
+    --image gcr.io/$PROJECT/simply-jax-tpu:latest
+```
+
+The script packages the Simply source directory (via XPK's
+`--script-dir`), installs it inside the container, downloads the
+tokenizer, and starts training.
+
+To preview the XPK command without submitting, add `--dry-run`.
+
+To monitor and delete the workloads, you can use the following
+commands:
+
+```bash
+# List all Simply workloads on the cluster
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --list
+
+# Stream logs for a specific workload
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --logs JOB_NAME
+
+# Delete a workload when done
+./scripts/launch_gke.sh \
+    --project $PROJECT --cluster $CLUSTER --zone $ZONE \
+    --delete JOB_NAME
+```
+
 ## What Next?
 
 See the [full guide](docs/gcloud.md) for:
