@@ -151,10 +151,10 @@ class CommonTest(absltest.TestCase):
     self.assertEqual(z.shape, a.shape)
 
   def test_neg_inf(self):
-    self.assertAlmostEqual(common.neg_inf(jnp.float32), -1.7014117e38)
-    self.assertAlmostEqual(common.neg_inf(jnp.float16), -3.275e4)
-    self.assertAlmostEqual(common.neg_inf(jnp.bfloat16), -1.6947657e38)
-    self.assertAlmostEqual(common.neg_inf(jnp.int32), -1073741823.5)
+    np.testing.assert_allclose(common.neg_inf(jnp.float32), -1.7014117e38)
+    np.testing.assert_allclose(common.neg_inf(jnp.float16), -3.275e4, rtol=1e-4)
+    np.testing.assert_allclose(common.neg_inf(jnp.bfloat16), -1.6947657e38)
+    np.testing.assert_allclose(common.neg_inf(jnp.int32), -1073741823.5)
 
   def test_reduce_same(self):
     with self.assertRaises(ValueError):
@@ -289,6 +289,22 @@ class RaggedArrayTest(absltest.TestCase):
         y.to_numpy_list(),
         [np.array([2, 3]), np.array([]), np.array([4, 5]), np.array([7, 8])],
     )
+
+  def test_when(self):
+
+    def _double(x, y):
+      return x * 2, y * 2
+
+    self.assertEqual(common.when(True)(_double)(3, 4), (6, 8))
+    self.assertEqual(common.when(False)(_double)(3, 4), (3, 4))
+
+    @jax.jit
+    def _fn(condition, x, y):
+      return common.when(condition)(_double)(x, y)
+
+    self.assertEqual(_fn(True, 3, 4), (6, 8))
+    self.assertEqual(_fn(False, 3, 4), (3, 4))
+
 
 if __name__ == '__main__':
   absltest.main()

@@ -107,7 +107,7 @@ def main(argv: Sequence[str]) -> None:
   evaluation = evaluation_lib.EvaluationRegistry.get_instance(_EVALUATION.value)
 
   datasource = data_lib.DataSourceRegistry.get_instance(_DATASOURCE_NAME.value)
-  dataset = grain.MapDataset.source(datasource.load())
+  dataset = data_lib.get_data_source(datasource)
   dataset = dataset.repeat(_N_REPEATS.value)
   num_total_examples = len(dataset)
 

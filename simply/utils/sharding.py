@@ -17,7 +17,6 @@ import asyncio
 import collections
 from collections.abc import Callable, MutableMapping, Sequence
 import dataclasses
-import functools
 import os
 import time
 from typing import Any, Mapping
@@ -122,8 +121,8 @@ def create_mesh(
     mesh_shape = [len(jax.devices())] + [1] * (len(axis_names) - 1)
   if isinstance(mesh_shape, Mapping):
     mesh_shape = [mesh_shape.get(axis_name, 1) for axis_name in axis_names]
-  if len(mesh_shape) == 2:
-    mesh_shape = (1, *mesh_shape)
+  if len(mesh_shape) < len(axis_names):
+    mesh_shape = [1] * (len(axis_names) - len(mesh_shape)) + list(mesh_shape)
   if len(mesh_shape) != len(axis_names):
     raise ValueError(f'{mesh_shape=} does not match {axis_names=}')
 
@@ -235,7 +234,7 @@ def with_sharding_constraint(
   """An extension of jax.lax.with_sharding_constraint.
 
   Besides js.Sharding, it also accepts PartitionAnnotation (e.g. [['replica',
-  'data'], None]]) as partition input. Plus, it requires partition to have the
+  'data'], None]) as partition input. Plus, it requires partition to have the
   same length as x.ndim if exists, in order to avoid incorrect implicit sharding
   extended annotation.
 
@@ -253,7 +252,7 @@ def with_sharding_constraint(
   partition = partition_spec(partition)
   if len(partition) > 0 and len(partition) != len(x.shape):  # pylint: disable=g-explicit-length-test
     raise ValueError(
-        f'If exists, {partition=} must have the same length as {x.ndim=}.'
+        f'If exists, {partition=} must have the same length as {x.shape=}.'
     )
   if js.get_abstract_mesh().are_all_axes_explicit:
     return js.reshard(x, partition)
@@ -263,6 +262,11 @@ def with_sharding_constraint(
         x, js.NamedSharding(create_mesh(), partition)
     )
   return jax.lax.with_sharding_constraint(x, partition)
+
+
+@jax.jit(static_argnames=('reduce_op',))
+def _preduce(x: jax.Array, reduce_op: Callable[..., jax.Array]):
+  return reduce_op(x, axis=0)
 
 
 def reduce_across_hosts(
@@ -289,10 +293,9 @@ def reduce_across_hosts(
 
   in_tree = jax.tree.map(pre_jit, in_tree)
   with js.set_mesh(global_mesh):
-    out_tree = jax.jit(
-        lambda x: jax.tree.map(functools.partial(reduce_op, axis=0), x),
-        out_shardings=js.PartitionSpec(),
-    )(in_tree)
+    out_tree = jax.tree.map(
+        lambda leaf: _preduce(leaf, reduce_op=reduce_op), in_tree
+    )
   return jax.tree.map(post_jit, out_tree)
 
 

@@ -669,7 +669,10 @@ def compute_ppo_loss(
 
   logpi = masked.masked(m.log_prob(targets), mask=answer_mask)
   logpi_old = masked.masked(batch.logprobs, mask=answer_mask)
-  logpi_ref = masked.masked(batch.ref_logprobs, mask=answer_mask)
+  if batch.ref_logprobs is not None:
+    logpi_ref = masked.masked(batch.ref_logprobs, mask=answer_mask)
+  else:
+    logpi_ref = logpi_old
 
   if use_grpo:
     # K3 estimator from http://joschu.net/blog/kl-approx.html.
@@ -875,23 +878,27 @@ def run_experiment(
     assert isinstance(data_state, Mapping)
     train_iter_state = data_state.get('train_iter_state', None)
 
-  if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
-    # Continue training from latest ckpt, so we load ref_params from init_ckpt.
-    abstract_params = ckpt_lib.get_abstract_params(model)
-    abstract_state = {'params': abstract_params}
-    ref_state = ckpt_lib.load_checkpoint_from_dir(
-        config.init_ckpt_dir,
-        abstract_state,
-        config.init_ckpt_step,
-        ckpt_format=config.init_ckpt_format,
-    )
-    ref_params = ref_state['params']
-  else:
-    ref_params = state['params']
+  if config.use_ref_params:
+    if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
+      # Continue training from latest ckpt, so we load ref_params from
+      # init_ckpt.
+      abstract_params = ckpt_lib.get_abstract_params(model)
+      abstract_state = {'params': abstract_params}
+      ref_state = ckpt_lib.load_checkpoint_from_dir(
+          config.init_ckpt_dir,
+          abstract_state,
+          config.init_ckpt_step,
+          ckpt_format=config.init_ckpt_format,
+      )
+      ref_params = ref_state['params']
+    else:
+      ref_params = state['params']
 
-  ref_params = jax.tree_util.tree_map(
-      lambda x: jnp.array(x, config.ref_params_dtype), ref_params
-  )
+    ref_params = jax.tree_util.tree_map(
+        lambda x: jnp.array(x, config.ref_params_dtype), ref_params
+    )
+  else:
+    ref_params = None
 
   # Compile loss, train and learning rate functions.
   t1 = time.time()
@@ -1146,7 +1153,11 @@ def run_experiment(
             sharding_lib.multihost_sharded(sampling_outputs),
             strict=True,
         ):
-          assert len(so_per_prompt) == config.num_samples_per_example
+          if len(so_per_prompt) != config.num_samples_per_example:
+            raise ValueError(
+                f'Expected {config.num_samples_per_example} samples per input'
+                f' example, but got {len(so_per_prompt)}.'
+            )
           for so in so_per_prompt:
             reward_future = evaluation_executor.submit(
                 evaluation.evaluate, input_example.raw_example, so.output_text

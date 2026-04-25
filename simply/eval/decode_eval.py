@@ -25,7 +25,6 @@ from typing import Any, cast
 from absl import app
 from absl import flags
 from etils import epath
-import grain
 import jax
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
@@ -284,7 +283,7 @@ def main(argv: Sequence[str]) -> None:
   prng_key = jax.random.key(seed)
 
   datasource = data_lib.DataSourceRegistry.get_instance(_DATASOURCE_NAME.value)
-  dataset = grain.MapDataset.source(datasource.load())
+  dataset = data_lib.get_data_source(datasource)
   dataset = dataset.repeat(_N_REPEATS.value)
   num_total_examples = len(dataset)
 

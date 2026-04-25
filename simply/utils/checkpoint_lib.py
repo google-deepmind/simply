@@ -42,8 +42,11 @@ CHECKPOINT_FORMAT_KEY = '__checkpoint_format__'
 DATA_ITEM_NAME = 'data'
 
 
+@dataclasses.dataclass(frozen=True)
 class CheckpointFormat(abc.ABC):
   """Checkpoint formats for Simply."""
+
+  restore_dtype: jax.typing.DTypeLike | None = None
 
   @final
   def __post_init__(self):
@@ -118,6 +121,9 @@ class LegacyFormat(CheckpointFormat):
 @dataclasses.dataclass(frozen=True)
 class V2Format(CheckpointFormat):
   """Current format that modulizes a lot of model components."""
+
+
+DefaultFormat = V2Format
 
 
 @CheckpointFormatRegistry.register
@@ -422,16 +428,36 @@ def load_checkpoint_from_manager(
   )
 
 
-def last_checkpoint_step(ckpt_dir: str) -> int:
+def last_checkpoint_step(ckpt_dir: epath.PathLike) -> int:
   last_step = -1
-  ckpt_dir_path = epath.Path(ckpt_dir)
-  if not ckpt_dir_path.is_dir():
+  ckpt_dir = epath.Path(ckpt_dir)
+  if not ckpt_dir.is_dir():
     return -1
-  for item in ckpt_dir_path.iterdir():
+  for item in ckpt_dir.iterdir():
     step = item.name
     if step.isdigit() and int(step) > last_step:
       last_step = int(step)
   return last_step
+
+
+def get_checkpoint_path(ckpt_dir: str, ckpt_step: int = -1) -> str:
+  """Returns the checkpoint path for the given ckpt_dir and ckpt_step."""
+  ckpt_dir = epath.Path(ckpt_dir)
+  if not ckpt_dir.is_dir():
+    raise ValueError(f'Checkpoint directory {ckpt_dir} does not exist.')
+  if (ckpt_dir / '_CHECKPOINT_METADATA').exists() or (
+      ckpt_dir / '_METADATA'
+  ).exists():
+    if ckpt_step >= 0:
+      raise ValueError(
+          'Checkpoint step must be -1 for checkpoints with'
+          ' _CHECKPOINT_METADATA or _METADATA.'
+      )
+    return ckpt_dir.as_posix()
+  ckpt_step = last_checkpoint_step(ckpt_dir)
+  if ckpt_step < 0:
+    raise ValueError(f'No checkpoint found in {ckpt_dir}.')
+  return (ckpt_dir / str(ckpt_step)).as_posix()
 
 
 def load_checkpoint_from_dir(
@@ -441,12 +467,8 @@ def load_checkpoint_from_dir(
     ckpt_format: CheckpointFormat | str = '',
 ):
   """Loads a checkpoint at ckpt_step in the format of abstract_state."""
-  if ckpt_step < 0:
-    ckpt_step = last_checkpoint_step(ckpt_dir)
-  if ckpt_step < 0:
-    raise ValueError(f'No checkpoint found in {ckpt_dir}.')
   return load_checkpoint_from_path(
-      os.path.join(ckpt_dir, str(ckpt_step)),
+      get_checkpoint_path(ckpt_dir, ckpt_step),
       abstract_state,
       ckpt_format=ckpt_format,
   )
@@ -502,7 +524,9 @@ def resolve_checkpoint_handler_from_path(
   return ocp.CompositeCheckpointHandler(**handlers)
 
 
-def construct_restore_item(x: PyTree) -> PyTree:
+def construct_restore_item(
+    x: PyTree, restore_dtype: jax.typing.DTypeLike | None = None
+) -> PyTree:
   """Constructs a restore item from a PyTree."""
   leaves, treedef = jax.tree_util.tree_flatten(x)
 
@@ -516,6 +540,20 @@ def construct_restore_item(x: PyTree) -> PyTree:
       [leaf.shape for leaf in leaves], mesh.axis_names, mesh.axis_sizes
   )
 
+  def _restore_leaf_dtype(
+      leaf_dtype: jax.typing.DTypeLike,
+  ) -> jax.typing.DTypeLike:
+    if restore_dtype is None:
+      return leaf_dtype
+    if not jnp.issubdtype(restore_dtype, jnp.inexact):
+      raise ValueError(f'Unsupported restore dtype: {restore_dtype}')
+    if (
+        jnp.issubdtype(leaf_dtype, jnp.inexact)
+        and jnp.dtype(leaf_dtype).itemsize > jnp.dtype(restore_dtype).itemsize
+    ):
+      return restore_dtype
+    return leaf_dtype
+
   structs = []
   for leaf, partition in zip(leaves, partitions, strict=True):
     if not isinstance(
@@ -525,7 +563,7 @@ def construct_restore_item(x: PyTree) -> PyTree:
     structs.append(
         jax.ShapeDtypeStruct(
             shape=leaf.shape,
-            dtype=leaf.dtype,
+            dtype=_restore_leaf_dtype(leaf.dtype),
             sharding=js.NamedSharding(
                 mesh, sharding_lib.partition_spec(partition)
             ),
@@ -572,7 +610,9 @@ def load_checkpoint_from_path(
       state_key = 'default'
 
     original_metadata = item_metadata[state_key] if state_key else item_metadata
-    restore_item = construct_restore_item(original_metadata.tree)
+    restore_item = construct_restore_item(
+        original_metadata.tree, ckpt_format.restore_dtype
+    )
 
     def transform_state_fn(stored_state: PyTree) -> PyTree:  # pylint: disable=function-redefined
 
@@ -602,15 +642,9 @@ def load_checkpoint_from_path(
               jax.lax.with_sharding_constraint(value, abstract.sharding),
               abstract.dtype,
           )
-          if not isinstance(value, jax.core.Tracer):
-            if (
-                value.sharding != new_value.sharding
-                or value.dtype != new_value.dtype
-            ):
-              logging.info('Deleting old value at path=%s', path)
-              # This value is definitely not reused by the output, so we delete
-              # the array to save HBM.
-              value.delete()
+          if not isinstance(value, jax.core.Tracer) and value is not new_value:
+            logging.info('Deleting old value at path=%s', path)
+            value.delete()
           return new_value
         except KeyError as e:
           logging.warning(
@@ -673,7 +707,7 @@ def save_checkpoint(
     checkpoint_manager: ocp.CheckpointManager,
     state: PyTree,
     ckpt_step: int,
-    ckpt_format: CheckpointFormat = V2Format(),
+    ckpt_format: CheckpointFormat = DefaultFormat(),
     data: PyTree | None = None,
     **kwargs: Any,
 ):

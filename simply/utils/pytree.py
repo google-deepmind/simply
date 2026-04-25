@@ -21,6 +21,7 @@ import re
 from typing import Any, Callable, cast
 import warnings
 
+from absl import logging
 from etils import epath
 import jax
 import numpy as np
@@ -320,19 +321,17 @@ def dump(ptree: Any, only_dump_basic: bool = True) -> PyTree:
   Returns:
     A json-like tree.
   """
+  if not only_dump_basic:
+    logging.log_first_n(
+        logging.WARNING, 'only_dump_basic can not be set false anymore.', 1
+    )
   if dataclasses.is_dataclass(ptree):
     res = {}
     registered_name = getattr(ptree, '__registered_name__')
     if registered_name:
       res['__dataclass__'] = registered_name
-
-    if only_dump_basic:
-      keys = [k.name for k in dataclasses.fields(ptree)]
-    else:
-      keys = ptree.__dict__.keys()
-    for k in keys:
-      v = ptree.__dict__[k]
-      res[k] = dump(v, only_dump_basic=only_dump_basic)
+    for field in dataclasses.fields(ptree):
+      res[field.name] = dump(getattr(ptree, field.name))
     return res
   if isinstance(ptree, enum.Enum):
     res = {}

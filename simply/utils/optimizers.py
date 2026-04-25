@@ -458,6 +458,7 @@ class Constant(LinearWarmupConstant):
 class LinearWarmupCosineDecay(Schedule):
   """Constant schedule."""
   value: float
+  start_value: float = 0.0
   end_decay: float = 0.0
 
   decay_start: int | None = None
@@ -511,7 +512,8 @@ class LinearWarmupCosineDecay(Schedule):
     return cosine_decay_schedule(
         steps, schedule.value, decay_steps=schedule.decay_steps,
         warmup_steps=schedule.warmup_steps,
-        end_decay=schedule.end_decay, decay_start=schedule.decay_start)
+        end_decay=schedule.end_decay, decay_start=schedule.decay_start,
+        start_value=schedule.start_value)
 
 
 def replace_fraction(
@@ -573,7 +575,8 @@ def create_lr_schedule_v0(config):
 
 
 def cosine_decay_schedule(
-    steps, val, decay_steps, warmup_steps=1, end_decay=0.1, decay_start=None):
+    steps, val, decay_steps, warmup_steps=1, end_decay=0.1, decay_start=None,
+    start_value=0.0):
   """Linear warmup and cosine decay schedule."""
   # Linear warmup.
   steps += 1
@@ -583,7 +586,8 @@ def cosine_decay_schedule(
   decay_progress = jnp.maximum(0.0, steps - decay_start) / decay_steps
   decay_factor = (
       1 + jnp.cos(jnp.minimum(decay_progress, 1.0) * jnp.pi)) / 2
-  actual_val = val * warmup_factor * (
+  warmup_val = start_value + (val - start_value) * warmup_factor
+  actual_val = warmup_val * (
       (1 - end_decay) * decay_factor + end_decay)
   actual_val = sharding.with_sharding_constraint(actual_val, None)
   return actual_val

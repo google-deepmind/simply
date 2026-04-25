@@ -530,17 +530,12 @@ def convert_array_with_abstract(
         jnp.astype(x, abstract.dtype), abstract.sharding
     )
 
-  replicated_sharding = x.sharding.update(spec=js.PartitionSpec())
-  with js.set_mesh(replicated_sharding.mesh):
-    if abstract.dtype.itemsize < x.dtype.itemsize:
-      x = jnp.astype(x, abstract.dtype)
-    x_replicated = jax.lax.with_sharding_constraint(x, replicated_sharding)
-    x_np = np.asarray(x_replicated)
-
-  y = jax.lax.with_sharding_constraint(
-      jnp.asarray(x_np, abstract.dtype), abstract.sharding
-  )
-  return y
+  # Direct device-to-device transfer avoids expensive host roundtrip.
+  # Cast under the source mesh context so jnp.astype compiles with the
+  # correct device ordering (the caller's mesh context may differ).
+  with js.set_mesh(x.sharding.mesh):
+    x = jnp.astype(x, abstract.dtype)
+  return jax.device_put(x, abstract.sharding)
 
 
 def neg_inf(dtype: jax.typing.DTypeLike) -> float:
@@ -551,7 +546,7 @@ def neg_inf(dtype: jax.typing.DTypeLike) -> float:
   else:
     raise ValueError(f'Unsupported dtype: {dtype}')
   # NOTE: Gemma uses -0.7 * dtype_max
-  return -0.5 * dtype_max
+  return float(-0.5 * dtype_max)
 
 
 def reduce_same(seq: Sequence[Any]) -> Any:
@@ -571,3 +566,36 @@ def pad_to_len(
     return arr.astype(dtype)
   pad_width = seq_len - len(arr)
   return np.pad(arr, (0, pad_width), constant_values=pad_value).astype(dtype)
+
+
+def round_up_to_base(x: int, base: int, threshold: int = 128):
+  """Rounds up to the nearest base multiple, but not when below threshold."""
+  if x < threshold:
+    return x
+  else:
+    return ((x + base - 1) // base) * base
+
+
+def when(condition: jax.typing.ArrayLike) -> Callable[..., Any]:
+  """Returns a decorator that conditionally applies a function."""
+
+  def _as_is(*args: Any) -> Any:
+    if len(args) == 0:
+      return None
+    if len(args) == 1:
+      return args[0]
+    return args
+
+  def _outer_wrapper(f):
+    @functools.wraps(f)
+    def _inner_wrapper(*args: Any) -> Any:
+      if not isinstance(condition, jax.core.Tracer):
+        if condition:
+          return f(*args)
+        return _as_is(*args)
+      else:
+        return jax.lax.cond(condition, f, _as_is, *args)
+
+    return _inner_wrapper
+
+  return _outer_wrapper

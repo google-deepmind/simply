@@ -19,6 +19,8 @@ import dataclasses
 import functools
 import json
 import logging
+import os
+import re
 from typing import Any, Mapping
 
 from etils import epath
@@ -37,6 +39,14 @@ def is_primary_process() -> bool:
   return jax.process_index() == 0
 
 
+@functools.cache
+def is_primary_task() -> bool:
+  """Returns if the current process is on task 0."""
+  if handle := os.environ.get('TASK_ID'):
+    return handle == '0'
+  return True
+
+
 def convert_to_scalar(x: Any) -> Any:
   """Convert x to a single Python scalar."""
   try:
@@ -49,7 +59,7 @@ def convert_to_scalar(x: Any) -> Any:
     return None
 
 
-def set_notes(notes: str) -> None:
+def set_notes(notes: str, should_set: bool | None = None) -> None:
   print(f'NOTES: {notes}')
 
 

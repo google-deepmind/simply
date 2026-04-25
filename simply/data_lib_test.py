@@ -15,6 +15,7 @@
 import dataclasses
 import json
 import typing
+from typing import Literal
 
 from absl.testing import absltest
 import numpy as np
@@ -332,6 +333,57 @@ class ChatFormatTransformTest(absltest.TestCase):
     )
 
 
+class RekeyTransformTest(absltest.TestCase):
+  """Tests for RekeyTransform."""
+
+  def test_rekeys_features(self):
+    transform = data_lib.RekeyTransform(key_map={'new_a': 'a', 'new_b': 'b'})
+    features = {'a': 1, 'b': 2, 'c': 3}
+    result = transform.map(features)
+    self.assertEqual(result, {'new_a': 1, 'new_b': 2})
+
+  def test_none_key_map(self):
+    transform = data_lib.RekeyTransform(key_map=None)
+    features = {'a': 1, 'b': 2}
+    result = transform.map(features)
+    self.assertEqual(result, features)
+
+
+class NumpyTransformTest(absltest.TestCase):
+  """Tests for NumpyTransform."""
+
+  def test_converts_to_numpy(self):
+    transform = data_lib.NumpyTransform()
+    features = {'a': [1, 2, 3], 'b': [4.0, 5.0]}
+    result = transform.map(features)
+    np.testing.assert_array_equal(result['a'], [1, 2, 3])
+    np.testing.assert_array_equal(result['b'], [4.0, 5.0])
+    self.assertIsInstance(result['a'], np.ndarray)
+
+  def test_type_cast_map(self):
+    transform = data_lib.NumpyTransform(type_cast_map={
+        'a': np.int32, 'b': np.float32,
+    })
+    features = {
+        'a': np.array([1.5, 2.5], dtype=np.float64),
+        'b': np.array([3, 4], dtype=np.int64),
+        'c': np.array([1, 2], dtype=np.int32),
+    }
+    result = transform.map(features)
+    self.assertEqual(result['a'].dtype, np.int32)
+    np.testing.assert_array_equal(result['a'], [1, 2])
+    self.assertEqual(result['b'].dtype, np.float32)
+    np.testing.assert_array_equal(result['b'], [3.0, 4.0])
+    # 'c' is still present (NumpyTransform keeps all keys)
+    self.assertIn('c', result)
+
+  def test_no_type_cast_map(self):
+    transform = data_lib.NumpyTransform(type_cast_map=None)
+    features = {'a': [1, 2]}
+    result = transform.map(features)
+    np.testing.assert_array_equal(result['a'], [1, 2])
+
+
 ################################################################################
 # Test Data Source
 ################################################################################
@@ -365,6 +417,7 @@ class MockExperimentConfig:
   prefetch_per_worker_buffer_size: int = 1
   validation_eval_batch_size: int = 2
   validation_eval_epochs: int = 1
+  shard_data_method: Literal['NO_SHARDING', 'BY_JAX_PROCESS'] = 'NO_SHARDING'
 
 
 class CreateIterDatasetTest(absltest.TestCase):

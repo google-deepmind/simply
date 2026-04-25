@@ -57,7 +57,6 @@ def lm_test():
       batch_size=16,
       vocab_size=64,
       seq_len=10,
-      dataset_name='simply_det:lm1b',
       lr=opt_lib.LinearWarmupCosineDecay(
           value=1e-3,
           warmup_steps=10,
@@ -532,7 +531,7 @@ class ModelLibTest(parameterized.TestCase):
   def test_chunked_local_attn(self):
     seq_len = 9
     window_size = 3
-    q = np.random.randn(2, seq_len, 2, 3, 4)
+    q = np.random.randn(2, seq_len, 3, 2, 4)
     k = np.random.randn(2, seq_len, 3, 4)
     v = np.random.randn(2, seq_len, 3, 4)
     segment_ids = np.array([
@@ -1286,6 +1285,17 @@ def simple_moe(
 
 
 class MoETest(parameterized.TestCase):
+  def vector_norm_error(self, a, b, axis=-1, reduce='max'):
+    norm_ = functools.partial(jnp.linalg.norm, axis=axis)
+    err = norm_(a - b) / jnp.maximum(norm_(a), 1e-7)
+    if reduce == 'max':
+      return jnp.max(err)
+    elif reduce == 'mean':
+      return jnp.mean(err)
+    elif reduce == 'sum':
+      return jnp.sum(err)
+    else:
+      return err
 
   @parameterized.named_parameters(
       dict(

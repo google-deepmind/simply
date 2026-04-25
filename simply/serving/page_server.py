@@ -90,6 +90,8 @@ _CKPT_STEP = flags.DEFINE_integer(
     'Checkpoint step to use. By default, use the latest checkpoint step.',
 )
 
+_CKPT_PATH = flags.DEFINE_string('ckpt_path', None, 'Path to the checkpoint.')
+
 _CKPT_FORMAT = flags.DEFINE_string(
     'ckpt_format', None, 'Checkpoint format to use. (Optional)'
 )
@@ -126,8 +128,29 @@ _LM_FORMAT = flags.DEFINE_string(
     ' experiment config.',
 )
 
+_PAGE_SIZE = flags.DEFINE_integer(
+    'page_size', 128, 'Page size to use for decoding.'
+)
+
+_TEMPERATURE = flags.DEFINE_float(
+    'temperature', 1.0, 'Temperature for sampling.'
+)
+
+_TOP_K = flags.DEFINE_integer('top_k', -1, 'Top-k for sampling.')
+
+_TOP_P = flags.DEFINE_float('top_p', 1.0, 'Top-p for sampling.')
+
+_INTERMEDIATE_STEPS = flags.DEFINE_integer(
+    'intermediate_steps', 1024, 'Intermediate steps for decoding.'
+)
 
 PyTree = core_common.PyTree
+
+
+def set_notes(notes: str):
+  experiment_helper.set_notes(
+      notes, should_set=experiment_helper.is_primary_task()
+  )
 
 
 class SimplyServiceResponse(NamedTuple):
@@ -162,8 +185,42 @@ class Batcher:
         extra_eos_tokens=self.lm_format.extra_eos_tokens,
     )
 
+  @functools.cached_property
+  def abstract_model_state(self) -> PyTree:
+    """Returns the abstract model state."""
+
+    def _init_fn():
+      params = self.model.init(jax.random.key(0))
+      if self.config.activation_dtype_name == 'bfloat16':
+        params = jax.tree_util.tree_map(
+            lambda x: jnp.astype(x, jnp.bfloat16)
+            if x.dtype == jnp.float32
+            else x,
+            params,
+        )
+      return {'params': params}
+
+    return core_common.eval_abstract_output(_init_fn)
+
   def update_params(self, params: PyTree):
     self.model_state['params'] = params
+
+  def update_params_from_checkpoint_path(self, ckpt_path: str):
+    """Updates the model params from a checkpoint path."""
+
+    if ckpt_format := self.config.init_ckpt_format:
+      ckpt_format_cls = checkpoint_lib.CheckpointFormatRegistry.get(ckpt_format)
+      ckpt_format = ckpt_format_cls(
+          restore_dtype=self.config.activation_dtype_name
+      )
+    logging.info('ckpt_format: %s', ckpt_format)
+
+    model_state = checkpoint_lib.load_checkpoint_from_path(
+        ckpt_path,
+        self.abstract_model_state,
+        ckpt_format=ckpt_format,
+    )
+    self.update_params(core_common.get_raw_arrays(model_state['params']))
 
   @functools.cached_property
   def request_queue(
@@ -180,15 +237,56 @@ class Batcher:
   ):
     self.request_queue.put((request, future), timeout=self.max_queue_timeout)
 
+  def _try_get_request(
+      self, max_seq_len: int, timeout: float
+  ) -> tuple[Any, asyncio.Future[SimplyServiceResponse], np.ndarray] | None:
+    """Tries to get a request from the queue."""
+    deadline = time.time() + timeout
+    while True:
+      try:
+        request, future = self.request_queue.get(
+            timeout=max(deadline - time.time(), 0)
+        )
+      except queue.Empty:
+        return None
+
+      logging.info('request: %s', request)
+      if future.cancelled():
+        logging.info('Future is already cancelled.')
+        continue
+
+      try:
+        inp = request
+        if pytree.tree_is_sequence(inp):
+          inp = self.lm_format.format(inp)
+        input_chunks = sampling_lib.input_as_chunks(inp)
+        logging.info('input_chunks: %s', input_chunks)
+        processed_input = self.input_processor.encode(input_chunks, max_seq_len)
+      except Exception as e:  # pylint: disable=broad-except
+        logging.exception('Failed to process input: %s', e)
+        future.get_loop().call_soon_threadsafe(
+            future.set_result,
+            SimplyServiceResponse(
+                code=grpc.StatusCode.INVALID_ARGUMENT,
+                details=str(e),
+            ),
+        )
+        continue
+
+      return request, future, np.asarray(processed_input.tokens)
+
   def decode_fn(
       self, sampling_state: rpa.SamplingState, params: PyTree
   ) -> rpa.SamplingState:
     return sampling_state.continue_decode(
         forward_fn=self.model.apply,
-        # TODO: Support intermediate insert.
         until_fn=lambda state: jnp.any(~state.is_pad_seq & state.has_ended),
         params=params,
         max_num_issue_tokens=_BATCH_SIZE.value,  # TODO: Tune this.
+        temperature=_TEMPERATURE.value,
+        top_k=_TOP_K.value,
+        top_p=_TOP_P.value,
+        intermediate_steps=_INTERMEDIATE_STEPS.value,
     )
 
   def loop(self, stop_event: threading.Event):
@@ -199,8 +297,9 @@ class Batcher:
     )
     seed = int(time.time() * 1000)
     seed = multihost_utils.broadcast_one_to_all(seed)
+    logging.info('seed: %s', seed)
 
-    page_size = 128
+    page_size = _PAGE_SIZE.value
     total_num_pages = (
         (_MAX_SEQ_LEN.value - 1 + page_size - 1)
         // page_size
@@ -220,7 +319,8 @@ class Batcher:
             _MAX_SEQ_LEN.value
         ),
     )
-    experiment_helper.set_notes('Compiling ...')
+    # TODO: Compile might be parallelized with checkpoint loading.
+    set_notes('Compiling ...')
     logging.info('Compiling decode function...')
     time_start = time.time()
     if jax.config.jax_disable_jit:
@@ -265,46 +365,38 @@ class Batcher:
     logging.info(
         'Compiled release function. Took %s seconds.', time.time() - time_start
     )
-    experiment_helper.set_notes('Ready')
+    set_notes('Ready')
 
     batch = [None] * sampling_state.batch_size
-    while not stop_event.is_set():
+    while True:
       while not all(batch):
-        try:
-          request, future = self.request_queue.get(
-              timeout=self.max_queue_timeout if any(batch) else None
+        request, future = None, None
+        input_tokens = np.empty((0,), dtype=np.int32)
+        if experiment_helper.is_primary_task():
+          timeout = (
+              self.max_queue_timeout
+              if any(batch)
+              else max(self.max_queue_timeout, 60)
           )
-          logging.info('request: %s', request)
-          if future.cancelled():
-            logging.info('Future is already cancelled.')
-            continue
-        except queue.Empty:
-          break
+          item = self._try_get_request(
+              max_seq_len=sampling_state.max_seq_len, timeout=timeout
+          )
+          if item is not None:
+            request, future, input_tokens = item
 
-        try:
-          inp = request
-          if pytree.tree_is_sequence(inp):
-            inp = self.lm_format.format(inp)
-          input_chunks = sampling_lib.input_as_chunks(inp)
-          logging.info('input_chunks: %s', input_chunks)
-          processed_input = self.input_processor.encode(
-              input_chunks, sampling_state.max_seq_len
-          )
-        except Exception as e:  # pylint: disable=broad-except
-          logging.exception('Failed to process input: %s', e)
-          future.get_loop().call_soon_threadsafe(
-              future.set_result,
-              SimplyServiceResponse(
-                  code=grpc.StatusCode.INVALID_ARGUMENT,
-                  details=str(e),
-              ),
-          )
+        input_len = len(input_tokens)
+        n = sharding.sum_across_hosts(input_len)
+        if n == 0:
+          if sharding.sum_across_hosts(stop_event.is_set()):
+            return
+          if any(batch):
+            break
           continue
-        n = len(processed_input.tokens)
         input_tokens = np.pad(
-            np.array(processed_input.tokens),
-            (0, sampling_state.max_seq_len - n),
+            input_tokens, (0, sampling_state.max_seq_len - input_len)
         )
+        input_tokens = sharding.sum_across_hosts(input_tokens)
+
         sampling_state, index = compiled_push_fn(
             sampling_state, input_tokens, n, _MAX_DECODE_STEPS.value
         )
@@ -320,44 +412,71 @@ class Batcher:
       logging.info('sampling_state.position=%s', sampling_state.position)
       logging.info('sampling_state.input_lens=%s', sampling_state.input_lens)
       logging.info('sampling_state.rank=%s', sampling_state.rank)
-      completed_mask = ~sampling_state.is_pad_seq & sampling_state.has_ended
-      completed_seqs = sampling_state.get(completed_mask)
-      logging.info('Completed decode function...')
-
-      is_cancelled = [False] * sampling_state.batch_size
-      for i, request_future in enumerate(batch):
-        if request_future is not None:
-          _, future = request_future
-          if future.cancelled():
-            logging.info('Future is cancelled.')
-            is_cancelled[i] = True
-            batch[i] = None
-      logging.info('is_cancelled=%s', is_cancelled)
-      logging.info('Releasing sampling state...')
-      sampling_state = compiled_release_fn(
-          sampling_state, completed_mask | jnp.array(is_cancelled)
+      logging.info(
+          'num_used_tokens=%s, max_total_num_tokens=%s',
+          sampling_state.num_used_tokens,
+          sampling_state.max_total_num_tokens,
+      )
+      logging.info(
+          'sampling_state.desired_issue_lens=%s',
+          sampling_state.desired_issue_lens,
+      )
+      logging.info(
+          'sampling_state.issue_lens=%s',
+          sampling_state.issue_lens(_BATCH_SIZE.value),
       )
 
-      for seq in completed_seqs:
-        seq = {key: value for key, value in seq.items()}
-        seq['output_text'] = sampling_lib.chunks_as_text(
-            self.input_processor.decode(
-                seq['tokens'][seq['input_len'] :].tolist()
-            )
+      logging.info('Completed decode function...')
+      completed_mask = ~sampling_state.is_pad_seq & sampling_state.has_ended
+      completed_seqs = sampling_state.get(completed_mask)
+
+      is_cancelled = np.array([False] * sampling_state.batch_size)
+      if experiment_helper.is_primary_task():
+        for i, request_future in enumerate(batch):
+          if request_future is not None:
+            _, future = request_future
+            if future is not None and future.cancelled():
+              logging.info('Future is cancelled.')
+              is_cancelled[i] = True
+      is_cancelled = np.astype(sharding.sum_across_hosts(is_cancelled), np.bool)
+
+      logging.info('is_cancelled=%s', is_cancelled)
+      logging.info('Releasing sampling state...')
+      should_release_mask = completed_mask | jnp.asarray(is_cancelled)
+      if np.any(should_release_mask):
+        sampling_state = compiled_release_fn(
+            sampling_state, should_release_mask
         )
-        index = seq.pop('index')
-        if request_future := batch[index]:
-          _, future = request_future
-          if not future.cancelled():
-            logging.info('Setting future result.')
-            future.get_loop().call_soon_threadsafe(
-                future.set_result,
-                SimplyServiceResponse(
-                    code=grpc.StatusCode.OK,
-                    result=seq,
-                ),
-            )
-          batch[index] = None
+
+      if experiment_helper.is_primary_task():
+        for seq in completed_seqs:
+          seq = {key: value for key, value in seq.items()}
+          seq['output_text'] = sampling_lib.chunks_as_text(
+              self.input_processor.decode(
+                  seq['tokens'][seq['input_len'] :].tolist()
+              )
+          )
+          if parser := getattr(self.lm_format, 'parse', None):
+            assistant_marker = getattr(self.lm_format, 'assistant_marker', '')
+            text_to_parse = assistant_marker + seq['output_text']
+            logging.info('output_text_to_parse=%s', text_to_parse)
+            output_messages = parser(text_to_parse)
+            seq['output_messages'] = output_messages
+          index = seq.pop('index')
+          if request_future := batch[index]:
+            _, future = request_future
+            if not future.cancelled():
+              logging.info('Setting future result.')
+              future.get_loop().call_soon_threadsafe(
+                  future.set_result,
+                  SimplyServiceResponse(
+                      code=grpc.StatusCode.OK,
+                      result=seq,
+                  ),
+              )
+
+      for index in np.flatnonzero(should_release_mask):
+        batch[index] = None
 
   def thread(
       self,
@@ -389,7 +508,7 @@ class SimplyService(server_pb2_grpc.SimplyService):
 
   @functools.cached_property
   def error_message_queue(self) -> queue.Queue[Exception]:
-    return queue.Queue[Exception]()
+    return queue.Queue[Exception](1)
 
   @functools.cached_property
   def batcher_thread(self) -> threading.Thread:
@@ -437,6 +556,8 @@ async def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  experiment_helper.setup_work_unit()
+
   config = config_lib.ExperimentConfigRegistry.get_instance(
       _EXPERIMENT_CONFIG.value
   )
@@ -446,9 +567,6 @@ async def main(argv: Sequence[str]) -> None:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_mesh(
-      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
-  )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
   if vocab_name := _VOCAB_NAME.value:
@@ -462,7 +580,7 @@ async def main(argv: Sequence[str]) -> None:
     config_replace_kwargs['init_ckpt_step'] = _CKPT_STEP.value
     if (ckpt_format := _CKPT_FORMAT.value) is not None:
       config_replace_kwargs['init_ckpt_format'] = ckpt_format
-  page_size = 128
+  page_size = _PAGE_SIZE.value
   global_total_num_pages = (
       rpa.max_num_pages_per_seq(_MAX_SEQ_LEN.value, page_size, None)
       * _BATCH_SIZE.value
@@ -484,10 +602,11 @@ async def main(argv: Sequence[str]) -> None:
 
   if not (lm_format_name := _LM_FORMAT.value):
     lm_format_name = getattr(config, 'lm_format_name')
-  decoding_sharding_config = getattr(config, 'decoding_sharding_config', None)
-  if decoding_sharding_config is None:
-    decoding_sharding_config = config.sharding_config.to_decoding_sharding()
 
+  decoding_sharding_config = (
+      getattr(config, 'decoding_sharding_config', None)
+      or config.sharding_config.to_decoding_sharding()
+  )
   config = dataclasses.replace(
       config,
       use_scan=False,
@@ -496,6 +615,9 @@ async def main(argv: Sequence[str]) -> None:
       **config_replace_kwargs,
   )
 
+  sharding.set_mesh(
+      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+  )
   service = SimplyService(
       batcher=Batcher(
           config=config,
@@ -503,44 +625,37 @@ async def main(argv: Sequence[str]) -> None:
       ),
   )
 
-  def _init_fn():
-    params = service.batcher.model.init(jax.random.key(0))
-    if _ACTIVATION_DTYPE.value == 'bfloat16':
-      params = jax.tree_util.tree_map(
-          lambda x: jnp.astype(x, jnp.bfloat16), params
-      )
-    return {'params': params}
-
-  experiment_helper.set_notes('Loading checkpoint ...')
-  abstract_state = core_common.eval_abstract_output(_init_fn)
-  model_state = checkpoint_lib.load_checkpoint_from_dir(
-      config.init_ckpt_dir,
-      abstract_state,
-      config.init_ckpt_step,
-      ckpt_format=config.init_ckpt_format,
+  if not (checkpoint_path := _CKPT_PATH.value):
+    checkpoint_path = checkpoint_lib.get_checkpoint_path(
+        config.init_ckpt_dir, config.init_ckpt_step
+    )
+  set_notes(f'Loading checkpoint from {checkpoint_path} ...')
+  service.batcher.update_params_from_checkpoint_path(
+      checkpoint_path,
   )
-  service.batcher.update_params(model_state['params'])
   service.batcher_thread.start()
 
-  server = grpc.aio.server()
-  health_pb2_grpc.add_HealthServicer_to_server(
-      health.aio.HealthServicer(), server
-  )
-  server_pb2_grpc.add_SimplyServiceServicer_to_server(service, server)
+  if experiment_helper.is_primary_task():
+    server = grpc.aio.server()
+    health_pb2_grpc.add_HealthServicer_to_server(
+        health.aio.HealthServicer(), server
+    )
+    server_pb2_grpc.add_SimplyServiceServicer_to_server(service, server)
 
-  service_names = (
-      health_pb2.Health.DESCRIPTOR.full_name,
-      server_pb2.SimplyService.DESCRIPTOR.full_name,
-      reflection.SERVICE_NAME,
-  )
-  reflection.enable_server_reflection(service_names, server)
-  port = server.add_insecure_port(f'[::]:{_SIMPLY_PORT.value}')
-  logging.info('listening %s', port)
-  await server.start()
+    service_names = (
+        health_pb2.Health.DESCRIPTOR.full_name,
+        server_pb2.SimplyService.DESCRIPTOR.full_name,
+        reflection.SERVICE_NAME,
+    )
+    reflection.enable_server_reflection(service_names, server)
+    port = server.add_insecure_port(f'[::]:{_SIMPLY_PORT.value}')
+    logging.info('listening %s', port)
+    await server.start()
+
   while not service.stop_event.is_set():
     await asyncio.sleep(1)
 
-  while service.error_message_queue:
+  if not service.error_message_queue.empty():
     raise service.error_message_queue.get()
 
 

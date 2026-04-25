@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import functools
 import json
+import re
 import textwrap
 import types
 from typing import Any, ClassVar
@@ -259,7 +260,10 @@ class ZeroShotBoxedInQuestionEvaluation(Evaluation):
 @EvaluationRegistry.register
 @dataclasses.dataclass(frozen=True)
 class ZeroShotCoTBoxedInQuestionEvaluation(ZeroShotBoxedInQuestionEvaluation):
-  r"""0-shot that asks for \boxed{} in the question part and have "Let's think step by step" at the beginning of answer."""
+  r"""0-shot that asks for \boxed{} in the question part.
+
+  It also asks "Let's think step by step" at the beginning of answer.
+  """
 
   # TODO: In both eval and training, only keep contents before
   # "Question:" in the response string.

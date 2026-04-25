@@ -251,7 +251,13 @@ class CheckpointLibTest(absltest.TestCase):
 
   def test_dump_format(self):
     js = pytree.dump(ckpt_lib.LegacyFormat())
-    self.assertEqual(js, {'__dataclass__': 'CheckpointFormat:LegacyFormat'})
+    self.assertEqual(
+        js,
+        {
+            '__dataclass__': 'CheckpointFormat:LegacyFormat',
+            'restore_dtype': None,
+        },
+    )
 
 
 if __name__ == '__main__':

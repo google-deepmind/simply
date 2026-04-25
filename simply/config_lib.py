@@ -18,7 +18,7 @@ import dataclasses
 import functools
 import math
 import os
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 import jax
 from simply import data_lib
@@ -293,6 +293,7 @@ class BaseExperimentConfig(ExperimentConfig):
   embedding_lookup_scale: float | None = 1.0
   norm_scale_plus_one: bool = True
   attn_soft_cap: float = 50.0  # If negative, no softcap.
+  attn_mask_value: float = common.neg_inf('float32')
   output_logits_soft_cap: float = 30.0  # If negative, no softcap.
   rms_norm_epsilon: float = 1e-6
   # Position encoding config. Can be:
@@ -328,6 +329,7 @@ class BaseExperimentConfig(ExperimentConfig):
   # (DatasetConfigRegistry lookup).
   dataset: Any | None = None
   validation_dataset: Any | None = None
+  shard_data_method: Literal['NO_SHARDING', 'BY_JAX_PROCESS'] = 'NO_SHARDING'
   # RL requires unstacked batch to iterate over examples.
   batch_mode: str = data_lib.BATCH_STACKED
   dataset_seed: int = 42
@@ -502,6 +504,7 @@ class RLExperimentConfig(BaseExperimentConfig):
   # New fields for quantization.
   decoding_quant_scheme: str = 'bfloat16'
   ref_params_dtype: str = 'bfloat16'
+  use_ref_params: bool = True
 
   # Tool config.
   tool_manager_name: str = ''
@@ -1187,6 +1190,26 @@ def gemma2_2b_it_gsm8k_0shot_rl():
 
 
 @ExperimentConfigRegistry.register
+def gemma2_2b_it_gsm8k_0shot_no_ref_rl():
+  config = gemma2_2b_it_gsm8k_0shot_rl()
+  return dataclasses.replace(
+      config,
+      use_ref_params=False,
+      use_validation_set=False,
+      use_flash_attention=False,
+      flash_attention_block_size=512,
+      train_batch_size=16 * 2,
+      batch_size=16,
+      num_train_steps=150,
+      should_save_ckpt=False,
+      lr=opt_lib.LinearWarmupConstant(
+          value=1e-7,
+          warmup_steps=1,
+      ),
+  )
+
+
+@ExperimentConfigRegistry.register
 def gemma2_2b_it_gsm8k_cot_0shot_rl():
   config = gemma2_2b_it_gsm8k_0shot_rl()
   return dataclasses.replace(
@@ -1769,6 +1792,41 @@ def qwen3_4b_thinking_2507():
 
 
 @ExperimentConfigRegistry.register
+def qwen3_4b_gsm8k_sft():
+  """Finetune Qwen3-4B on GSM8K with SFT (chat format, assistant-only loss)."""
+  config = qwen3_4b()
+  return dataclasses.replace(
+      config,
+      dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_sft_train',
+          lm_format_name='QwQChat',
+          packing='first_fit',
+          data_key='conversation',
+          trainable_roles=('assistant',),
+      ),
+      validation_dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_sft_test',
+          lm_format_name='QwQChat',
+          packing='first_fit',
+          data_key='conversation',
+          trainable_roles=('assistant',),
+      ),
+      seq_len=2048,
+      batch_size=32,
+      num_train_steps=1000,
+      lr=opt_lib.LinearWarmupCosineDecay(
+          value=1e-5,
+          warmup_steps=50,
+          steps_after_decay=0,
+          end_decay=0.1,
+      ),
+      ckpt_interval=200,
+      validation_eval_interval=200,
+      validation_eval_batch_size=32,
+  )
+
+
+@ExperimentConfigRegistry.register
 def qwen3_8b():
   config = qwen3_0p6b()
   return dataclasses.replace(
@@ -1914,6 +1972,7 @@ def lm_test():
       tb_log_interval=2,
   )
 
+
 @ExperimentConfigRegistry.register
 def lm_test_gke_training() -> BaseExperimentConfig:
   """Synthetic config for testing GKE training."""
@@ -1925,6 +1984,7 @@ def lm_test_gke_training() -> BaseExperimentConfig:
       gmm_impl='ragged_dot',
   )
 
+
 @ExperimentConfigRegistry.register
 def lm_no_scan_test():
   config = lm_test()
@@ -1932,6 +1992,24 @@ def lm_no_scan_test():
       config,
       use_scan=False,
       use_remat=False,
+  )
+
+
+@ExperimentConfigRegistry.register
+def lm_sft_test():
+  """Small SFT test config using GSM8K chat data."""
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      dataset=data_lib.DatasetConfig(
+          source='simply:gsm8k_sft_train',
+          lm_format_name='QwQChat',
+          packing='first_fit',
+          data_key='conversation',
+          trainable_roles=('assistant',),
+      ),
+      num_train_steps=20,
+      should_save_ckpt=False,
   )
 
 

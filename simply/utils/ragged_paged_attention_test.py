@@ -15,6 +15,7 @@ import dataclasses
 import functools
 
 from absl.testing import absltest
+from absl.testing import parameterized
 import einops
 import jax
 from jax.experimental.pallas.ops.tpu.ragged_paged_attention import tuned_block_sizes
@@ -47,7 +48,7 @@ def qkv_attn(q: jax.Array, k: jax.Array, v: jax.Array) -> jax.Array:
   return output
 
 
-class DecodeStateTest(absltest.TestCase):
+class DecodeStateTest(parameterized.TestCase):
 
   def test_allocate(self):
     total_num_pages = 6
@@ -155,35 +156,52 @@ class DecodeStateTest(absltest.TestCase):
         ]),
     )
 
-  def test_update_decode_state_and_compute_attn(self):
+  @parameterized.named_parameters(
+      dict(testcase_name='no_partition', use_partition=False),
+      dict(testcase_name='with_partition', use_partition=True),
+  )
+  def test_update_decode_state_and_compute_attn(self, use_partition: bool):
     if tuned_block_sizes.get_tpu_version() < 4:
       self.skipTest('Requires TPU v4 or higher')
+    mesh_shape = [jax.device_count(), 1, 1, 1]
+    if use_partition:
+      if jax.device_count() < 2:
+        self.skipTest('Requires at least 2 devices.')
+      mesh_shape = [1, 1, jax.device_count() // 2, 2]
     total_num_pages = 6
     page_size = 3
     max_seq_len = total_num_pages * page_size + 1
+    num_issue_tokens = 10
     n_kv_heads = 2
     n_q_heads = 4
     per_head_dim = 2
     batch_size = 4
+
+    sharding.set_mesh(
+        mesh_shape, axis_names=('replica', 'data', 'seq', 'model')
+    )
     rk1, rk2, rk3 = jax.random.split(jax.random.key(0), 3)
 
-    sharding.set_mesh([1, 1, 1])
+    old_kv_lens = jnp.array([3, 2, 0, 1])
+    q_lens = jnp.array([5, 2, 0, 2])
 
     ragged_old_kv = RaggedArray(
         data=jax.random.normal(
-            rk1, (max_seq_len, n_kv_heads * 2, per_head_dim)
+            rk1, (num_issue_tokens, n_kv_heads * 2, per_head_dim)
         ),
-        lens=jnp.array([3, 2, 0, 1]),
+        lens=old_kv_lens,
     )
     ragged_q = RaggedArray(
-        data=jax.random.normal(rk2, (max_seq_len, n_q_heads, per_head_dim)),
-        lens=jnp.array([5, 2, 0, 2]),
+        data=jax.random.normal(
+            rk2, (num_issue_tokens, n_q_heads, per_head_dim)
+        ),
+        lens=q_lens,
     )
     ragged_kv = RaggedArray(
         data=jax.random.normal(
-            rk3, (max_seq_len, n_kv_heads * 2, per_head_dim)
+            rk3, (num_issue_tokens, n_kv_heads * 2, per_head_dim)
         ),
-        lens=ragged_q.lens,
+        lens=q_lens,
     )
     updated_ragged_kv = ragged_old_kv.concat(ragged_kv)
     expected_attn_out_list = []
@@ -202,14 +220,16 @@ class DecodeStateTest(absltest.TestCase):
         batch_size=batch_size,
         dtype='float32',
         max_seq_len=max_seq_len,
+        head_partition='model',
+        seq_partition='seq',
     )
     ds = (
         config.init()
-        .allocate(ragged_old_kv.lens)
+        .allocate(old_kv_lens)
         .insert(
             ragged_old_kv.data[:, 0::2],
             ragged_old_kv.data[:, 1::2],
-            ragged_old_kv.lens,
+            old_kv_lens,
         )
     )
 
@@ -281,7 +301,7 @@ class DecodeStateTest(absltest.TestCase):
     )
 
 
-class SamplingStateTest(absltest.TestCase):
+class SamplingStateTest(parameterized.TestCase):
 
   def test_push_and_release(self):
 
@@ -410,15 +430,28 @@ class SamplingStateTest(absltest.TestCase):
         ],
     )
 
-  def test_continue_decode(self):
+  @parameterized.named_parameters(
+      dict(testcase_name='no_partition', use_partition=False),
+      dict(testcase_name='with_partition', use_partition=True),
+  )
+  def test_continue_decode(self, use_partition: bool):
     if tuned_block_sizes.get_tpu_version() < 4:
       self.skipTest('Requires TPU v4 or higher')
+    mesh_shape = [jax.device_count(), 1, 1, 1]
+    if use_partition:
+      if jax.device_count() < 2:
+        self.skipTest('Requires at least 2 devices.')
+      mesh_shape = [1, 1, jax.device_count() // 2, 2]
     max_seq_len = 8
     batch_size = 2
     vocab_size = 10
     per_head_dim = 2
+    n_heads = 4
+    n_kv_heads = 2
 
-    sharding.set_mesh([1, 1, 1])
+    sharding.set_mesh(
+        mesh_shape, axis_names=('replica', 'data', 'seq', 'model')
+    )
 
     sampling_state = rpa.SamplingState.create(
         max_total_num_tokens=max_seq_len * 100,
@@ -427,12 +460,13 @@ class SamplingStateTest(absltest.TestCase):
         decode_state=rpa.DecodeStateConfig(
             total_num_pages=6,
             page_size=3,
-            n_kv_heads=1,
+            n_kv_heads=n_kv_heads,
             per_head_dim=per_head_dim,
             batch_size=batch_size,
             max_seq_len=max_seq_len,
             dtype='float32',
             head_partition='model',
+            seq_partition='seq',
         ).init(),
     )
     tokens = RaggedArray.from_numpy_list(
@@ -447,8 +481,6 @@ class SamplingStateTest(absltest.TestCase):
         rank=jnp.array([0, 1]),
     )
 
-    n_heads = 2
-    n_kv_heads = 1
     emb_key, q_key, k_key, v_key = jax.random.split(jax.random.key(0), 4)
     params = dict(
         emb=jax.random.normal(emb_key, (vocab_size, per_head_dim)),

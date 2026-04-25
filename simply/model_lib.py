@@ -14,25 +14,23 @@
 """All modeling components including architecture, training and inference."""
 
 import collections
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 import copy
 import dataclasses
 import functools
 import time
-from typing import Any, cast, ClassVar, Self, Tuple
+from typing import Any, Callable, cast, ClassVar, Literal, Self, Tuple
 import warnings
 
 from absl import logging
 import einops
 import jax
-from jax.experimental import shard_map
 from jax.experimental import xla_metadata
 from jax.experimental.pallas.ops.tpu import megablox
 from jax.experimental.pallas.ops.tpu import splash_attention
 import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
-
 from simply import data_lib
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
@@ -82,6 +80,7 @@ AnnotatedArray = common.AnnotatedArray
 # back to raw arrays in a PyTree like `get_raw_arrays(x)`.
 get_raw_arrays = common.get_raw_arrays
 neg_inf = common.neg_inf
+round_up_to_base = common.round_up_to_base
 
 ################################################################################
 # Architecture.
@@ -202,6 +201,30 @@ class PerDimScale(module.SimplyModule):
     return x
 
 
+@jax.named_scope('gmm')
+def gmm(lhs, rhs, group_sizes, *, tiling, gmm_impl, activation_dtype):
+  if gmm_impl == 'megablox':
+    output = megablox.gmm(
+        lhs,
+        rhs,
+        group_sizes=group_sizes,
+        tiling=tiling,
+        preferred_element_type=activation_dtype,
+    )
+  elif gmm_impl == 'ragged_dot':
+    with xla_metadata.set_xla_metadata(
+        ragged_dot_tiling=','.join([str(t) for t in tiling])):
+      output = jax.lax.ragged_dot(
+          lhs=lhs,
+          rhs=rhs,
+          group_sizes=group_sizes,
+          preferred_element_type=activation_dtype,
+      )
+  else:
+    raise ValueError(f'Unsupported gmm impl: {gmm_impl}')
+  return output
+
+
 def updated_decode_state(
     k: Array,
     v: Array,
@@ -245,41 +268,48 @@ def updated_decode_state(
   decode_state = cast(Mapping[str, Any], decode_state)
   new_decode_state = None
   if 'k' in decode_state and 'v' in decode_state:
-    k_cache = decode_state['k']
-    v_cache = decode_state['v']
-    # Insert the new key and value at the cache_position.
-    if update_kv_cache:
-      # Assume that we are dealing with one decode step.
-      assert segment_positions.shape[1] == 1
-      # Assume that all the tokens in the batch share the same position.
-      position = segment_positions[0][0]
-      cache_position = position
-      if window_size > 0:
-        cache_position = cache_position % (window_size + 1)
+    cache_state = {
+        'k': decode_state['k'],
+        'v': decode_state['v'],
+        'segment_positions': decode_state['segment_positions'],
+        'segment_ids': decode_state['segment_ids'],
+    }
+    input_state = {
+        'k': k,
+        'v': v,
+        'segment_positions': segment_positions,
+        'segment_ids': segment_ids,
+    }
 
-      k = jax.lax.dynamic_update_slice_in_dim(
-          k_cache, k, cache_position, axis=1
-      )
-      v = jax.lax.dynamic_update_slice_in_dim(
-          v_cache, v, cache_position, axis=1
-      )
-      segment_positions = jax.lax.dynamic_update_slice_in_dim(
-          decode_state['segment_positions'],
-          segment_positions,
-          cache_position,
-          axis=1,
-      )
-      segment_ids = jax.lax.dynamic_update_slice_in_dim(
-          decode_state['segment_ids'],
-          segment_ids,
-          cache_position,
-          axis=1,
-      )
-    else:
-      k = k_cache
-      v = v_cache
-      segment_positions = decode_state['segment_positions']
-      segment_ids = decode_state['segment_ids']
+    def _update_kv(cache_state, input_state):
+      if segment_positions.shape[1] > 1:
+        return input_state
+      else:
+        cache_pos = segment_positions[0][0]
+        if window_size > 0:
+          cache_pos = cache_pos % (window_size + 1)
+
+        return jax.tree.map(
+            lambda c_arr, i_arr: jax.lax.dynamic_update_slice_in_dim(
+                c_arr, i_arr, cache_pos, axis=1
+            ),
+            cache_state,
+            input_state,
+        )
+
+    updated_state = jax.lax.cond(
+        update_kv_cache,
+        _update_kv,
+        lambda c, i: c,
+        cache_state,
+        input_state,
+    )
+
+    k, v = updated_state['k'], updated_state['v']
+    segment_positions, segment_ids = (
+        updated_state['segment_positions'],
+        updated_state['segment_ids'],
+    )
   elif window_size > 0 and k.shape[1] > window_size + 1:
     # Properly truncate the cache to window_size.
     if (prefill_position := decode_state.get('prefill_position')) is None:
@@ -300,17 +330,24 @@ def updated_decode_state(
           ),
       )
 
-    new_decode_state = dict(
-        k=_windowized_array(k),
-        v=_windowized_array(v),
-        segment_positions=_windowized_array(segment_positions),
-        segment_ids=_windowized_array(segment_ids),
-    )
+    final_state = {
+        'k': k,
+        'v': v,
+        'segment_positions': segment_positions,
+        'segment_ids': segment_ids,
+    }
+    new_decode_state = jax.tree.map(_windowized_array, final_state)
   if new_decode_state is None:
     new_decode_state = dict(
         k=k, v=v, segment_positions=segment_positions, segment_ids=segment_ids
     )
   new_decode_state[f'window_size={window_size}'] = None
+  # Preserve 'prefill_position' from the input decode_state if it exists, so
+  # that the pytree structure stays consistent across jax.lax.while_loop
+  # iterations. The value is only meaningful during prefill but must be present
+  # in the output to avoid a pytree mismatch.
+  if decode_state is not None and 'prefill_position' in decode_state:
+    new_decode_state['prefill_position'] = decode_state['prefill_position']
   return k, v, segment_positions, segment_ids, new_decode_state
 
 
@@ -364,7 +401,15 @@ def create_mask(
 
 
 def chunked_local_attn(
-    q, k, v, mask, window_size, *, attn_soft_cap=50.0, dtype=jnp.bfloat16
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    mask: jax.Array,
+    window_size: int,
+    *,
+    attn_soft_cap: float = 50.0,
+    attn_mask_value: float = common.neg_inf('float32'),
+    dtype: jax.typing.DTypeLike = 'bfloat16',
 ):
   """Chunked local attention.
 
@@ -380,6 +425,7 @@ def chunked_local_attn(
     window_size: The size of the sliding window.
     attn_soft_cap: The soft cap for the attention logits. Does not apply if
       negative.
+    attn_mask_value: The value to mask out in the attention mask.
     dtype: The dtype of the output.
 
   Returns:
@@ -409,6 +455,7 @@ def chunked_local_attn(
       chunked_v[:, 0],
       chunked_mask[:, 0, 0],
       attn_soft_cap=attn_soft_cap,
+      attn_mask_value=attn_mask_value,
       dtype=dtype,
   )
 
@@ -434,6 +481,7 @@ def chunked_local_attn(
       w2_chunked_v,
       w2_chunked_mask,
       attn_soft_cap=attn_soft_cap,
+      attn_mask_value=attn_mask_value,
       dtype=dtype,
   )
   # output1: [batch_size, (num_chunks-1)*window_size, num_heads, model_dim]
@@ -445,11 +493,20 @@ def chunked_local_attn(
 
 
 @jax.named_call
-def attn(q, k, v, mask, *, attn_soft_cap=50.0, dtype='bfloat16'):
+def attn(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    mask: jax.Array,
+    *,
+    attn_soft_cap: float = 50.0,
+    attn_mask_value: float = common.neg_inf('float32'),
+    dtype: jax.typing.DTypeLike = 'bfloat16',
+):
   group_axis = 'g' if len(q.shape) > len(k.shape) else ''
-  # ...tgnh, ...snh -> ...gnts
+  # ...tngh, ...snh -> ...ngts
   attn_logit_mat = jnp.einsum(
-      f'...t{group_axis}hi,...qhi->...{group_axis}htq', q, k
+      f'...th{group_axis}i,...qhi->...h{group_axis}tq', q, k
   ).astype(jnp.float32)
   if attn_soft_cap > 0:
     attn_logit_mat = soft_cap(attn_logit_mat, attn_soft_cap)
@@ -458,15 +515,12 @@ def attn(q, k, v, mask, *, attn_soft_cap=50.0, dtype='bfloat16'):
   # a. Intermediate decoding graduately extends seq len
   # b. Sliding window decoding keeps KV seq len as window_size + 1
   # In practice, we do not see it results in significant logp diff.
-  attn_logit_mat = jnp.where(
-      mask, attn_logit_mat, neg_inf(attn_logit_mat.dtype)
-  )
-  attn_mat = jax.nn.softmax(attn_logit_mat, axis=-1)
-  attn_mat = attn_mat.astype(dtype)
+  attn_logit_mat = jnp.where(mask, attn_logit_mat, attn_mask_value)
+  attn_softmax = jax.nn.softmax(attn_logit_mat).astype(dtype)
   output = jnp.einsum(
-      f'...{group_axis}htq,...qhi->...t{group_axis}hi', attn_mat, v
+      f'...h{group_axis}tq,...qhi->...th{group_axis}i', attn_softmax, v
   )
-  return output, attn_mat
+  return output, attn_softmax
 
 
 @module.ModuleRegistry.register
@@ -490,7 +544,7 @@ class FeedForward(module.SimplyModule):
   def expand_dim(self) -> int:
     if self.ffn_expand_dim is not None:
       return self.ffn_expand_dim
-    return self.expand_factor * self.model_dim
+    return round(self.expand_factor * self.model_dim)
 
   def setup(self) -> None:
     self.ffn_0 = EinsumLinear(
@@ -596,6 +650,7 @@ class MoEFeedForward(FeedForward):
   tile_model_dim: int = 128
   tile_expand_dim: int = 128
   gmm_impl: str = 'ragged_dot'
+  ep_method: Literal['ra2a'] = 'ra2a'
 
   def setup(self):
     if self.ffn_use_bias:
@@ -666,12 +721,16 @@ class MoEFeedForward(FeedForward):
     return params
 
   def apply(
-      self, params: PyTree, x: Array, inputs_mask: Array | None = None
+      self,
+      params: PyTree,
+      x: Array,
+      inputs_mask: Array | None = None,
   ) -> PyTree:
     inputs = x
     extra_output = {'loss': {}, 'metric': {}}
     params = get_raw_arrays(params)
-    inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
+    if inputs_mask is not None:
+      inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
     # router_logits: [batch_size, seq_len, num_experts]
     router_logits = self.router.apply(params['router'], inputs)
     router_logits = router_logits.astype(jnp.float32)
@@ -697,7 +756,17 @@ class MoEFeedForward(FeedForward):
         selected_router_probs, self.activation_dtype
     )
     router_probs = jnp.asarray(router_probs, self.activation_dtype)
-    if self.expert_capacity_factor is None:
+    if self.expert_capacity_factor is not None:
+      logging.info('MoE method: dense moe')
+      outputs, ffn_extra_output = self._apply_dense_moe(
+          params,
+          inputs,
+          selected_indices=selected_indices,
+          selected_weights=selected_router_probs,
+          inputs_mask=inputs_mask,
+      )
+    elif self.ep_method == 'ra2a':
+      logging.info('MoE method: (non-pipelined) sparse moe')
       outputs, ffn_extra_output = self._apply_sparse_moe(
           params,
           inputs,
@@ -706,13 +775,9 @@ class MoEFeedForward(FeedForward):
           inputs_mask=inputs_mask,
       )
     else:
-      outputs, ffn_extra_output = self._apply_dense_moe(
-          params,
-          inputs,
-          selected_indices=selected_indices,
-          selected_weights=selected_router_probs,
-          inputs_mask=inputs_mask,
-      )
+      raise ValueError(f'Unsupported MoE method: {self.ep_method=} with'
+                       f' {self.expert_capacity_factor=}')
+
     load = ffn_extra_output['load']
     extra_output.update(ffn_extra_output)
     router_entropy = - jnp.sum(router_probs * jnp.where(
@@ -744,7 +809,8 @@ class MoEFeedForward(FeedForward):
           jax.nn.logsumexp(router_logits, axis=-1) ** 2, where=inputs_mask)
       extra_output['metric']['z_loss'] = z_loss
       extra_output['loss']['z_loss'] = z_loss * self.router_z_loss_weight
-    outputs = jnp.where(inputs_mask[..., None], outputs, 0.0)
+    if inputs_mask is not None:
+      outputs = jnp.where(inputs_mask[..., None], outputs, 0.0)
     outputs = sharding_lib.with_sharding_constraint(
         outputs, self.sharding_config.activation_partition
     )
@@ -766,29 +832,6 @@ class MoEFeedForward(FeedForward):
       selected_indices = jnp.where(
           inputs_mask[..., None], selected_indices, self.num_experts
       )
-
-    @jax.named_scope('gmm')
-    def gmm(lhs, rhs, group_sizes, tiling):
-      if self.gmm_impl == 'megablox':
-        output = megablox.gmm(
-            lhs,
-            rhs,
-            group_sizes=group_sizes,
-            tiling=tiling,
-            preferred_element_type=self.activation_dtype,
-        )
-      elif self.gmm_impl == 'ragged_dot':
-        with xla_metadata.set_xla_metadata(
-            ragged_dot_tiling=','.join([str(t) for t in tiling])):
-          output = jax.lax.ragged_dot(
-              lhs=lhs,
-              rhs=rhs,
-              group_sizes=group_sizes,
-              preferred_element_type=self.activation_dtype,
-          )
-      else:
-        raise ValueError(f'Unsupported gmm impl: {self.gmm_impl}')
-      return output
 
     if self.sharding_config.activation_partition is None:
       selected_indices_partition = js.PartitionSpec()
@@ -818,11 +861,7 @@ class MoEFeedForward(FeedForward):
     # ffn1_w: [num_experts, expand_dim, model_dim]
     ffn1_w = params['ffn_1']['w']
     ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)
-    ffn1_partition = (
-        js.PartitionSpec(*self.ffn1_partition)
-        if self.ffn1_partition is not None
-        else js.PartitionSpec()
-    )
+    ffn1_partition = sharding_lib.partition_spec(self.ffn1_partition)
 
     if self.sharding_config.activation_partition is None:
       activation_partition = js.PartitionSpec()
@@ -980,12 +1019,6 @@ class MoEFeedForward(FeedForward):
       ffn0_tiling = (
           self.tile_batch_seq, self.tile_model_dim, self.tile_expand_dim)
 
-      def round_up_to_base(x: int, base: int, threshold: int = 128):
-        if x < threshold:
-          return x
-        else:
-          return ((x + base - 1) // base) * base
-
       ffn0_tiling = (
           round_up_to_base(
               min(ffn0_tiling[0], m), base=8, threshold=8),
@@ -993,20 +1026,23 @@ class MoEFeedForward(FeedForward):
           round_up_to_base(min(ffn0_tiling[2], n), base=128, threshold=128),
       )
       ffn1_tiling = (ffn0_tiling[0], ffn0_tiling[2], ffn0_tiling[1])
-      projected_inputs = gmm(
-          sorted_inputs, ffn0_w, local_group_sizes, ffn0_tiling)
+      gmm_ = functools.partial(gmm, gmm_impl=self.gmm_impl,
+                               activation_dtype=self.activation_dtype,
+                               tiling=ffn0_tiling)
+      projected_inputs = gmm_(sorted_inputs, ffn0_w, local_group_sizes)
       activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
       if self.use_gated_activation_in_ffn:
         ffn0_gate_w = all_gather_if_sharded(
             ffn0_gate_w, self.sharding_config.ffn0_partition, axis=1)
-        gate = gmm(sorted_inputs, ffn0_gate_w, local_group_sizes, ffn0_tiling)
+        gate = gmm_(sorted_inputs, ffn0_gate_w, local_group_sizes)
         gate = activation_fn(gate)
         middle = jnp.asarray(gate, self.activation_dtype) * projected_inputs
       else:
         middle = jnp.asarray(
             activation_fn(projected_inputs), self.activation_dtype
         )
-      sorted_outputs = gmm(middle, ffn1_w, local_group_sizes, ffn1_tiling)
+      sorted_outputs = gmm_(middle, ffn1_w, local_group_sizes,
+                            tiling=ffn1_tiling)
 
       # Dispatch tokens from expert shards to original shards
       # if using expert parallelism.
@@ -1194,6 +1230,7 @@ class Attention(module.SimplyModule):
   qkv_use_bias: bool = False
   o_use_bias: bool = False
   attn_soft_cap: float = 50.0
+  attn_mask_value: float = common.neg_inf('float32')
   query_scale: float = -1.0
   # Ragged paged attention
   total_num_pages: int = 0
@@ -1329,29 +1366,14 @@ class Attention(module.SimplyModule):
     q, k = self._scale_qk(q, k, segment_positions, params)
 
     # n_groups = n_heads // n_kv_heads
-    # q in [batch_size, seq_len, n_groups, n_kv_heads, per_head_dim]
+    # q in [batch_size, seq_len, n_kv_heads, n_groups, per_head_dim]
     # k in [batch_size, seq_len, n_kv_heads, per_head_dim]
     # v in [batch_size, seq_len, n_kv_heads, per_head_dim]
-
-    # TODO: Refactor this so that we don't need to rearrange it.
-    # Note: g/n_kv_heads order change is for compatibility with Gemma models.
-    q = einops.rearrange(
-        q,
-        '... (n_kv_heads g) h -> ... g n_kv_heads h',
-        n_kv_heads=self.n_kv_heads,
-    )
-    group_sharding = None
-    if self.attn_activation_partition:
-      group_sharding = (
-          *self.attn_activation_partition[:2],
-          None,
-          *self.attn_activation_partition[2:],
-      )
 
     extra_output = {}
 
     if isinstance(decode_state, rpa.DecodeState):
-      q = einops.rearrange(q, '1 l g n_kv_heads ... -> l (n_kv_heads g) ...')
+      q = einops.rearrange(q, '1 l ... -> l ...')
       k = einops.rearrange(k, '1 l ... -> l ...')
       v = einops.rearrange(v, '1 l ... -> l ...')
       # TODO: Pass update_kv_cache into rpa.DecodeState
@@ -1359,9 +1381,15 @@ class Attention(module.SimplyModule):
           q=common.RaggedArray(q, extra_inputs['lens']),
           k=k,
           v=v,
+          soft_cap=self.attn_soft_cap if self.attn_soft_cap > 0 else None,
+          mask_value=self.attn_mask_value,
+          update_kv_cache=extra_inputs.get('update_kv_cache', True),
           page_manage_cache=extra_inputs.get('page_manage_cache'),
       )
       output = einops.rearrange(output, 'l ... -> 1 l ...')
+      output = sharding_lib.with_sharding_constraint(
+          output, self.attn_activation_partition
+      )
     else:
       if (
           extra_inputs
@@ -1398,13 +1426,13 @@ class Attention(module.SimplyModule):
         bnlh = js.PartitionSpec(
             batch_size_axis, num_heads_axis, seq_len_axis, per_head_size_axis
         )
-        bl = js.PartitionSpec(batch_size_axis, seq_len_axis)
-
-        q = einops.rearrange(
-            q,
-            'b l g n_kv_heads h -> b (n_kv_heads g) l h ',
-            n_kv_heads=self.n_kv_heads,
+        bnlh_unsharded_seq = js.PartitionSpec(
+            batch_size_axis, num_heads_axis, None, per_head_size_axis
         )
+        bl = js.PartitionSpec(batch_size_axis, seq_len_axis)
+        bl_unsharded_seq = js.PartitionSpec(batch_size_axis, None)
+
+        q = einops.rearrange(q, 'b l n h -> b n l h')
         k = einops.repeat(
             k,
             'b l n_kv_heads h -> b (n_kv_heads g) l h',
@@ -1439,28 +1467,33 @@ class Attention(module.SimplyModule):
             block_kv_dq=self.flash_attention_block_size,
         )
 
-        mesh = js.get_abstract_mesh()
-        attn_soft_cap = self.attn_soft_cap
-        if attn_soft_cap is not None and attn_soft_cap < 0:
-          attn_soft_cap = None
         splash_attn_kernel = splash_attention.make_splash_mha(
             mask=mask,
             block_sizes=block_sizes,
-            mask_value=neg_inf(np.float32),
-            attn_logits_soft_cap=attn_soft_cap,
-            head_shards=mesh.shape[num_heads_axis],
-            q_seq_shards=1,
+            mask_value=self.attn_mask_value,
+            attn_logits_soft_cap=(
+                self.attn_soft_cap if self.attn_soft_cap > 0 else None
+            ),
+            head_shards=sharding_lib.get_partition_size(num_heads_axis),
+            q_seq_shards=sharding_lib.get_partition_size(seq_len_axis),
         )
         kernel_sharding = splash_attn_kernel.manual_sharding_spec(
             sharding_lib.named_sharding((num_heads_axis, seq_len_axis))
         )
 
         @functools.partial(
-            shard_map.shard_map,
-            mesh=mesh,
-            in_specs=(kernel_sharding, bnlh, bnlh, bnlh, bl, bl),
+            jax.shard_map,
+            mesh=js.get_abstract_mesh(),
+            in_specs=(
+                kernel_sharding,
+                bnlh,
+                bnlh_unsharded_seq,
+                bnlh_unsharded_seq,
+                bl,
+                bl_unsharded_seq,
+            ),
             out_specs=bnlh,
-            check_rep=False,
+            check_vma=False,
         )
         def flash_attention_fn(
             kernel, query, key, value, q_segment_ids, kv_segment_ids
@@ -1490,6 +1523,21 @@ class Attention(module.SimplyModule):
         # Add the group and head dimension.
         mask = einops.rearrange(mask, 'b l1 l2 -> b 1 1 l1 l2')
 
+        q = einops.rearrange(
+            q,
+            '... (n_kv_heads g) h -> ... n_kv_heads g h',
+            n_kv_heads=self.n_kv_heads,
+        )
+
+        group_sharding = None
+        if self.attn_activation_partition:
+          group_sharding = (
+              *self.attn_activation_partition[:3],
+              None,
+              *self.attn_activation_partition[3:],
+          )
+        q = sharding_lib.with_sharding_constraint(q, group_sharding)
+
         # q: [batch_size, seq_len, n_groups, self.n_kv_heads, self.per_head_dim]
         # k, v: [batch_size, seq_len, self.n_kv_heads, self.per_head_dim]
         if (
@@ -1507,6 +1555,7 @@ class Attention(module.SimplyModule):
               mask,
               self.window_size,
               attn_soft_cap=self.attn_soft_cap,
+              attn_mask_value=self.attn_mask_value,
               dtype=self.activation_dtype,
           )
         else:
@@ -1516,6 +1565,7 @@ class Attention(module.SimplyModule):
               v,
               mask,
               attn_soft_cap=self.attn_soft_cap,
+              attn_mask_value=self.attn_mask_value,
               dtype=self.activation_dtype,
           )
           if self.add_extra_output:
@@ -1523,7 +1573,7 @@ class Attention(module.SimplyModule):
 
         output = sharding_lib.with_sharding_constraint(output, group_sharding)
         output = einops.rearrange(
-            output, '... n_groups n_kv_heads i -> ... (n_kv_heads n_groups) i'
+            output, '... n_kv_heads n_groups i -> ... (n_kv_heads n_groups) i'
         )
       output = sharding_lib.with_sharding_constraint(
           output, self.attn_activation_partition
@@ -1533,14 +1583,42 @@ class Attention(module.SimplyModule):
     return output, extra_output
 
   def init_decode_state(self, batch_size: int, max_seq_len: int) -> PyTree:
-    # TODO: We currently only support using this function for Ragged
-    # Paged Attention. We also want to support for classic attention.
     if self.total_num_pages <= 0 or self.page_size <= 0:
-      raise ValueError(
-          f'{self.total_num_pages=} and {self.page_size=} must be positive'
-          ' integers.'
+      num_kv_heads = self.n_kv_heads if self.n_kv_heads > 0 else self.n_heads
+      pos_partition = (
+          self.attn_activation_partition[:2]
+          if self.attn_activation_partition is not None
+          else None
       )
+      return {
+          'k': sharding_lib.with_sharding_constraint(
+              jnp.zeros(
+                  (batch_size, max_seq_len, num_kv_heads, self.per_head_dim),
+                  dtype=self.activation_dtype,
+              ),
+              self.attn_activation_partition,
+          ),
+          'v': sharding_lib.with_sharding_constraint(
+              jnp.zeros(
+                  (batch_size, max_seq_len, num_kv_heads, self.per_head_dim),
+                  dtype=self.activation_dtype,
+              ),
+              self.attn_activation_partition,
+          ),
+          'segment_positions': sharding_lib.with_sharding_constraint(
+              jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32),
+              pos_partition,
+          ),
+          'segment_ids': sharding_lib.with_sharding_constraint(
+              jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32),
+              pos_partition,
+          ),
+          f'window_size={self.window_size}': None,
+      }
     head_partition = sharding_lib.get_partition_axis(self.qkv_partition, 1)
+    seq_partition = sharding_lib.get_partition_axis(
+        self.attn_activation_partition, 1
+    )
     return rpa.DecodeStateConfig(
         total_num_pages=self.total_num_pages,
         page_size=self.page_size,
@@ -1551,6 +1629,7 @@ class Attention(module.SimplyModule):
         max_seq_len=max_seq_len,
         window_size=self.window_size if self.window_size > 0 else None,
         head_partition=head_partition,
+        seq_partition=seq_partition,
     ).init()
 
 
@@ -1595,6 +1674,7 @@ class TransformerBlock(module.SimplyModule):
   ffn_activation: str = 'gelu'
   norm_scale_plus_one: bool = True
   attn_soft_cap: float = 50.0  # If negative, no softcap.
+  attn_mask_value: float = common.neg_inf('float32')
   rms_norm_epsilon: float = 1e-6
   # Position encoding config (None = NoPE, no positional encoding).
   position_encoding: pe_lib.PositionEncodingConfig | None = pe_lib.RoPE()
@@ -1924,6 +2004,7 @@ class TransformerLM(module.SimplyModule):
           ffn_activation=config.ffn_activation,
           norm_scale_plus_one=config.norm_scale_plus_one,
           attn_soft_cap=config.attn_soft_cap,
+          attn_mask_value=config.attn_mask_value,
           rms_norm_epsilon=config.rms_norm_epsilon,
           position_encoding=pe,
           query_scale=config.query_scale,
@@ -2048,11 +2129,8 @@ class TransformerLM(module.SimplyModule):
         segment_positions, self.sharding_config.data_partition
     )
 
-    # TODO: Consider removing this conversion. In theory, in can result
-    # in larger HBM usage when params.dtype=float32, activation_dtype=bfloat16,
-    # as it forces XLA to keep copy of params in bfloat16 at the beginning.
-    # In practice, we found, by default, params would be casted to bfloat16
-    # no matter what activation_dtype is set.
+    # Convert `params` to lower bits to avoid sending float32 params to
+    # `jax.lax.scan`.
     def convert_to_lower_bits(x, activation_dtype):
       # Only convert if the activation_dtype is lower bits than the params.
       if x.dtype.itemsize > jnp.dtype(activation_dtype).itemsize:
@@ -2664,6 +2742,7 @@ def run_experiment(
     warnings.warn('sharding_config is deprecated.')
     del sharding_config
   logging.info('jax.process_index(): %s', jax.process_index())
+  exp_helper.set_notes('Initializing model ...')
   # Setup model, optimizer, initial state, and mesh.
   sharding_lib.set_mesh(
       mesh_shape=config.mesh_shape,
@@ -2730,6 +2809,9 @@ def run_experiment(
     )
     assert isinstance(data_state, Mapping)
     train_iter_state = data_state.get('train_iter_state', None)
+    if train_iter_state is not None:
+      train_iter_state = data_lib.grain_iter_local_state(train_iter_state)
+
   if train_iter_state is not None:
     train_iter.set_state(train_iter_state)
 
@@ -2760,7 +2842,18 @@ def run_experiment(
   while steps <= config.num_train_steps and not should_early_stop:
     with jax.profiler.StepTraceAnnotation('train', step_num=steps):
       logging.info('steps: %s', steps)
-      helper.save_ckpt(state, steps, data=train_iter.get_state())
+      # TODO: update the ckpt criteria.
+      if config.should_save_ckpt and (
+          steps % config.ckpt_interval == 0 or steps == config.num_train_steps
+      ):
+        helper.save_ckpt(
+            state,
+            steps,
+            data={'train_iter_state': data_lib.grain_iter_global_state(
+                train_iter.get_state(),
+                shard_data_method=config.shard_data_method,
+            )},
+        )
       # Run eval every validation_eval_interval steps and at the very end.
       if config.validation_dataset and (
           steps % config.validation_eval_interval == 0
@@ -2772,12 +2865,22 @@ def run_experiment(
 
       t1 = time.time()
       batch = next(train_iter)
-      logging.info('batch=%s', batch)
 
-      batch = build_global_array_from_replicated(
-          batch, data_partition=(('replica', 'data'),)
-      )
+      if config.shard_data_method == 'NO_SHARDING':
+        batch = build_global_array_from_replicated(
+            batch, data_partition=(('replica', 'data'),)
+        )
+      elif config.shard_data_method == 'BY_JAX_PROCESS':
+        batch = build_global_batch_from_sharded(
+            batch, data_partition=(('replica', 'data'),)
+        )
+      else:
+        raise NotImplementedError(f'Unsupported {config.shard_data_method=}')
+
       data_generation_step_time = time.time() - t1
+      # TODO: This is misleading for sharded data.
+      logging.info('%s ses to get next batch ready.', data_generation_step_time)
+      logging.info('batch=%s', batch)
 
       t1 = time.time()
       lr = lr_fn(state['steps'])
@@ -2789,6 +2892,7 @@ def run_experiment(
       )
       train_loss = float(loss)
       train_step_time = time.time() - t1
+
       logging.info('train_loss: %s', train_loss)
 
       if helper.should_log_additional_info(steps):
@@ -2819,6 +2923,10 @@ def run_experiment(
           'data_generation_step_time', data_generation_step_time)
 
       agg_metrics = helper.get_aggregated_metrics()
+      exp_helper.set_notes(
+          f'{steps=}, {train_loss=},'
+          f' avg_total_step_time={agg_metrics["avg_total_step_time"]:.2f}'
+      )
       should_early_stop = should_early_stop or (
           config.early_stop and
           config.early_stop.should_stop(
@@ -2877,7 +2985,10 @@ def build_global_array_from_replicated(
 def build_global_batch_from_sharded(
     batch: PyTree, data_partition: PartitionAnnotation = None
 ) -> PyTree:
-  data_sharding = sharding_lib.named_sharding(data_partition)
+  logging.info('local batch=%s', batch)
+  data_sharding = js.NamedSharding(
+      js.get_mesh(), js.PartitionSpec(*data_partition)
+  )
 
   def _build_global_array_from_sharded(array: np.ndarray):
     if array.ndim < 1:

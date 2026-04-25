@@ -115,6 +115,7 @@ class DecodeStateConfig:
   max_seq_len: int
   window_size: int | None = None  # self excluded
   head_partition: str | Sequence[str] | None = None
+  seq_partition: str | Sequence[str] | None = None
   num_kv_pages_per_block: int | None = None
   num_queries_per_block: int | None = None
 
@@ -154,6 +155,7 @@ class DecodeStateConfig:
         max_seq_len=self.max_seq_len,
         window_size=self.window_size,
         head_partition=self.head_partition,
+        seq_partition=self.seq_partition,
         num_kv_pages_per_block=self.num_kv_pages_per_block,
         num_queries_per_block=self.num_queries_per_block,
     )
@@ -176,6 +178,9 @@ class DecodeState:
       default=None, metadata=dict(static=True)
   )
   head_partition: str | Sequence[str] | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
+  )
+  seq_partition: str | Sequence[str] | None = dataclasses.field(
       default=None, metadata=dict(static=True)
   )
   num_kv_pages_per_block: int | None = dataclasses.field(
@@ -472,91 +477,173 @@ class DecodeState:
       q: RaggedArray,  # [max_num_tokens, num_q_heads, per_head_dim]
       k: jax.Array,  # [max_num_tokens, num_kv_heads, per_head_dim]
       v: jax.Array,  # [max_num_tokens, num_kv_heads, per_head_dim]
+      soft_cap: float | None = None,
+      mask_value: float | None = None,
+      update_kv_cache: bool = True,
       page_manage_cache: MutableMapping[Hashable, Self] | None = None,
   ) -> tuple[Self, jax.Array]:
     """Updates decode state."""
-    k = self.pad_per_head_dim(k)
-    v = self.pad_per_head_dim(v)
-
-    if (
-        page_manage_cache is None
-        or self.page_manage_key not in page_manage_cache
-    ):
-      decode_state = self.release_for_window().allocate(q.lens)
-      if page_manage_cache is not None:
-        page_manage_cache[self.page_manage_key] = decode_state
-    else:
-      manage_cache = page_manage_cache[self.page_manage_key]
-      decode_state = dataclasses.replace(
-          self,
-          kv_lens=manage_cache.kv_lens,
-          page_indices=manage_cache.page_indices,
-          available_page_indices=manage_cache.available_page_indices,
-          num_available_pages=manage_cache.num_available_pages,
+    if update_kv_cache:
+      k = sharding.with_sharding_constraint(
+          k, (None, self.head_partition, None)
       )
+      v = sharding.with_sharding_constraint(
+          v, (None, self.head_partition, None)
+      )
+      k = self.pad_per_head_dim(k)
+      v = self.pad_per_head_dim(v)
+      if (
+          page_manage_cache is None
+          or self.page_manage_key not in page_manage_cache
+      ):
+        decode_state = self.release_for_window().allocate(q.lens)
+        if page_manage_cache is not None:
+          page_manage_cache[self.page_manage_key] = decode_state
+      else:
+        manage_cache = page_manage_cache[self.page_manage_key]
+        decode_state = dataclasses.replace(
+            self,
+            kv_lens=manage_cache.kv_lens,
+            page_indices=manage_cache.page_indices,
+            available_page_indices=manage_cache.available_page_indices,
+            num_available_pages=manage_cache.num_available_pages,
+        )
 
-    decode_state = decode_state.insert(k, v, q.lens)
+      decode_state = decode_state.insert(k, v, q.lens)
+    else:
+      decode_state = self
 
-    if jax.config.jax_disable_jit and jax.devices()[0].platform == 'cpu':
-      rpa_fn = functools.partial(
-          ragged_paged_attention.ref_ragged_paged_attention,
+    if jax.devices()[0].platform == 'cpu':
+      # Pallas RPA kernel is TPU-only; always use reference impl on CPU.
+      attn_output = ragged_paged_attention.ref_ragged_paged_attention(
+          self.pad_per_head_dim(q.data),
+          decode_state.pages,
+          decode_state.kv_lens,
+          decode_state.page_indices,
+          jnp.cumulative_sum(q.lens, include_initial=True),
+          jnp.reshape(jnp.sum(q.lens > 0), 1),
           sliding_window=self.window_size,
       )
-    else:
-      num_kv_pages_per_block = self.num_kv_pages_per_block
-      num_queries_per_block = self.num_queries_per_block
-      if num_kv_pages_per_block is None or num_queries_per_block is None:
-        head_partition_size = sharding.get_partition_size(self.head_partition)
-        num_kv_heads_per_shard = self.num_kv_heads // head_partition_size
-        num_q_heads_per_shard = q.data.shape[1] // head_partition_size
-        num_kv_pages_per_block, num_queries_per_block = autotune_block_sizes(
-            num_kv_heads=num_kv_heads_per_shard,
-            num_q_heads=num_q_heads_per_shard,
-            page_size=self.page_size,
-            max_seq_len=self.max_seq_len,
-            per_head_dim=self.padded_per_head_dim,
-            window_size=self.window_size,
-            dtype=self.dtype,
-            max_num_issue_tokens=q.capacity,
+      return decode_state, attn_output
+
+    seq_partition_size = sharding.get_partition_size(self.seq_partition)
+    num_kv_pages_per_block = self.num_kv_pages_per_block
+    num_queries_per_block = self.num_queries_per_block
+    if num_kv_pages_per_block is None or num_queries_per_block is None:
+      head_partition_size = sharding.get_partition_size(self.head_partition)
+      if q.capacity % seq_partition_size != 0:
+        raise ValueError(
+            f'{q.capacity=} must be divisible by {seq_partition_size=}'
         )
-        logging.info(
-            'Autotuned num_kv_pages_per_block: %d, num_queries_per_block: %d',
-            num_kv_pages_per_block,
-            num_queries_per_block,
-        )
-      rpa_fn = jax.shard_map(
-          functools.partial(
-              ragged_paged_attention.ragged_paged_attention,
-              # RPA kernel's window size includes self
-              sliding_window=self.window_size + 1 if self.window_size else None,
-              num_kv_pages_per_block=num_kv_pages_per_block,
-              num_queries_per_block=num_queries_per_block,
-          ),
-          mesh=js.get_abstract_mesh(),
-          in_specs=(
-              js.PartitionSpec(None, self.head_partition, None),
-              js.PartitionSpec(None, None, self.head_partition, None),
-              js.PartitionSpec(),
-              js.PartitionSpec(),
-              js.PartitionSpec(),
-              js.PartitionSpec(),
-          ),
-          out_specs=js.PartitionSpec(None, self.head_partition, None),
-          check_vma=False,
+      num_kv_heads_per_shard = self.num_kv_heads // head_partition_size
+      num_q_heads_per_shard = q.data.shape[1] // head_partition_size
+      max_num_issue_tokens_per_shard = q.capacity // seq_partition_size
+      num_kv_pages_per_block, num_queries_per_block = autotune_block_sizes(
+          num_kv_heads=num_kv_heads_per_shard,
+          num_q_heads=num_q_heads_per_shard,
+          page_size=self.page_size,
+          max_seq_len=self.max_seq_len,
+          per_head_dim=self.padded_per_head_dim,
+          window_size=self.window_size,
+          dtype=self.dtype,
+          max_num_issue_tokens=max_num_issue_tokens_per_shard,
+      )
+      logging.info(
+          'Autotuned num_kv_pages_per_block: %d, num_queries_per_block: %d',
+          num_kv_pages_per_block,
+          num_queries_per_block,
+      )
+    batch_size = q.batch_size
+
+    def _rpa_kernel_wrapper(q_shard, kv_pages, kv_lens, page_indices, q_lens):
+      """Wrapper that compacts sequences and adjusts for seq partition."""
+      shard_size = q_shard.shape[0]
+      if seq_partition_size > 1:
+        shard_idx = jax.lax.axis_index(self.seq_partition)
+      else:
+        shard_idx = 0
+      shard_start = shard_idx * shard_size
+      # Compute global cumulative q_lens and shift to shard-local coordinates.
+      global_cu_q_lens = jnp.cumulative_sum(q_lens, include_initial=True)
+      shard_cu_q_lens = jnp.clip(
+          global_cu_q_lens - shard_start, 0, shard_size
       )
 
-    compact_row_indices = jnp.flatnonzero(
-        q.lens, size=q.batch_size, fill_value=q.batch_size
-    )
-    compact_q_lens = q.lens[compact_row_indices]
-    attn_output = rpa_fn(
+      shard_q_ends = shard_cu_q_lens[1:]
+      shard_q_starts = shard_cu_q_lens[:-1]
+      shard_q_lens = shard_q_ends - shard_q_starts
+
+      # Compact to only sequences with tokens in this shard.
+      shard_compact = jnp.flatnonzero(shard_q_lens, size=batch_size)
+      num_seqs = jnp.sum(shard_q_lens > 0)
+      compact_page_indices = page_indices[shard_compact]
+      # Compute shard-local q_lens by clamping to non-negative.
+      compact_shard_q_lens = shard_q_lens[shard_compact]
+      cu_q_lens = jnp.cumulative_sum(
+          compact_shard_q_lens, include_initial=True
+      )
+
+      # Adjust kv_lens for correct causal masking when a sequence
+      # spans multiple shards.  The kernel computes position as
+      #   kv_len - q_len + q_idx
+      # so for the first shard of a cross-boundary sequence, we must
+      # subtract the number of query tokens on *later* shards
+      # (tokens_after) to shift the positions back correctly.
+      #
+      # Example: global_q_len=5 split [3 | 2] across 2 shards.
+      #   Shard 0: tokens_after=2, kv_adj=K-2, q_len=3
+      #            pos = (K-2)-3+idx -> K-5, K-4, K-3
+      #   Shard 1: tokens_after=0, kv_adj=K,   q_len=2
+      #            pos = K-2+idx     -> K-2, K-1
+      tokens_after = jnp.maximum(
+          global_cu_q_lens[1:] - shard_start - shard_size, 0
+      )
+      compact_kv_lens = (kv_lens - tokens_after)[shard_compact]
+
+      return jax.lax.cond(
+          num_seqs > 0,
+          lambda: ragged_paged_attention.ragged_paged_attention(
+              q_shard,
+              kv_pages,
+              compact_kv_lens,
+              compact_page_indices,
+              cu_q_lens,
+              jnp.reshape(num_seqs, 1),
+              # RPA kernel's window size includes self
+              sliding_window=(
+                  self.window_size + 1 if self.window_size else None
+              ),
+              soft_cap=soft_cap,
+              mask_value=mask_value,
+              num_kv_pages_per_block=num_kv_pages_per_block,
+              num_queries_per_block=num_queries_per_block,
+              vmem_limit_bytes=50 * 1024 * 1024,
+          ),
+          lambda: jnp.zeros_like(q_shard),
+      )
+
+    attn_output = jax.shard_map(
+        _rpa_kernel_wrapper,
+        mesh=js.get_abstract_mesh(),
+        in_specs=(
+            js.PartitionSpec(self.seq_partition, self.head_partition, None),
+            js.PartitionSpec(None, None, self.head_partition, None),
+            js.PartitionSpec(),
+            js.PartitionSpec(),
+            js.PartitionSpec(),
+        ),
+        out_specs=js.PartitionSpec(
+            self.seq_partition, self.head_partition, None
+        ),
+        check_vma=False,
+    )(
         self.pad_per_head_dim(q.data),
         decode_state.pages,
-        decode_state.kv_lens[compact_row_indices],
-        decode_state.page_indices[compact_row_indices],
-        jnp.cumulative_sum(compact_q_lens, include_initial=True),
-        jnp.reshape(jnp.sum(q.lens > 0), 1),
+        decode_state.kv_lens,
+        decode_state.page_indices,
+        q.lens,
     )
+
     if attn_output.shape[0] < q.capacity:
       attn_output = jnp.pad(
           attn_output,
@@ -571,6 +658,13 @@ class DecodeState:
       attn_output = attn_output[:, :, :per_head_dim]
     # Return in shape [max_num_tokens, num_q_heads, per_head_dim]
     return decode_state, attn_output
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _StepState:
+  step: jax.Array  # i32
+  state: 'SamplingState'
 
 
 @jax.tree_util.register_dataclass
@@ -649,7 +743,9 @@ class SamplingState:
     attrs = DecodeState.attrs_from_tree(
         self.decode_state, ['max_available_kv_lens']
     )
-    max_available_kv_lens = jnp.min(jnp.array(attrs['max_available_kv_lens']))
+    max_available_kv_lens = jnp.min(
+        jnp.array(attrs['max_available_kv_lens']), axis=0
+    )
     return jnp.where(
         self.has_ended,
         0,
@@ -770,6 +866,7 @@ class SamplingState:
     """Returns the number of used tokens."""
     return jnp.sum(self.position, where=~self.is_pad_seq, initial=0)
 
+  @jax.jit(static_argnames=('capacity',))
   @jax.named_call
   def issue_lens(self, capacity: int) -> jax.Array:
     """Returns the issue lens."""
@@ -985,22 +1082,29 @@ class SamplingState:
       scoring_temperature: float = 1.0,
       scoring_top_k: int = -1,
       scoring_top_p: float = 1.0,
+      intermediate_steps: int = np.iinfo(np.int32).max // 2,
   ) -> Self:
     """Continues decoding."""
+
     final_sampling_state = jax.lax.while_loop(
-        lambda state: state.is_continuable & ~until_fn(state),
-        lambda state: state.mixed_step(
-            forward_fn,
-            params,
-            extra_inputs,
-            max_num_issue_tokens,
-            temperature,
-            top_k,
-            top_p,
-            scoring_temperature,
-            scoring_top_k,
-            scoring_top_p,
+        lambda step_state: step_state.state.is_continuable
+        & ~until_fn(step_state.state)
+        & (step_state.step < intermediate_steps),
+        lambda step_state: _StepState(
+            step_state.step + 1,
+            step_state.state.mixed_step(
+                forward_fn,
+                params,
+                extra_inputs,
+                max_num_issue_tokens,
+                temperature,
+                top_k,
+                top_p,
+                scoring_temperature,
+                scoring_top_k,
+                scoring_top_p,
+            ),
         ),
-        self,
+        _StepState(step=jnp.array(0), state=self),
     )
-    return final_sampling_state
+    return final_sampling_state.state

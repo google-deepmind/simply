@@ -16,7 +16,6 @@
 import dataclasses
 import json
 import os
-import re
 from typing import Sequence
 
 from absl import flags
@@ -181,5 +180,15 @@ def main(argv: Sequence[str]) -> None:
   run_experiment_fn = model_lib.TrainLoopRegistry.get(config.train_loop_name)
   run_experiment_fn(config=config, experiment_dir=experiment_dir)
 
+
+def _set_xla_dump_to_flag():
+  """Sets --xla_dump_to flag in environment."""
+  if experiment_helper.is_primary_task():
+    if dump_dir := os.getenv('XLA_DUMP_TO'):
+      xla_flags = os.getenv('XLA_FLAGS', '') + f'--xla_dump_to={dump_dir} '
+      os.environ['XLA_FLAGS'] = xla_flags
+
+
 if __name__ == '__main__':
+  _set_xla_dump_to_flag()
   app.run(main)

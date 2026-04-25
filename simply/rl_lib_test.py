@@ -19,6 +19,7 @@ import tempfile
 from typing import TypedDict
 
 from absl.testing import absltest
+from absl.testing import parameterized
 from etils import epath
 import numpy as np
 from simply import config_lib
@@ -52,7 +53,7 @@ _MOCK_VOCAB_NAME = 'mock_vocab'
 
 
 @lm_format.LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class MockSimplyV1Chat(lm_format.SimplyV1Chat):
   """Mock LM format for SimplyV1Chat, used in tests."""
 
@@ -98,6 +99,67 @@ class MockDeepScaleRSource:
 
   def __getitem__(self, index: int) -> MockDeepScaleRJSONExample:
     return self._examples[index]
+
+
+class UtilityFunctionsTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='all_masked',
+          x=np.array([1.0, 2.0, 3.0]),
+          where=np.array([False, False, False]),
+          expected=0.0,
+      ),
+      dict(
+          testcase_name='none_masked',
+          x=np.array([1.0, 2.0, 3.0, 4.0]),
+          where=np.array([True, True, True, True]),
+          expected=2.5,
+      ),
+      dict(
+          testcase_name='partial_masked',
+          x=np.array([1.0, 2.0, 3.0, 4.0]),
+          where=np.array([True, True, False, False]),
+          expected=1.5,
+      ),
+  )
+  def test_np_safe_mean(
+      self, x: np.ndarray, where: np.ndarray, expected: float
+  ) -> None:
+    result = rl_lib.np_safe_mean(x, where=where)
+    self.assertEqual(result, expected)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='all_masked',
+          x=np.array([1.0, 2.0, 3.0]),
+          where=np.array([False, False, False]),
+          expected=0.0,
+      ),
+      dict(
+          testcase_name='normal',
+          x=np.array([1.0, 3.0]),
+          where=np.array([True, True]),
+          expected=1.0,
+      ),
+      dict(
+          testcase_name='partial_masked',
+          x=np.array([1.0, 2.0, 3.0, 100.0]),
+          where=np.array([True, True, True, False]),
+          expected=np.std([1.0, 2.0, 3.0]),
+      ),
+      dict(
+          testcase_name='single_element',
+          x=np.array([5.0, 100.0]),
+          where=np.array([True, False]),
+          expected=0.0,
+      ),
+  )
+  def test_np_safe_std(
+      self, x: np.ndarray, where: np.ndarray, expected: float
+  ) -> None:
+    result = rl_lib.np_safe_std(x, where=where)
+    self.assertEqual(result, expected)
 
 
 class RewardNormalizerTest(absltest.TestCase):

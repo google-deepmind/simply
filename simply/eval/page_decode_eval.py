@@ -16,6 +16,7 @@
 import asyncio
 from collections.abc import Mapping, Sequence
 import dataclasses
+import functools
 import json
 import logging
 import queue
@@ -29,9 +30,6 @@ from absl import flags
 from etils import epath
 import grain
 import grpc
-import jax
-import jax.experimental.multihost_utils
-import jax.numpy as jnp
 from simply import config_lib
 from simply import data_lib
 from simply.serving import page_server
@@ -43,6 +41,8 @@ from simply.utils import lm_format as lm_format_lib
 from simply.utils import pytree
 from simply.utils import ragged_paged_attention as rpa
 from simply.utils import sharding
+
+PyTree = common.PyTree
 
 
 _EXPERIMENT_DIR = flags.DEFINE_string(
@@ -64,16 +64,15 @@ _SAVE_EVERY_N = flags.DEFINE_integer(
     'save_every_n', 10, 'Save the history every n examples.'
 )
 
-_TEMPERATURE = flags.DEFINE_float(
-    'temperature', 0.0, 'Temperature for sampling.'
-)
-
-_TOP_K = flags.DEFINE_integer('top_k', -1, 'Top-k for sampling.')
-
-_TOP_P = flags.DEFINE_float('top_p', 1.0, 'Top-p for sampling.')
 
 _N_REPEATS = flags.DEFINE_integer(
     'n_repeats', 1, 'Number of times to repeat the dataset.'
+)
+
+_SAVE_FULL_INFO = flags.DEFINE_bool(
+    'save_full_info',
+    False,
+    'If True, save full information in history, else only save critical info.',
 )
 
 
@@ -98,11 +97,12 @@ def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
-  experiment_helper.setup_work_unit()
-
-  helper = experiment_helper.ExperimentHelper(
-      experiment_dir=_EXPERIMENT_DIR.value
+  set_notes = functools.partial(
+      experiment_helper.set_notes,
+      should_set=experiment_helper.is_primary_task(),
   )
+
+  experiment_helper.setup_work_unit()
 
   config = config_lib.ExperimentConfigRegistry.get_instance(
       page_server._EXPERIMENT_CONFIG.value
@@ -113,9 +113,6 @@ def main(argv: Sequence[str]) -> None:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
-  sharding.set_mesh(
-      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
-  )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
   if vocab_name := page_server._VOCAB_NAME.value:
@@ -129,7 +126,7 @@ def main(argv: Sequence[str]) -> None:
     config_replace_kwargs['init_ckpt_step'] = page_server._CKPT_STEP.value
     if (ckpt_format := page_server._CKPT_FORMAT.value) is not None:
       config_replace_kwargs['init_ckpt_format'] = ckpt_format
-  page_size = 128
+  page_size = page_server._PAGE_SIZE.value
   global_total_num_pages = (
       rpa.max_num_pages_per_seq(page_server._MAX_SEQ_LEN.value, page_size, None)
       * page_server._BATCH_SIZE.value
@@ -149,13 +146,13 @@ def main(argv: Sequence[str]) -> None:
   config_replace_kwargs['local_total_num_pages'] = local_total_num_pages
   config_replace_kwargs['page_size'] = page_size
 
-  decoding_sharding_config = getattr(config, 'decoding_sharding_config', None)
-  if decoding_sharding_config is None:
-    decoding_sharding_config = config.sharding_config.to_decoding_sharding()
-
   if not (lm_format_name := page_server._LM_FORMAT.value):
     lm_format_name = getattr(config, 'lm_format_name')
 
+  decoding_sharding_config = (
+      getattr(config, 'decoding_sharding_config', None)
+      or config.sharding_config.to_decoding_sharding()
+  )
   config = dataclasses.replace(
       config,
       use_scan=False,
@@ -167,41 +164,43 @@ def main(argv: Sequence[str]) -> None:
   experiment_dir = _EXPERIMENT_DIR.value
   if not experiment_dir:
     raise ValueError('Must specify --experiment_dir.')
-  experiment_dir = epath.Path(experiment_dir)
+  helper = experiment_helper.ExperimentHelper(experiment_dir=experiment_dir)
+  experiment_dir = epath.Path(helper.experiment_dir)
+  helper.save_config_info(config, config.sharding_config)
 
+  sharding.set_mesh(
+      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+  )
   batcher = page_server.Batcher(
       config=config,
       lm_format=lm_format_lib.LMFormatRegistry.get_instance(lm_format_name),
   )
-  helper.save_config_info(config, config.sharding_config)
-  experiment_helper.set_notes('Initializing model.')
+  set_notes('Initializing model.')
 
-  def _init_fn():
-    params = batcher.model.init(jax.random.key(0))
-    if page_server._ACTIVATION_DTYPE.value == 'bfloat16':
-      params = jax.tree_util.tree_map(
-          lambda x: jnp.astype(x, jnp.bfloat16), params
-      )
-    return {'params': params}
-
-  experiment_helper.set_notes('Loading checkpoint ...')
-  abstract_state = common.eval_abstract_output(_init_fn)
-  model_state = checkpoint_lib.load_checkpoint_from_dir(
-      config.init_ckpt_dir,
-      abstract_state,
-      config.init_ckpt_step,
-      ckpt_format=config.init_ckpt_format,
+  if not (checkpoint_path := page_server._CKPT_PATH.value):
+    checkpoint_path = checkpoint_lib.get_checkpoint_path(
+        config.init_ckpt_dir, config.init_ckpt_step
+    )
+  set_notes(f'Loading checkpoint from {checkpoint_path} ...')
+  batcher.update_params_from_checkpoint_path(
+      checkpoint_path,
   )
-  batcher.update_params(model_state['params'])
+
   stop_event = threading.Event()
   error_message_queue = queue.Queue[Exception]()
   batcher_thread = batcher.thread(stop_event, error_message_queue)
   batcher_thread.start()
 
+  if not experiment_helper.is_primary_task():
+    batcher_thread.join()
+    if not error_message_queue.empty():
+      raise error_message_queue.get()
+    return
+
   evaluation = evaluation_lib.EvaluationRegistry.get_instance(_EVALUATION.value)
 
   datasource = data_lib.DataSourceRegistry.get_instance(_DATASOURCE_NAME.value)
-  dataset = grain.MapDataset.source(datasource.load())
+  dataset = data_lib.get_data_source(datasource)
   dataset = dataset.repeat(_N_REPEATS.value)
   num_total_examples = len(dataset)
 
@@ -217,7 +216,7 @@ def main(argv: Sequence[str]) -> None:
 
   logging.info('dataiter_state=%s', dataiter_state)
   logging.info('num_past_examples=%d', num_past_examples)
-  experiment_helper.set_notes(
+  set_notes(
       f'Starting to decode from example {num_past_examples}.'
   )
 
@@ -254,7 +253,7 @@ def main(argv: Sequence[str]) -> None:
   if dataiter_state is not None:
     dataiter.set_state(dataiter_state)
 
-  experiment_helper.set_notes(
+  set_notes(
       f'Starting to decode from example {num_past_examples}.'
   )
   start_time = time.time()
@@ -277,8 +276,18 @@ def main(argv: Sequence[str]) -> None:
       history_path = experiment_dir / f'history_{num_past_examples}.jsonl'
       history_tmp_path = history_path.with_suffix('.tmp')
       with history_tmp_path.open('w') as f:
-        for example in history:
-          json.dump(pytree.dump(example), f)
+        for example_to_save in history:
+          if not _SAVE_FULL_INFO.value:
+            lm_response = example_to_save['lm_response']
+            input_len = lm_response['input_len']
+            example_to_save = dict(
+                lm_request=example_to_save['lm_request'],
+                output_text=lm_response['output_text'],
+                input_len=input_len,
+                output_len=len(lm_response['tokens']) - input_len,
+                correct=example_to_save['correct'],
+            )
+          json.dump(pytree.dump(example_to_save), f)
           f.write('\n')
       history_path.rmtree(missing_ok=True)
       history_tmp_path.rename(history_path)
@@ -296,7 +305,7 @@ def main(argv: Sequence[str]) -> None:
       iter_state_tmp_path.rename(iter_state_path)
 
       avg_generation_time = total_generation_time / num_past_examples
-      helper.set_notes(
+      set_notes(
           f'Completed {num_past_examples}/{num_total_examples} examples,'
           f' {avg_generation_time:.2f} s/example'
       )
@@ -319,6 +328,8 @@ def main(argv: Sequence[str]) -> None:
         total=total,
     )
 
+  stop_event.set()
+
   async def _stats_all_history() -> Mapping[str, int | float]:
     history_paths = experiment_dir.glob('history_*.jsonl')
     stat_futures = []
@@ -337,18 +348,28 @@ def main(argv: Sequence[str]) -> None:
           results[k] += v
     return results
 
-  if experiment_helper.is_primary_process():
-    results = asyncio.run(_stats_all_history())
-    logging.info('results=%s', results)
+  results = asyncio.run(_stats_all_history())
+  logging.info('results=%s', results)
+  correct = results['correct']
+  total = results['total']
+  set_notes(
+      f'Finished: accuracy is {correct=}/{total=} ='
+      f' {correct / total * 100:.2f}%,'
+      f' {total_generation_time / total:.2f} s/example'
+  )
 
-    correct = results['correct']
-    total = results['total']
+  final_result = {
+      'accuracy': correct / total,
+      'correct': correct,
+      'total': total,
+      'avg_generation_time': total_generation_time / total,
+  }
+  logging.info('final_result=%s', final_result)
+  experiment_dir = epath.Path(helper.experiment_dir)
+  with (experiment_dir / 'final_result.json').open('w') as f:
+    f.write(json.dumps(final_result, indent=2))
 
-    experiment_helper.set_notes(
-        f'Finished: accuracy is {correct=}/{total=} ='
-        f' {correct / total * 100:.2f}%,'
-        f' {total_generation_time / total:.2f} s/example'
-    )
+  batcher_thread.join()
 
 
 if __name__ == '__main__':

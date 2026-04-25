@@ -14,20 +14,12 @@
 """Registry."""
 
 from collections.abc import Collection
-import importlib
-import traceback
+import sys
 from typing import Any, ClassVar
 
 
-def _being_reloaded() -> bool:
-  """Returns whether we are being called from importlib.reload."""
-  for s in traceback.extract_stack():
-    if s.name == 'reload' and s.filename == importlib.__file__:
-      return True
-    if s.name.endswith('cell_maybe_reload'):
-      # ecolab autoreload
-      return True
-  return False
+def _is_running_in_colab():
+  return 'google.colab' in sys.modules
 
 
 class RootRegistry:
@@ -73,7 +65,7 @@ class RootRegistry:
       raise ValueError(f'name must be specified for {fn_or_cls}')
     fullname = cls.fullname(name)
     if fullname in cls.registry and not cls.OVERWRITE_DUPLICATE:
-      if not _being_reloaded():
+      if not _is_running_in_colab():
         raise ValueError(f'Duplicate name: {fullname}')
     cls.registry[fullname] = fn_or_cls
     setattr(fn_or_cls, '__registered_name__', fullname)

@@ -100,7 +100,10 @@ def main(argv: Sequence[str]) -> None:
 
   with ocp.CheckpointManager(_OUTPUT_PATH.value) as mngr:
     ckpt_lib.save_checkpoint(
-        mngr, state, 1, ckpt_lib.CheckpointFormatRegistry.get(_FORMAT.value)
+        mngr,
+        state,
+        1,
+        ckpt_lib.CheckpointFormatRegistry.get_instance(_FORMAT.value),
     )
 
 

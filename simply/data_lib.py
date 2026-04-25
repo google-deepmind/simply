@@ -44,13 +44,16 @@ import dataclasses
 import functools
 import json
 import os
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Literal, Protocol, cast
 
 from absl import logging
 from etils import epath
 import grain.python as grain
+import jax
+from jax.experimental import multihost_utils
 import numpy as np
 from simply.utils import common
+from simply.utils import pytree
 from simply.utils import registry
 from simply.utils import tokenization
 import simply.utils.lm_format as lm_format_lib
@@ -278,12 +281,11 @@ class ArrayRecordSource:
     expanded_paths = []
     paths = (self.paths,) if isinstance(self.paths, str) else self.paths
     for pattern in paths:
-      import glob
-      matches = glob.glob(pattern)
+      matches = [mp.as_posix() for mp in epath.Path().glob(pattern)]
       if matches:
         expanded_paths.extend(sorted(matches))
       else:
-        expanded_paths.append(pattern)
+        raise ValueError(f'No matches found for pattern: {pattern}')
     return grain.ArrayRecordDataSource(expanded_paths)
 
   def __len__(self) -> int:
@@ -509,6 +511,51 @@ class GSM8KTestSource(GSM8KSource):
   split: str = 'test'
 
 
+@functools.partial(DataSourceRegistry.register, name='simply:gsm8k_sft_train')
+@dataclasses.dataclass(frozen=True)
+class GSM8KSFTSource:
+  """GSM8K dataset formatted as conversations for SFT."""
+
+  path: str = os.path.join(DATASETS_DIR, 'gsm8k/gsm8k.json')
+  split: str = 'train'
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _examples(self) -> list[dict[str, Any]]:
+    """Lazily load and cache examples as conversations."""
+    with epath.Path(self.path).open('r') as f:
+      data = json.load(f)
+    examples = []
+    for i, example in enumerate(
+        data[self.split][self.start_index : self.end_index]
+    ):
+      conversation = json.dumps([
+          {'role': 'user', 'content': example['question']},
+          {'role': 'assistant', 'content': example['answer']},
+      ])
+      examples.append({
+          'conversation': conversation,
+          'uid': f'gsm8k_sft_{self.split}-{i}',
+          'id': i,
+      })
+    return examples
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._examples[index]
+
+
+@functools.partial(DataSourceRegistry.register, name='simply:gsm8k_sft_test')
+@dataclasses.dataclass(frozen=True)
+class GSM8KSFTTestSource(GSM8KSFTSource):
+  """GSM8K test split formatted as conversations for SFT."""
+
+  split: str = 'test'
+
+
 @functools.partial(DataSourceRegistry.register, name='simply:simple_qa_test')
 @dataclasses.dataclass(frozen=True)
 class SimpleQASource:
@@ -608,7 +655,7 @@ class DeepScaleRSource:
 class AIME24Source:
   """AIME 2024 dataset source with lazy loading."""
 
-  path: str = os.path.join(DATASETS_DIR, 'aime/aime_v2.json')
+  path: str = os.path.join(DATASETS_DIR, 'aime/aime_v3.json')
   year: int = 2024
   start_index: int | None = None
   end_index: int | None = None
@@ -643,6 +690,14 @@ class AIME25Source(AIME24Source):
   """AIME 2025 dataset source."""
 
   year: int = 2025
+
+
+@functools.partial(DataSourceRegistry.register, name='simply:aime26')
+@dataclasses.dataclass(frozen=True)
+class AIME26Source(AIME24Source):
+  """AIME 2026 dataset source."""
+
+  year: int = 2026
 
 
 @functools.partial(DataSourceRegistry.register, name='simply:math500_test')
@@ -784,12 +839,12 @@ class TFExampleDeserializeTransform(grain.MapTransform):
     if isinstance(features, Mapping):
       return dict(features)
 
-    # Parse TFExample proto using tensorflow proto definitions.
+    # Parse TFExample proto using tensorflow_datasets proto definitions.
     # This avoids requiring full tensorflow installation.
     # pylint: disable=g-import-not-at-top
-    import tensorflow as tf
+    from tensorflow_datasets.proto import tf_example_pb2
 
-    example = tf.train.Example()
+    example = tf_example_pb2.Example()
     example.ParseFromString(features)
 
     result = {}
@@ -993,6 +1048,42 @@ class PadTransform(grain.MapTransform):
     return result
 
 
+@dataclasses.dataclass(frozen=True)
+class RekeyTransform(grain.MapTransform):
+  """Rekey features.
+
+  Note that this transform will drop any keys not in the key_map.
+  """
+
+  key_map: Mapping[str, str] | None
+
+  def map(self, features: Mapping[str, Any]) -> Mapping[str, Any]:
+    if self.key_map is None:
+      return features
+    else:
+      return {
+          new_key: features[old_key]
+          for new_key, old_key in self.key_map.items()
+      }
+
+
+@dataclasses.dataclass(frozen=True)
+class NumpyTransform(grain.MapTransform):
+  """Transform list-types to Numpy arrays."""
+
+  type_cast_map: Mapping[str, np.typing.DTypeLike] | None = None
+
+  def map(self, features: Mapping[str, Any]) -> Mapping[str, Any]:
+    output = {}
+    for key in features:
+      val = features.get(key)
+      val = np.asarray(val)
+      if self.type_cast_map and key in self.type_cast_map:
+        val = val.astype(self.type_cast_map[key])
+      output[key] = val
+    return output
+
+
 ################################################################################
 # Packing methods.
 ################################################################################
@@ -1167,7 +1258,9 @@ def _create_map_dataset(
   Returns:
     A grain.MapDataset ready for packing via _to_fixed_length().
   """
-  tk_name = ds_config.tokenizer_name or tokenizer_name
+  tk_name = tokenizer_name
+  if ds_config.tokenizer_name is not None:
+    tk_name = ds_config.tokenizer_name
   fmt_name = ds_config.lm_format_name
 
   # Step 1a: Get raw data source.
@@ -1211,7 +1304,6 @@ def _create_map_dataset(
   if shuffle:
     ds = ds.shuffle(seed=seed + seed_offset)
   ds = ds.repeat(num_epochs)
-
   return ds
 
 
@@ -1250,6 +1342,10 @@ def create_iter_dataset(
     shuffle = False
     num_epochs = config.validation_eval_epochs
 
+  # Resolve string shorthand via DatasetConfigRegistry.
+  if isinstance(ds_config, str):
+    ds_config = DatasetConfigRegistry.get_instance(ds_config)
+
   # Get config values.
   tokenizer_name = config.vocab_name
   seq_len = config.seq_len
@@ -1261,6 +1357,16 @@ def create_iter_dataset(
   # Get pad_id from tokenizer (used for pad_or_truncate packing).
   tokenizer = _get_tokenizer(tokenizer_name)
   pad_id = tokenizer.pad_id or 0
+
+  def _shard(
+      map_ds: grain.MapDataset,
+      shard_data_method: Literal['NO_SHARDING', 'BY_JAX_PROCESS'],
+  ) -> grain.MapDataset:
+    if shard_data_method == 'NO_SHARDING':
+      return map_ds
+    if shard_data_method == 'BY_JAX_PROCESS':
+      return map_ds[jax.process_index() :: jax.process_count()]
+    raise NotImplementedError(f'Unsupported {shard_data_method=}')
 
   # Helper to convert MapDataset to IterDataset via packing.
   def _pack(map_ds: grain.MapDataset, packing: str) -> grain.IterDataset:
@@ -1279,7 +1385,16 @@ def create_iter_dataset(
   # Helper to apply batching and prefetching.
   def _finalize(iter_ds: grain.IterDataset) -> grain.IterDataset:
     batch_fn = get_batch_fn(batch_mode)
-    iter_ds = iter_ds.batch(batch_size, drop_remainder=True, batch_fn=batch_fn)
+    local_batch_size = batch_size
+    if config.shard_data_method == 'BY_JAX_PROCESS':
+      if batch_size % jax.process_count() != 0:
+        raise ValueError(
+            f'{batch_size=} cannot be divided by {jax.process_count()=}'
+        )
+      local_batch_size = batch_size // jax.process_count()
+    iter_ds = iter_ds.batch(
+        local_batch_size, drop_remainder=True, batch_fn=batch_fn
+    )
     return iter_ds.mp_prefetch(
         grain.MultiprocessingOptions(
             num_workers=prefetch_num_workers,
@@ -1293,6 +1408,9 @@ def create_iter_dataset(
     weights = []
     packings = []
     for i, (entry, weight) in enumerate(ds_config.datasets):
+      # Resolve string shorthand via DatasetConfigRegistry.
+      if isinstance(entry, str):
+        entry = DatasetConfigRegistry.get_instance(entry)
       ds = _create_map_dataset(
           entry,
           tokenizer_name,
@@ -1301,6 +1419,7 @@ def create_iter_dataset(
           num_epochs,
           seed_offset=i,
       )
+      ds = _shard(ds, config.shard_data_method)
       if ds_config.pack_before_mix:
         packing_method = entry.packing if training else PACKING_PAD_OR_TRUNCATE
         ds = _to_fixed_length(
@@ -1324,6 +1443,7 @@ def create_iter_dataset(
         mixed_packing = PACKING_FIRST_FIT
       else:
         mixed_packing = PACKING_CONCAT_SPLIT
+      datasets = cast(Sequence[grain.MapDataset], datasets)
       mixed_ds = grain.MapDataset.mix(datasets, weights=weights)
       iter_ds = _pack(mixed_ds, mixed_packing)
     return _finalize(iter_ds)
@@ -1336,4 +1456,49 @@ def create_iter_dataset(
       shuffle,
       num_epochs,
   )
+  map_ds = _shard(map_ds, config.shard_data_method)
   return _finalize(_pack(map_ds, ds_config.packing))
+
+
+def grain_iter_global_state(
+    local_state: Mapping[str, Any],
+    shard_data_method: Literal['NO_SHARDING', 'BY_JAX_PROCESS'],
+) -> Mapping[str, Any]:
+  """Returns the global state for a given grain local state."""
+  if shard_data_method == 'NO_SHARDING':
+    return local_state
+  if shard_data_method == 'BY_JAX_PROCESS':
+
+    def _is_leaf(x):
+      if pytree.tree_is_mapping(x):
+        return False
+      if pytree.tree_is_sequence(x):
+        if pytree.tree_is_mapping(x[0]) or pytree.tree_is_sequence(x[0]):
+          return False
+      return True
+
+    local_state = jax.tree.map(np.asarray, local_state, is_leaf=_is_leaf)
+    state = multihost_utils.process_allgather(local_state)
+    state = jax.tree.map(lambda x: x.tolist(), state)
+    state['__process_count__'] = jax.process_count()
+    return state
+  raise NotImplementedError(f'Unsupported {shard_data_method=}')
+
+
+def grain_iter_local_state(
+    global_state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+  """Returns the local state for a given grain global state."""
+  if process_count := global_state.get('__process_count__'):
+    if process_count != jax.process_count():
+      raise ValueError(f'{process_count=} != {jax.process_count()=}')
+    process_index = jax.process_index()
+    global_state = {
+        k: v for k, v in global_state.items() if k != '__process_count__'
+    }
+    return jax.tree_util.tree_map(
+        lambda x: x[process_index],
+        global_state,
+        is_leaf=lambda x: not pytree.tree_is_mapping(x),
+    )
+  return global_state

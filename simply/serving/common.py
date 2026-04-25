@@ -24,9 +24,11 @@ def json_to_struct_pb(jtree: common.PyTree) -> struct_pb2.Value:
   """Converts a json-like tree to a struct_pb2.Value."""
   res = struct_pb2.Value()
   if pytree.tree_is_mapping(jtree):
+    res.struct_value.SetInParent()
     for k, v in jtree.items():
       res.struct_value.fields[k].CopyFrom(json_to_struct_pb(v))
   elif pytree.tree_is_sequence(jtree):
+    res.list_value.SetInParent()
     for v in jtree:
       res.list_value.values.append(json_to_struct_pb(v))
   elif jtree is None:

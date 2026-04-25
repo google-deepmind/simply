@@ -25,7 +25,7 @@ class LMFormatRegistry(registry.RootRegistry):
   namespace: ClassVar[str] = 'lm_format'
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class LMFormat(abc.ABC):
   """Base class for Language Model formatting.
 
@@ -35,6 +35,8 @@ class LMFormat(abc.ABC):
   bos_id: int | None = None
   pad_id: int | None = None
   extra_eos_tokens: tuple[str, ...] = ()
+  begin_of_thought_marker: str | None = None
+  end_of_thought_marker: str | None = None
 
   @abc.abstractmethod
   def format(self, messages: Sequence[Mapping[str, Any]]) -> str:
@@ -93,7 +95,7 @@ class LMFormat(abc.ABC):
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Pretrain(LMFormat):
   """Pre-training model format."""
 
@@ -106,7 +108,7 @@ class Pretrain(LMFormat):
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class SimplyV1Chat(LMFormat):
   """LM format for Simply V1."""
   user_marker: str = '<reserved_1>'
@@ -138,7 +140,7 @@ class SimplyV1Chat(LMFormat):
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class GemmaV2Chat(LMFormat):
   """LM format for Gemma V2."""
   system_marker: str = '<start_of_turn>system\n'
@@ -165,7 +167,7 @@ class GemmaV2Chat(LMFormat):
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class DeepSeekQwenR1DistillChat(LMFormat):
   """LM format for Qwen R1 distill.
 
@@ -253,7 +255,7 @@ class DeepSeekQwenR1DistillChat(LMFormat):
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class QwenV2Chat(LMFormat):
   """LM format for Qwen V2."""
   user_marker: str = '<|im_start|>user\n'
@@ -262,6 +264,8 @@ class QwenV2Chat(LMFormat):
   end_of_message_marker: str = '<|im_end|>\n'
   extra_eos_tokens: tuple[str, ...] = ('<|im_start|>', '<|im_end|>')
   add_think_marker: bool = False
+  begin_of_thought_marker: str = '<think>'
+  end_of_thought_marker: str = '</think>'
 
   def format(self, messages: Sequence[Mapping[str, Any]]) -> str:
     output = ''
@@ -278,11 +282,11 @@ class QwenV2Chat(LMFormat):
       output += self.end_of_message_marker
     output += self.assistant_marker
     if self.add_think_marker:
-      output += '<think>\n'
+      output += self.begin_of_thought_marker + '\n'
     return output
 
 
 @LMFormatRegistry.register
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class QwQChat(QwenV2Chat):
   add_think_marker: bool = True
