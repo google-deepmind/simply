@@ -212,7 +212,7 @@ def get_partition_size(partition: str | Sequence[str] | None) -> int:
       js.get_abstract_mesh().shape[axis] if axis is not None else 1
       for axis in partition
   ]
-  return np.prod(axis_sizes, dtype=int)
+  return int(np.prod(axis_sizes, dtype=int))
 
 
 def partition_spec(

@@ -1302,55 +1302,58 @@ class MoETest(parameterized.TestCase):
           testcase_name='_no_gate_dropless',
           use_gated_activation_in_ffn=False,
           num_experts=8,
-          expert_capacity_factor=None,
+          ep_capacity_factor=None,
           num_experts_per_token=2,
       ),
       dict(
           testcase_name='_gate_dropless',
           use_gated_activation_in_ffn=True,
           num_experts=6,
-          expert_capacity_factor=None,
+          ep_capacity_factor=None,
           num_experts_per_token=2,
       ),
       dict(
           testcase_name='_gate_dropless_single_expert',
           use_gated_activation_in_ffn=True,
           num_experts=1,
-          expert_capacity_factor=None,
+          ep_capacity_factor=None,
           num_experts_per_token=1,
       ),
       dict(
           testcase_name='_gate_dropless_all_experts',
           use_gated_activation_in_ffn=True,
           num_experts=4,
-          expert_capacity_factor=None,
+          ep_capacity_factor=None,
           num_experts_per_token=4,
       ),
       dict(
           testcase_name='_no_gate',
           use_gated_activation_in_ffn=False,
           num_experts=8,
-          expert_capacity_factor=5,
+          ep_method='dense',
+          ep_capacity_factor=5,
           num_experts_per_token=2,
       ),
       dict(
           testcase_name='_gate',
           use_gated_activation_in_ffn=True,
           num_experts=6,
-          expert_capacity_factor=5,
+          ep_method='dense',
+          ep_capacity_factor=5,
           num_experts_per_token=2,
       ),
       dict(
           testcase_name='_gate_single_expert',
           use_gated_activation_in_ffn=True,
           num_experts=1,
-          expert_capacity_factor=5,
+          ep_method='dense',
+          ep_capacity_factor=5,
           num_experts_per_token=1,
       ),
   )
   def test_moe_feed_forward_equivalence(
-      self, use_gated_activation_in_ffn, num_experts, expert_capacity_factor,
-      num_experts_per_token=2, activation_dtype='bfloat16',
+      self, use_gated_activation_in_ffn, num_experts, ep_capacity_factor,
+      num_experts_per_token=2, activation_dtype='bfloat16', ep_method='ra2a',
   ):
     sharding_config = config_lib.moe_sharding()
     sharding_lib.set_default_mesh_shape(
@@ -1372,7 +1375,8 @@ class MoETest(parameterized.TestCase):
         sharding_config=sharding_config,
         num_experts=num_experts,
         num_experts_per_token=num_experts_per_token,
-        expert_capacity_factor=expert_capacity_factor,
+        ep_capacity_factor=ep_capacity_factor,
+        ep_method=ep_method,
         ffn_use_bias=False,
         use_gated_activation_in_ffn=use_gated_activation_in_ffn,
         activation_dtype=activation_dtype,
@@ -1407,6 +1411,108 @@ class MoETest(parameterized.TestCase):
     jax.tree.map(
         lambda x, y: np.testing.assert_allclose(x, y, rtol=1e-2, atol=1e-2),
         grad1, grad2)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='_pipelined_ag_dropless',
+          ep_method='pipelined_ag',
+          ep_pipeline_fine_grained_ra2a=False,
+          ep_capacity_factor=None,
+      ),
+      dict(
+          testcase_name='_pipelined_ra2a_dropless',
+          ep_method='pipelined_ra2a',
+          ep_pipeline_fine_grained_ra2a=False,
+          ep_capacity_factor=None,
+      ),
+      dict(
+          testcase_name='_pipelined_ag',
+          ep_method='pipelined_ag',
+          ep_pipeline_fine_grained_ra2a=False,
+          ep_capacity_factor=5,
+      ),
+      dict(
+          testcase_name='_pipelined_ra2a',
+          ep_method='pipelined_ra2a',
+          ep_pipeline_fine_grained_ra2a=False,
+          ep_capacity_factor=5,
+      ),
+      dict(
+          testcase_name='_pipelined_ra2a_fine_grained_dropless',
+          ep_method='pipelined_ra2a',
+          ep_pipeline_fine_grained_ra2a=True,
+          ep_capacity_factor=None,
+      ),
+
+  )
+  def test_pipelined_moe_feed_forward_equivalence(
+      self, ep_method, ep_pipeline_fine_grained_ra2a, ep_capacity_factor,
+      use_gated_activation_in_ffn=False, num_experts=8, num_experts_per_token=2,
+      activation_dtype='bfloat16',
+  ):
+    sharding_config = config_lib.moe_sharding()
+    sharding_lib.set_default_mesh_shape(
+        mesh_shape=(1, 1, 1, 1),
+        axis_names=sharding_config.mesh_axis_names)
+    batch_size, seq_len, model_dim, expand_factor = 2, 4, 1024, 2
+    segment_ids = jnp.array([[1, 2, 3, 0], [1, 0, 0, 1]])
+    key = jax.random.key(0)
+    input_key, prng_key = jax.random.split(key)
+    inputs = jax.random.normal(
+        input_key, shape=(batch_size, seq_len, model_dim),
+        dtype=activation_dtype
+    )
+    inputs_mask = segment_ids != 0
+
+    moe_ffn = model_lib.MoEFeedForward(
+        model_dim=model_dim,
+        expand_factor=expand_factor,
+        sharding_config=sharding_config,
+        num_experts=num_experts,
+        num_experts_per_token=num_experts_per_token,
+        ep_capacity_factor=ep_capacity_factor,
+        ffn_use_bias=False,
+        use_gated_activation_in_ffn=use_gated_activation_in_ffn,
+        activation_dtype=activation_dtype,
+        ep_method=ep_method,
+        ep_pipeline_fine_grained_ra2a=ep_pipeline_fine_grained_ra2a,
+        ep_pipeline_stages=4,
+    )
+
+    params = moe_ffn.init(prng_key)
+    moe_output, _ = jax.jit(moe_ffn.apply)(
+        params, inputs, inputs_mask=inputs_mask)
+
+    simple_moe_fn = functools.partial(
+        simple_moe,
+        num_experts_per_token=num_experts_per_token,
+        num_experts=num_experts,
+        ffn_activation=moe_ffn.ffn_activation,
+        use_gated_activation_in_ffn=use_gated_activation_in_ffn,
+        activation_dtype=activation_dtype,
+    )
+    simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
+    self.assertEqual(moe_output.shape, simple_moe_output.shape)
+    self.assertEqual(moe_output.dtype, simple_moe_output.dtype)
+    err = self.vector_norm_error(moe_output, simple_moe_output)
+    np.testing.assert_allclose(err, jnp.zeros_like(err), atol=1e-2, rtol=0)
+
+    def loss1(params, inputs, inputs_mask):
+      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(moe_output) / (batch_size * seq_len)
+
+    def loss2(params, inputs, inputs_mask):
+      simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
+      return jnp.sum(simple_moe_output) / (batch_size * seq_len)
+
+    grad1 = jax.jit(jax.grad(loss1))(params, inputs, inputs_mask)
+    grad2 = jax.jit(jax.grad(loss2))(params, inputs, inputs_mask)
+
+    def check_error(g1, g2):
+      err = self.vector_norm_error(g1, g2, axis=(-1, -2))  # Frobenius norm
+      np.testing.assert_allclose(err, jnp.zeros_like(err), atol=4e-2, rtol=0)
+
+    jax.tree.map(check_error, grad1, grad2)
 
 
 if __name__ == '__main__':

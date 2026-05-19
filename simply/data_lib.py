@@ -770,6 +770,82 @@ class GPQADiamondSource:
     return self._examples[index]
 
 
+@functools.partial(DataSourceRegistry.register, name='simply:quality_train')
+@dataclasses.dataclass(frozen=True)
+class QualityTrainSource:
+  """QuALITY long-context multiple-choice QA dataset (train split).
+
+  QuALITY is a multiple-choice QA benchmark requiring reading comprehension of
+  long passages (~5k tokens). Each example contains an article, a question, 4
+  answer options, and a gold label.
+
+  Paper: https://arxiv.org/abs/2112.08608
+  TFDS: quality
+  """
+
+  split: str = 'train'
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _source(self):
+    return TFDSSource(name='quality', split=self.split)
+
+  @functools.cached_property
+  def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples with normalized field names."""
+    source = self._source
+    examples = []
+    label_map = {1: 'A', 2: 'B', 3: 'C', 4: 'D'}
+
+    for i in range(len(source)):
+      ex = source[i]
+      article = (
+          ex['article'].decode('utf-8')
+          if isinstance(ex['article'], bytes)
+          else ex['article']
+      )
+
+      questions = ex['questions']
+      options = ex['options']
+      gold_labels = ex['gold_labels']
+
+      for j in range(len(questions)):
+        gold_label_int = int(gold_labels[j])
+        gold = label_map[gold_label_int]
+
+        examples.append({
+            'article': article,
+            'question': (
+                questions[j].decode('utf-8')
+                if isinstance(questions[j], bytes)
+                else questions[j]
+            ),
+            'options': [
+                opt.decode('utf-8') if isinstance(opt, bytes) else opt
+                for opt in options[j]
+            ],
+            'gold_label': gold,
+            'uid': f'quality_{self.split}-{i}-{j}',
+            'id': len(examples),
+        })
+    return examples[self.start_index : self.end_index]
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._examples[index]
+
+
+@functools.partial(DataSourceRegistry.register, name='simply:quality_val')
+@dataclasses.dataclass(frozen=True)
+class QualityValSource(QualityTrainSource):
+  """QuALITY long-context multiple-choice QA dataset (validation split)."""
+
+  split: str = 'dev'
+
+
 def _register_gsm8k_variants():
   """Register GSM8K variants with limited examples."""
   for num_examples in [4, 32, 128]:

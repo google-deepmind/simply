@@ -13,11 +13,18 @@
 # limitations under the License.
 """Common utils for Simply serving."""
 
-from typing import Any
+from typing import Any, NamedTuple
 
+import grpc
 from simply.serving import struct_pb2
 from simply.utils import common
 from simply.utils import pytree
+
+
+class SimplyServiceResponse(NamedTuple):
+  code: grpc.StatusCode = grpc.StatusCode.OK
+  details: str = ''
+  result: Any = None
 
 
 def json_to_struct_pb(jtree: common.PyTree) -> struct_pb2.Value:

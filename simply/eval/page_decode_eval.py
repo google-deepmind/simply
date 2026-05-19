@@ -32,7 +32,9 @@ import grain
 import grpc
 from simply import config_lib
 from simply import data_lib
-from simply.serving import page_server
+from simply.serving import common as serving_common
+from simply.serving import common_flags
+from simply.serving import page_batcher
 from simply.utils import checkpoint_lib
 from simply.utils import common
 from simply.utils import evaluation_lib
@@ -76,9 +78,6 @@ _SAVE_FULL_INFO = flags.DEFINE_bool(
 )
 
 
-# pylint: disable=protected-access
-
-
 def get_last_file(directory: epath.PathLike, pattern: str) -> epath.Path | None:
   """Returns the last file that matches the pattern."""
   last_file = None
@@ -105,37 +104,61 @@ def main(argv: Sequence[str]) -> None:
   experiment_helper.setup_work_unit()
 
   config = config_lib.ExperimentConfigRegistry.get_instance(
-      page_server._EXPERIMENT_CONFIG.value
+      common_flags.EXPERIMENT_CONFIG.value
   )
 
   config_replace_kwargs = {}
-  if mesh_shape := page_server._MESH_SHAPE.value:
+  if mesh_shape := common_flags.MESH_SHAPE.value:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
-  if vocab_name := page_server._VOCAB_NAME.value:
+  if vocab_name := common_flags.VOCAB_NAME.value:
     config_replace_kwargs['vocab_name'] = vocab_name
-  if batch_size := page_server._BATCH_SIZE.value:
+  if batch_size := common_flags.BATCH_SIZE.value:
     config_replace_kwargs['batch_size'] = batch_size
-  if activation_dtype := page_server._ACTIVATION_DTYPE.value:
+  if activation_dtype := common_flags.ACTIVATION_DTYPE.value:
     config_replace_kwargs['activation_dtype_name'] = activation_dtype
-  if checkpoint_dir := page_server._CKPT_DIR.value:
+  if checkpoint_dir := common_flags.CKPT_DIR.value:
     config_replace_kwargs['init_ckpt_dir'] = checkpoint_dir
-    config_replace_kwargs['init_ckpt_step'] = page_server._CKPT_STEP.value
-    if (ckpt_format := page_server._CKPT_FORMAT.value) is not None:
+    config_replace_kwargs['init_ckpt_step'] = common_flags.CKPT_STEP.value
+    if (ckpt_format := common_flags.CKPT_FORMAT.value) is not None:
       config_replace_kwargs['init_ckpt_format'] = ckpt_format
-  page_size = page_server._PAGE_SIZE.value
+
+  if not (lm_format_name := common_flags.LM_FORMAT.value):
+    lm_format_name = getattr(config, 'lm_format_name')
+
+  decoding_sharding_config = (
+      getattr(config, 'decoding_sharding_config', None)
+      or config.sharding_config.to_decoding_sharding()
+  )
+  config_replace_kwargs['sharding_config'] = decoding_sharding_config
+  sharding.set_mesh(
+      mesh_shape, axis_names=decoding_sharding_config.mesh_axis_names
+  )
+
+  page_size = common_flags.PAGE_SIZE.value
+  seq_partition = sharding.get_partition_axis(
+      decoding_sharding_config.attn_activation_partition, 1
+  )
+  num_seq_shards = sharding.get_partition_size(seq_partition)
   global_total_num_pages = (
-      rpa.max_num_pages_per_seq(page_server._MAX_SEQ_LEN.value, page_size, None)
-      * page_server._BATCH_SIZE.value
+      rpa.max_num_pages_per_seq_per_shard(
+          common_flags.MAX_SEQ_LEN.value, page_size, None, num_seq_shards
+      )
+      * common_flags.BATCH_SIZE.value
+      * num_seq_shards
   )
   local_total_num_pages = (
-      rpa.max_num_pages_per_seq(
-          page_server._MAX_SEQ_LEN.value, page_size, config.window_size
+      rpa.max_num_pages_per_seq_per_shard(
+          common_flags.MAX_SEQ_LEN.value,
+          page_size,
+          config.window_size,
+          num_seq_shards,
       )
-      * page_server._BATCH_SIZE.value
+      * common_flags.BATCH_SIZE.value
+      * num_seq_shards
   )
   logging.info(
       'global_total_num_pages=%d, local_total_num_pages=%d',
@@ -146,18 +169,10 @@ def main(argv: Sequence[str]) -> None:
   config_replace_kwargs['local_total_num_pages'] = local_total_num_pages
   config_replace_kwargs['page_size'] = page_size
 
-  if not (lm_format_name := page_server._LM_FORMAT.value):
-    lm_format_name = getattr(config, 'lm_format_name')
-
-  decoding_sharding_config = (
-      getattr(config, 'decoding_sharding_config', None)
-      or config.sharding_config.to_decoding_sharding()
-  )
   config = dataclasses.replace(
       config,
       use_scan=False,
       use_remat=False,
-      sharding_config=decoding_sharding_config,
       **config_replace_kwargs,
   )
 
@@ -168,23 +183,29 @@ def main(argv: Sequence[str]) -> None:
   experiment_dir = epath.Path(helper.experiment_dir)
   helper.save_config_info(config, config.sharding_config)
 
-  sharding.set_mesh(
-      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
-  )
-  batcher = page_server.Batcher(
+  batcher = page_batcher.Batcher(
       config=config,
       lm_format=lm_format_lib.LMFormatRegistry.get_instance(lm_format_name),
+      max_seq_len=common_flags.MAX_SEQ_LEN.value,
+      max_decode_steps=common_flags.MAX_DECODE_STEPS.value,
+      page_size=common_flags.PAGE_SIZE.value,
+      temperature=common_flags.TEMPERATURE.value,
+      top_k=common_flags.TOP_K.value,
+      top_p=common_flags.TOP_P.value,
+      intermediate_steps=common_flags.INTERMEDIATE_STEPS.value,
+      response_asap=common_flags.RESPONSE_ASAP.value,
   )
-  set_notes('Initializing model.')
 
-  if not (checkpoint_path := page_server._CKPT_PATH.value):
-    checkpoint_path = checkpoint_lib.get_checkpoint_path(
-        config.init_ckpt_dir, config.init_ckpt_step
-    )
-  set_notes(f'Loading checkpoint from {checkpoint_path} ...')
-  batcher.update_params_from_checkpoint_path(
-      checkpoint_path,
+  set_notes('Compiling ...')
+  _ = batcher.compiled_decode_fn
+  _ = batcher.compiled_push_fn
+  _ = batcher.compiled_release_fn
+
+  checkpoint_path = checkpoint_lib.get_checkpoint_path(
+      config.init_ckpt_dir, config.init_ckpt_step
   )
+  set_notes(f'Loading checkpoint from {checkpoint_path} ...')
+  batcher.update_params_from_checkpoint_path(checkpoint_path)
 
   stop_event = threading.Event()
   error_message_queue = queue.Queue[Exception]()
@@ -229,7 +250,7 @@ def main(argv: Sequence[str]) -> None:
     assert pytree.tree_is_sequence(request)
     logging.info('enqueue index=%s', index)
     request[0]['__index__'] = index
-    future_response = asyncio.Future[page_server.SimplyServiceResponse]()
+    future_response = asyncio.Future[serving_common.SimplyServiceResponse]()
     batcher.enqueue(request, future_response)
     response = await future_response
     logging.info('response=%s', response)
@@ -244,7 +265,7 @@ def main(argv: Sequence[str]) -> None:
   )
   dataset = dataset.to_iter_dataset(
       grain.ReadOptions(
-          num_threads=page_server._BATCH_SIZE.value * 2,
+          num_threads=common_flags.BATCH_SIZE.value * 2,
           prefetch_buffer_size=4096,
       )
   )

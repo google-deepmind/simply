@@ -18,9 +18,9 @@ from absl.testing import absltest
 from absl.testing import parameterized
 import einops
 import jax
-from jax.experimental.pallas.ops.tpu.ragged_paged_attention import tuned_block_sizes
 import jax.numpy as jnp
 import numpy as np
+from simply.kernels import ragged_paged_attention as rpa_kernel
 from simply.utils import common
 from simply.utils import ragged_paged_attention as rpa
 from simply.utils import sampling_lib
@@ -100,9 +100,18 @@ class DecodeStateTest(parameterized.TestCase):
     page_size = 3
     n_kv_heads = 1
     per_head_dim = 2
-    pages_shape = (total_num_pages, page_size, n_kv_heads * 2, per_head_dim)
+    kv_packing = rpa_kernel.get_dtype_packing('float32')
+    pages_shape = (
+        total_num_pages,
+        page_size,
+        n_kv_heads * 2 // kv_packing,
+        kv_packing,
+        per_head_dim,
+    )
     pages = jnp.reshape(jnp.arange(np.prod(pages_shape)), pages_shape)
-    pages = jnp.pad(pages, ((0, 0), (0, 0), (0, 0), (0, 128 - per_head_dim)))
+    pages = jnp.pad(
+        pages, ((0, 0), (0, 0), (0, 0), (0, 0), (0, 128 - per_head_dim))
+    )
     page_indices = jnp.array([
         [5, 1, 3],
         [2, 0, -1],
@@ -127,13 +136,13 @@ class DecodeStateTest(parameterized.TestCase):
     )
 
     np.testing.assert_array_equal(
-        ds.num_pages, jnp.sum(page_indices >= 0, axis=-1)
+        ds.local_num_pages, jnp.sum(page_indices >= 0, axis=-1)
     )
     new_kv_shape = (jnp.sum(q_lens), n_kv_heads * 2, per_head_dim)
     new_kv = jnp.reshape(jnp.arange(np.prod(new_kv_shape)) * -1, new_kv_shape)
     ds = jax.jit(ds.insert)(new_kv[:, 0::2], new_kv[:, 1::2], q_lens)
     np.testing.assert_array_equal(
-        ds.pages[:, :, :, :per_head_dim],
+        ds.pages[..., :per_head_dim],
         np.array([
             [[[-24, -25], [-26, -27]], [[4, 5], [6, 7]], [[8, 9], [10, 11]]],
             [[[0, -1], [-2, -3]], [[-4, -5], [-6, -7]], [[-8, -9], [-10, -11]]],
@@ -153,7 +162,13 @@ class DecodeStateTest(parameterized.TestCase):
                 [[-32, -33], [-34, -35]],
             ],
             [[[60, 61], [62, 63]], [[64, 65], [66, 67]], [[68, 69], [70, 71]]],
-        ]),
+        ]).reshape(
+            total_num_pages,
+            page_size,
+            n_kv_heads * 2 // kv_packing,
+            kv_packing,
+            per_head_dim,
+        ),
     )
 
   @parameterized.named_parameters(
@@ -161,14 +176,16 @@ class DecodeStateTest(parameterized.TestCase):
       dict(testcase_name='with_partition', use_partition=True),
   )
   def test_update_decode_state_and_compute_attn(self, use_partition: bool):
-    if tuned_block_sizes.get_tpu_version() < 4:
+    if rpa_kernel.get_tpu_version() < 4:
       self.skipTest('Requires TPU v4 or higher')
     mesh_shape = [jax.device_count(), 1, 1, 1]
     if use_partition:
       if jax.device_count() < 2:
         self.skipTest('Requires at least 2 devices.')
       mesh_shape = [1, 1, jax.device_count() // 2, 2]
-    total_num_pages = 6
+    # TODO: Change it back to 6 when smart token issuing is properly
+    # implemented.
+    total_num_pages = 8
     page_size = 3
     max_seq_len = total_num_pages * page_size + 1
     num_issue_tokens = 10
@@ -286,7 +303,7 @@ class DecodeStateTest(parameterized.TestCase):
         max_seq_len=10000,
     )
     ds = config.init().allocate(jnp.array([3, 8, 10]))
-    self.assertEqual(ds.max_num_pages_per_seq, 3)
+    self.assertEqual(ds.max_num_pages_per_seq_per_shard, 3)
     np.testing.assert_array_equal(ds.max_available_kv_lens, np.array([9, 4, 6]))
     ds = ds.release_for_window()
     np.testing.assert_array_equal(ds.max_available_kv_lens, np.array([9, 4, 6]))
@@ -330,13 +347,11 @@ class SamplingStateTest(parameterized.TestCase):
     np.testing.assert_array_equal(
         sampling_state.input_lens, np.array([3, 5, 1])
     )
-    np.testing.assert_array_equal(
-        sampling_state.rank, np.array([0, 1, 2])
-    )
+    np.testing.assert_array_equal(sampling_state.rank, np.array([0, 1, 2]))
     outputs = sampling_state.get(np.array([True, True, True]))
     for i in range(len(outputs)):
       self.assertEqual(outputs[i]['index'], i)
-      np.testing.assert_array_equal(outputs[i]['tokens'], inputs[i][:lens[i]])
+      np.testing.assert_array_equal(outputs[i]['tokens'], inputs[i][: lens[i]])
 
     sampling_state = sampling_state.release(jnp.array([False, True, False]))
     np.testing.assert_array_equal(
@@ -354,9 +369,7 @@ class SamplingStateTest(parameterized.TestCase):
     np.testing.assert_array_equal(
         sampling_state.input_lens, np.array([3, 3, 1])
     )
-    np.testing.assert_array_equal(
-        sampling_state.rank, np.array([0, 2, 1])
-    )
+    np.testing.assert_array_equal(sampling_state.rank, np.array([0, 2, 1]))
 
   def test_ragged_issue_tokens(self):
     sampling_state = rpa.SamplingState.create(
@@ -405,9 +418,7 @@ class SamplingStateTest(parameterized.TestCase):
         token_logprobs=jnp.ones_like(ragged_output_tokens.data),
         token_scores=jnp.ones_like(ragged_output_tokens.data),
     )
-    np.testing.assert_array_equal(
-        sampling_state.position, np.array([1, 7])
-    )
+    np.testing.assert_array_equal(sampling_state.position, np.array([1, 7]))
     outputs = sampling_state.get(np.array([True, True]))
     jax.tree_util.tree_map(
         np.testing.assert_almost_equal,
@@ -435,7 +446,7 @@ class SamplingStateTest(parameterized.TestCase):
       dict(testcase_name='with_partition', use_partition=True),
   )
   def test_continue_decode(self, use_partition: bool):
-    if tuned_block_sizes.get_tpu_version() < 4:
+    if rpa_kernel.get_tpu_version() < 4:
       self.skipTest('Requires TPU v4 or higher')
     mesh_shape = [jax.device_count(), 1, 1, 1]
     if use_partition:

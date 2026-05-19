@@ -37,6 +37,7 @@ from simply.utils import common
 from simply.utils import experiment_helper as exp_helper
 from simply.utils import initializer
 from simply.utils import module
+from simply.utils import moe_lib
 from simply.utils import optimizers as opt_lib
 from simply.utils import position_encoding as pe_lib
 from simply.utils import pytree
@@ -643,14 +644,22 @@ class MoEFeedForward(FeedForward):
   """A Mixture-of-Experts FeedForward block."""
   num_experts: int = 8
   num_experts_per_token: int = 2
-  expert_capacity_factor: float | None = 1.0
   router_z_loss_weight: float = 0.0
   lbl_loss_weight: float = 0.0
   tile_batch_seq: int = 128
   tile_model_dim: int = 128
   tile_expand_dim: int = 128
   gmm_impl: str = 'ragged_dot'
-  ep_method: Literal['ra2a'] = 'ra2a'
+  # expert capacity factor for both dropping and dropless
+  # dropping: maximum token processed per expert shard
+  # dropless: maximum tokens processed per expert shard before slowpath fallback
+  ep_capacity_factor: float | None = None
+  ep_method: Literal['dense', 'ra2a', 'pipelined_ag', 'pipelined_ra2a'
+                     ] = 'ra2a'
+  ep_pipeline_stages: int = 4
+  ep_pipeline_comms: Literal['xla', 'pallas'] = 'xla'
+  ep_pipeline_fine_grained_ra2a: bool = False
+  ep_pipeline_use_opt_barriers: bool = True
 
   def setup(self):
     if self.ffn_use_bias:
@@ -756,16 +765,16 @@ class MoEFeedForward(FeedForward):
         selected_router_probs, self.activation_dtype
     )
     router_probs = jnp.asarray(router_probs, self.activation_dtype)
-    if self.expert_capacity_factor is not None:
-      logging.info('MoE method: dense moe')
-      outputs, ffn_extra_output = self._apply_dense_moe(
+    if self.ep_method.startswith('pipelined'):  # sparse dropless
+      logging.info('MoE method: pipelined sparse moe')
+      outputs, ffn_extra_output = self._apply_sparse_moe_v2(
           params,
           inputs,
           selected_indices=selected_indices,
           selected_weights=selected_router_probs,
           inputs_mask=inputs_mask,
       )
-    elif self.ep_method == 'ra2a':
+    elif self.ep_method == 'ra2a':  # sparse dropless, worst-case buffer
       logging.info('MoE method: (non-pipelined) sparse moe')
       outputs, ffn_extra_output = self._apply_sparse_moe(
           params,
@@ -774,9 +783,19 @@ class MoEFeedForward(FeedForward):
           selected_weights=selected_router_probs,
           inputs_mask=inputs_mask,
       )
+    elif self.ep_method == 'dense' and self.ep_capacity_factor is not None:
+      # dense with dropping
+      logging.info('MoE method: dense moe')
+      outputs, ffn_extra_output = self._apply_dense_moe(
+          params,
+          inputs,
+          selected_indices=selected_indices,
+          selected_weights=selected_router_probs,
+          inputs_mask=inputs_mask,
+      )
     else:
       raise ValueError(f'Unsupported MoE method: {self.ep_method=} with'
-                       f' {self.expert_capacity_factor=}')
+                       f' {self.ep_capacity_factor=}')
 
     load = ffn_extra_output['load']
     extra_output.update(ffn_extra_output)
@@ -1108,6 +1127,200 @@ class MoEFeedForward(FeedForward):
     )
     return outputs, {'load': load}
 
+  def _apply_sparse_moe_v2(
+      self,
+      params: PyTree,
+      inputs: Array,
+      selected_indices: Array,
+      selected_weights: Array,
+      inputs_mask: Array | None = None,
+  ) -> tuple[Array, PyTree]:
+    """Apply sparse MoE."""
+    logging.info('using sparse moe!')
+    if inputs_mask is not None:
+      # Mask out the padded tokens by assigning them to an expert that
+      # does not exist so that they will be skipped in the sparse matmul.
+      selected_indices = jnp.where(
+          inputs_mask[..., None], selected_indices, self.num_experts
+      )
+
+    if self.sharding_config.activation_partition is None:
+      selected_indices_partition = js.PartitionSpec()
+    else:
+      selected_indices_partition = js.PartitionSpec(
+          self.sharding_config.activation_partition[0],  # batch
+          self.sharding_config.activation_partition[1],  # seq
+          None                                           # experts_per_token
+      )
+    selected_weights_partition = selected_indices_partition
+
+    # ffn0_w: [num_experts, model_dim, expand_dim]
+    ffn0_w = params['ffn_0']['w']
+    ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)
+    ffn0_partition = (
+        js.PartitionSpec(*self.ffn0_partition)
+        if self.ffn0_partition is not None
+        else js.PartitionSpec()
+    )
+
+    if self.use_gated_activation_in_ffn:
+      # ffn0_gate_w: [num_experts, model_dim, expand_dim]
+      ffn0_gate_w = params['ffn_0_gate']['w']
+      ffn0_gate_w = common.convert_or_dequantize(
+          ffn0_gate_w, dtype=self.activation_dtype
+      )
+      ffn0_gate_partition = ffn0_partition
+    else:
+      ffn0_gate_w = None
+      ffn0_gate_partition = None
+
+    # ffn1_w: [num_experts, expand_dim, model_dim]
+    ffn1_w = params['ffn_1']['w']
+    ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)
+    ffn1_partition = sharding_lib.partition_spec(self.ffn1_partition)
+
+    if self.sharding_config.activation_partition is None:
+      activation_partition = js.PartitionSpec()
+    else:
+      activation_partition = js.PartitionSpec(
+          *self.sharding_config.activation_partition)
+
+    def all_gather_if_sharded(w, partition, axis):
+      if axis_name := get_partition_axis(partition, axis=axis):
+        return jax.lax.all_gather(
+            w, axis_name=axis_name, tiled=True, axis=axis)
+      else:
+        return w
+
+    def compute_block(
+        sorted_inputs, local_group_sizes, ffn0_w, ffn0_gate_w, ffn1_w
+    ):
+      # we get in a special 3D layout for efficient pipelined MoE
+      assert sorted_inputs.ndim == 3
+      inputs_shape = sorted_inputs.shape
+      sorted_inputs = sorted_inputs.reshape((sorted_inputs.shape[0], -1))
+
+      m, k = sorted_inputs.shape
+      n = ffn0_w.shape[-1]
+      ffn0_tiling = (
+          self.tile_batch_seq, self.tile_model_dim, self.tile_expand_dim)
+
+      ffn0_tiling = (
+          round_up_to_base(
+              min(ffn0_tiling[0], m), base=8, threshold=8),
+          round_up_to_base(min(ffn0_tiling[1], k), base=128, threshold=128),
+          round_up_to_base(min(ffn0_tiling[2], n), base=128, threshold=128),
+      )
+      ffn1_tiling = (ffn0_tiling[0], ffn0_tiling[2], ffn0_tiling[1])
+      gmm_ = functools.partial(
+          gmm, gmm_impl=self.gmm_impl, activation_dtype=self.activation_dtype,
+          tiling=ffn0_tiling)
+
+      projected_inputs = gmm_(sorted_inputs, ffn0_w, local_group_sizes)
+      activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
+      if self.use_gated_activation_in_ffn:
+        ffn0_gate_w = all_gather_if_sharded(
+            ffn0_gate_w, self.sharding_config.ffn0_partition, axis=1)
+        gate = gmm_(sorted_inputs, ffn0_gate_w, local_group_sizes)
+        gate = activation_fn(gate)
+        middle = jnp.asarray(gate, self.activation_dtype) * projected_inputs
+      else:
+        middle = jnp.asarray(
+            activation_fn(projected_inputs), self.activation_dtype
+        )
+      sorted_outputs = gmm_(middle, ffn1_w, local_group_sizes,
+                            tiling=ffn1_tiling)
+      return sorted_outputs.reshape(inputs_shape)
+
+    metrics_partition = js.PartitionSpec()
+    @jax.shard_map(
+        mesh=sharding_lib.get_default_mesh(),
+        in_specs=(
+            activation_partition,
+            ffn0_partition,
+            ffn0_gate_partition,
+            ffn1_partition,
+            selected_indices_partition,
+            selected_weights_partition
+        ),
+        out_specs=(activation_partition, metrics_partition),
+        check_vma=False  # Needed when using megablox.
+    )
+    def moe_ffn(inputs, ffn0_w, ffn0_gate_w, ffn1_w,
+                selected_indices, selected_weights):
+
+      # All gather inputs on model_dim axis if sharded.
+      inputs = all_gather_if_sharded(
+          inputs, partition=self.sharding_config.activation_partition, axis=2)
+      # All gather ffn0_w on contraction dimension if sharded (used in fsdp).
+      ffn0_w = all_gather_if_sharded(
+          ffn0_w, self.sharding_config.ffn0_partition, axis=1)
+      # All gather ffn1_w on output dimension if sharded (used in fsdp).
+      ffn1_w = all_gather_if_sharded(
+          ffn1_w, self.sharding_config.ffn1_partition, axis=2)
+
+      ep_axis = get_partition_axis(self.ffn0_partition, axis=0)
+      inputs_shape = inputs.shape
+      if inputs.shape[-1] % 128 != 0:
+        raise ValueError(f'Only 128-divisible {inputs.shape[-1]=} supported.')
+      inputs = inputs.reshape((-1, inputs.shape[-1] // 128, 128))
+      selected_indices = selected_indices.reshape(-1)
+      assert self.ep_method.startswith('pipelined_')
+
+      ra2a_method = (None if self.ep_pipeline_comms == 'pallas'
+                     else jax.lax.ragged_all_to_all)
+      ep_method = self.ep_method[len('pipelined_'):]  # strip 'pipelined_'
+      moe_pipeline_config = moe_lib.PipelinedMoEConfig(
+          gathers='custom',
+          ra2a=ra2a_method,
+          safety_factor=self.ep_capacity_factor or 1.5,  # 1.5 if None
+          use_scheduling_groups=False,
+          use_pipelined_ra2a_barriers=self.ep_pipeline_use_opt_barriers,
+          ep_method=ep_method,  # pytype: disable=wrong-arg-types
+          fine_grained_ra2a=self.ep_pipeline_fine_grained_ra2a,
+      )
+
+      if ep_method in ('ra2a', 'ag'):
+        moe_fwd_fn = moe_lib.run_moe_pipelined_shard_map
+      else:
+        raise ValueError(f'Unsupported ep_method: {self.ep_method}')
+      outputs = moe_fwd_fn(
+          selected_indices, inputs, ffn0_w, ffn0_gate_w, ffn1_w,
+          axis_name=ep_axis, num_experts=self.num_experts,
+          config=moe_pipeline_config,
+          experts_per_tok=self.num_experts_per_token,
+          splits=self.ep_pipeline_stages, metrics=(metrics := {}),
+          compute_block=compute_block, scales=selected_weights,
+      ).reshape(inputs_shape)
+      load = jax.lax.all_gather(metrics['load_factor'], axis_name=ep_axis)
+
+      # Assume megatron-style tensor parallelism on FFN.
+      tp_axis = get_partition_axis(self.ffn0_partition, axis=-1)
+      num_tp = jax.lax.axis_size(tp_axis) if tp_axis else 1
+      if outputs_model_dim_axis := get_partition_axis(
+          self.sharding_config.activation_partition, -1
+      ):
+        outputs = jax.lax.psum_scatter(
+            outputs,
+            axis_name=outputs_model_dim_axis,
+            scatter_dimension=2,
+            tiled=True,
+        )
+      elif num_tp > 1:
+        outputs = jax.lax.psum(outputs, axis_name=tp_axis)
+
+      return outputs, load
+
+    outputs, load = moe_ffn(
+        inputs,
+        ffn0_w,
+        ffn0_gate_w,
+        ffn1_w,
+        selected_indices,
+        selected_weights,
+    )
+    return outputs, {'load': load}
+
   def _apply_dense_moe(
       self,
       params: PyTree,
@@ -1120,7 +1333,7 @@ class MoEFeedForward(FeedForward):
     batch_size, seq_len, _ = inputs.shape
     num_tokens = batch_size * seq_len
     expert_capacity = max(
-        1, int(num_tokens / self.num_experts * self.expert_capacity_factor)
+        1, int(num_tokens / self.num_experts * self.ep_capacity_factor)
     )
     logging.info('expert_capacity=%s', expert_capacity)
     # selected_indices: [batch_size * seq_len, num_experts_per_token]
@@ -1237,6 +1450,49 @@ class Attention(module.SimplyModule):
   page_size: int = 0
   # Position encoding (None = NoPE, no positional encoding).
   position_encoding: pe_lib.PositionEncodingConfig | None = pe_lib.RoPE()
+
+  def _preprocess_flash_qkv(self, q, segment_ids, q_seq_len, kv_seq_len,
+                            shard_count):
+    """Prepare Q, segment_ids, and mask for flash attention.
+
+    Subclasses can override to modify Q ordering (e.g., interleaving for
+    load-balanced causal attention) and provide a matching mask.
+
+    Args:
+      q: Query tensor in BNLH format.
+      segment_ids: Segment IDs for Q positions.
+      q_seq_len: Q sequence length.
+      kv_seq_len: KV sequence length.
+      shard_count: Number of sequence shards.
+
+    Returns:
+      Tuple of (q, q_segment_ids, mask) where mask is a SplashAttention mask.
+    """
+    # NOTE: These are static masks, and their behavior are global which can
+    # result in some limitations. For example, we cannot mask first/last k
+    # tokens for each sequence under packed mode.
+    mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
+    if self.window_size > 0 and self.window_size + 1 < kv_seq_len:
+      mask &= splash_attention.LocalMask(
+          (q_seq_len, kv_seq_len),
+          (self.window_size, None),
+          offset=0,
+      )
+    return q, segment_ids, mask
+
+  def _postprocess_flash_output(self, output, shard_count):
+    """Post-process flash attention output before axis swap.
+
+    Subclasses can override to un-interleave the output.
+
+    Args:
+      output: Flash attention output in BNLH format.
+      shard_count: Number of sequence shards.
+
+    Returns:
+      Processed output in BNLH format.
+    """
+    return output
 
   def _scale_qk(
       self,
@@ -1433,27 +1689,15 @@ class Attention(module.SimplyModule):
         bl_unsharded_seq = js.PartitionSpec(batch_size_axis, None)
 
         q = einops.rearrange(q, 'b l n h -> b n l h')
-        k = einops.repeat(
-            k,
-            'b l n_kv_heads h -> b (n_kv_heads g) l h',
-            g=self.n_heads // self.n_kv_heads,
-        )
-        v = einops.repeat(
-            v,
-            'b l n_kv_heads h -> b (n_kv_heads g) l h',
-            g=self.n_heads // self.n_kv_heads,
-        )
+        k = einops.rearrange(k, 'b l n h -> b n l h')
+        v = einops.rearrange(v, 'b l n h -> b n l h')
 
-        # NOTE: These are static masks, and their behavior are global which can
-        # result in some limitations. For example, we cannot mask first/last k
-        # tokens for each sequence under packed mode.
-        mask = splash_attention.CausalMask((q_seq_len, kv_seq_len))
-        if self.window_size > 0 and self.window_size + 1 < kv_seq_len:
-          mask &= splash_attention.LocalMask(
-              (q_seq_len, kv_seq_len),
-              (self.window_size, None),
-              offset=0,
-          )
+        shard_count = sharding_lib.get_partition_size(seq_len_axis)
+
+        # Hook: prepare Q, segment_ids, and mask for flash attention.
+        # Subclasses can override _preprocess_flash_qkv to modify Q ordering.
+        q, q_segment_ids, mask = self._preprocess_flash_qkv(
+            q, segment_ids, q_seq_len, kv_seq_len, shard_count)
         mask = splash_attention.MultiHeadMask([mask] * self.n_heads)
 
         block_sizes = splash_attention.BlockSizes(
@@ -1475,7 +1719,7 @@ class Attention(module.SimplyModule):
                 self.attn_soft_cap if self.attn_soft_cap > 0 else None
             ),
             head_shards=sharding_lib.get_partition_size(num_heads_axis),
-            q_seq_shards=sharding_lib.get_partition_size(seq_len_axis),
+            q_seq_shards=shard_count,
         )
         kernel_sharding = splash_attn_kernel.manual_sharding_spec(
             sharding_lib.named_sharding((num_heads_axis, seq_len_axis))
@@ -1509,8 +1753,10 @@ class Attention(module.SimplyModule):
           return attn_out
 
         output = flash_attention_fn(
-            splash_attn_kernel, q, k, v, segment_ids, kv_segment_ids
+            splash_attn_kernel, q, k, v, q_segment_ids, kv_segment_ids
         )
+        # Hook: post-process flash attention output (e.g., un-interleave).
+        output = self._postprocess_flash_output(output, shard_count)
         output = jnp.swapaxes(output, 1, 2)  # Swap back.
       else:
         mask = create_mask(
@@ -1654,7 +1900,7 @@ class TransformerBlock(module.SimplyModule):
   use_moe: bool = False
   num_experts: int = 0
   num_experts_per_token: int = 0
-  expert_capacity_factor: float | None = 0.0
+  ep_capacity_factor: float | None = None
   lbl_loss_weight: float = 0.0
   router_z_loss_weight: float = 0.0
   # Mixed precision related.
@@ -1784,7 +2030,7 @@ class TransformerBlock(module.SimplyModule):
       self.ffn = MoEFeedForward(
           num_experts=self.num_experts,
           num_experts_per_token=self.num_experts_per_token,
-          expert_capacity_factor=self.expert_capacity_factor,
+          ep_capacity_factor=self.ep_capacity_factor,
           router_z_loss_weight=self.router_z_loss_weight,
           lbl_loss_weight=self.lbl_loss_weight,
           model_dim=self.model_dim,
@@ -1983,7 +2229,7 @@ class TransformerLM(module.SimplyModule):
           # MoE related.
           use_moe=config.use_moe,
           num_experts=config.num_experts,
-          expert_capacity_factor=config.expert_capacity_factor,
+          ep_capacity_factor=config.ep_capacity_factor,
           num_experts_per_token=config.num_experts_per_token,
           lbl_loss_weight=config.lbl_loss_weight,
           router_z_loss_weight=config.router_z_loss_weight,
@@ -2758,10 +3004,6 @@ def run_experiment(
       metric_log_interval=config.tb_log_interval,
       log_additional_info=config.log_additional_info,
       should_save_ckpt=config.should_save_ckpt,
-      use_wandb=config.use_wandb,
-      wandb_project=config.wandb_project,
-      wandb_name=config.wandb_name,
-      wandb_config=dataclasses.asdict(config),
   )
   model, extra_output = create_model(config, config.sharding_config)
   teacher_model = extra_output.get('teacher')
@@ -3465,6 +3707,7 @@ class LMInterface:
             apply_fn=model.apply,
         ),
         donate_argnames='init_sampling_state',
+        static_argnames=('top_k', 'scoring_top_k'),
     )
     self.pad_state_to_fn = jax.jit(
         SamplingState.pad_to,

@@ -172,9 +172,11 @@ class ShardingTest(absltest.TestCase):
       x = jax.lax.with_sharding_constraint(
           jnp.array([[1, 2], [3, 4]]), jax.sharding.PartitionSpec('x')
       )
-      self.assertEqual(
-          sharding.get_array_sharding(x),
-          jax.sharding.NamedSharding(js.get_mesh(), js.PartitionSpec('x')),
+      self.assertTrue(
+          sharding.get_array_sharding(x).is_equivalent_to(
+              jax.sharding.NamedSharding(js.get_mesh(), js.PartitionSpec('x')),
+              x.ndim,
+          )
       )
 
       def _f(x):

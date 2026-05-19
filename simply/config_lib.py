@@ -162,12 +162,6 @@ class BaseSharding(ShardingConfig):
   # Name of all the mesh axes.
   mesh_axis_names: PartitionAnnotation = ('replica', 'data', 'model')
 
-  # Utilities for collectives, needed to be updated to be consistent
-  # if you change the sharding config.
-  fsdp: PartitionAnnotation = ('replica', 'data')
-  ep: PartitionAnnotation = None
-  tp: PartitionAnnotation = ('model',)
-
   def to_decoding_sharding(self) -> Self:
     activation_partition = (*self.activation_partition[:-1], None)
     return dataclasses.replace(
@@ -195,9 +189,6 @@ def moe_sharding():
       ffn0_activation_partition=(('replica', 'data'), 'seq', 'model'),
       logits_partition=(('replica', 'data'), 'seq', 'model'),
       data_partition=(('replica', 'data'), 'seq'),
-      fsdp=('replica', 'data'),
-      ep='seq',
-      tp='model',
       mesh_axis_names=('replica', 'data', 'seq', 'model'),
   )
 
@@ -311,7 +302,7 @@ class BaseExperimentConfig(ExperimentConfig):
   use_moe: bool = False
   num_experts: int = 32
   num_experts_per_token: int = 2
-  expert_capacity_factor: float | None = None
+  ep_capacity_factor: float | None = None
   lbl_loss_weight: float = 0.01
   router_z_loss_weight: float = 0.0
   tile_batch_seq: int = 1024
@@ -388,9 +379,6 @@ class BaseExperimentConfig(ExperimentConfig):
   ckpt_keep_period: int | None = None
   tb_log_interval: int = 100
   log_additional_info: bool = True
-  use_wandb: bool = False
-  wandb_project: str = 'simply'
-  wandb_name: str | None = None
 
   # Config for init from existing checkpoint.
   init_ckpt_dir: str = ''
@@ -1075,6 +1063,7 @@ def gemma2_2b_gsm8k_0shot_rl():
           value=1e-7,
           warmup_steps=1,
       ),
+      num_train_steps=5_000,
       # Checkpoint and tensorboard configs.
       init_ckpt_opt_state=False,
       ckpt_max_to_keep=1,
@@ -1206,6 +1195,25 @@ def gemma2_2b_it_gsm8k_0shot_no_ref_rl():
           value=1e-7,
           warmup_steps=1,
       ),
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma2_2b_it_dsr40k_math500_0shot_no_ref_rl():
+  """Gemma 2B IT model for DSR40K RL, evaluated on MATH500."""
+  config = gemma2_2b_it_gsm8k_0shot_no_ref_rl()
+  return dataclasses.replace(
+      config,
+      dataset=data_lib.DatasetConfig(
+          source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
+      use_validation_set=True,
+      validation_dataset=data_lib.DatasetConfig(
+          source='simply:math500_test', packing=data_lib.PACKING_NONE,
+          lm_format_name=None),
+      validation_eval_batch_size=-1,
+      validation_eval_epochs=1,
+      validation_eval_interval=50,
   )
 
 
@@ -1517,6 +1525,27 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2():
 
 
 @ExperimentConfigRegistry.register
+def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2_fast():
+  """B2 task config: bf16_v2 with 25 steps, fits on glp_4x4 in ~45 min.
+
+  Reduces batch_size 64->16 and increases grad_accum_steps 4->16 to keep
+  the same effective batch size (16*16=256 vs 64*4=256) while cutting
+  per-chip KV cache memory by 4x during RL sampling.
+  train_batch_size must be divisible by data_parallel (16) * grad_accum (16).
+  """
+  config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_bf16_v2()
+  return dataclasses.replace(
+      config,
+      num_train_steps=25,
+      train_batch_size=16 * 16,
+      batch_size=16,
+      grad_accum_steps=16,
+      validation_eval_interval=25,
+      validation_eval_batch_size=16,
+  )
+
+
+@ExperimentConfigRegistry.register
 def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v4():
   config = deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl_f32_v2()
   return dataclasses.replace(
@@ -1813,15 +1842,15 @@ def qwen3_4b_gsm8k_sft():
       ),
       seq_len=2048,
       batch_size=32,
-      num_train_steps=1000,
+      num_train_steps=500,
       lr=opt_lib.LinearWarmupCosineDecay(
           value=1e-5,
           warmup_steps=50,
           steps_after_decay=0,
           end_decay=0.1,
       ),
-      ckpt_interval=200,
-      validation_eval_interval=200,
+      ckpt_interval=100,
+      validation_eval_interval=100,
       validation_eval_batch_size=32,
   )
 
@@ -1883,7 +1912,7 @@ def qwen3_30b_a3b():
       use_moe=True,
       num_experts=128,
       num_experts_per_token=8,
-      expert_capacity_factor=None,  # dropless
+      ep_capacity_factor=None,  # dropless
       lbl_loss_weight=0.01,
       router_z_loss_weight=0.0,
       # Make it smaller to fit on PF as well.
@@ -1892,7 +1921,7 @@ def qwen3_30b_a3b():
       tile_expand_dim=512,
       gmm_impl='megablox',
       init_ckpt_dir=QWEN3_30B_A3B_CKPT_DIR,
-      sharding_config=moe_sharding_v1(),
+      sharding_config=moe_sharding(),
   )
 
 
@@ -1902,6 +1931,9 @@ def qwen3_30b_a3b_thinking_2507():
       qwen3_30b_a3b(),
       position_encoding=pe_lib.RoPE(max_timescale=10_000_000),
       init_ckpt_dir=QWEN3_30B_A3B_THINKING_2507_CKPT_DIR,
+      tile_batch_seq=16,  # It is tuned for decoding.
+      tile_model_dim=4096,
+      tile_expand_dim=2048,
   )
 
 
@@ -1923,6 +1955,9 @@ def qwen3_235b_a22b_thinking_2507() -> BaseExperimentConfig:
       qwen3_235b_a22b(),
       position_encoding=pe_lib.RoPE(max_timescale=5_000_000),
       init_ckpt_dir=QWEN3_235B_A22B_THINKING_2507_CKPT_DIR,
+      tile_batch_seq=16,  # It is tuned for decoding.
+      tile_model_dim=4096,
+      tile_expand_dim=2048,
   )
 
 ################################################################################
@@ -1970,18 +2005,6 @@ def lm_test():
       ckpt_interval=10,
       ckpt_max_to_keep=3,
       tb_log_interval=2,
-  )
-
-
-@ExperimentConfigRegistry.register
-def lm_test_gke_training() -> BaseExperimentConfig:
-  """Synthetic config for testing GKE training."""
-  return dataclasses.replace(
-      lm_test(),
-      init_ckpt_dir='',
-      batch_size=128,
-      should_save_ckpt=False,
-      gmm_impl='ragged_dot',
   )
 
 

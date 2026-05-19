@@ -40,6 +40,13 @@ math-eval = [
     "sympy",
     "pylatexenc",
 ]
+agent = [
+    "litellm",
+    "pydantic>=2.0",
+    "python-frontmatter",
+    "rich",
+    "jinja2",
+]
 dev = [
     "pytest",
 ]

@@ -476,6 +476,7 @@ def load_checkpoint_from_dir(
 
 def resolve_checkpoint_handler_from_json(
     handler_in_json: PyTree,
+    restore_concurrent_gb: int | None = None,
 ) -> ocp.CheckpointHandler:
   """Resolves a checkpoint handler from a handler represented in json."""
   if isinstance(handler_in_json, str):
@@ -484,11 +485,13 @@ def resolve_checkpoint_handler_from_json(
       raise ValueError(f'Unsupported checkpoint handler class: {handler_cls}')
     if handler_cls is ocp.StandardCheckpointHandler:
       # Use PyTreeCheckpointHandler as the standard handler.
-      return ocp.PyTreeCheckpointHandler()
+      return ocp.PyTreeCheckpointHandler(
+          restore_concurrent_gb=restore_concurrent_gb
+      )
     return handler_cls()
   if pytree.tree_is_mapping(handler_in_json):
     return ocp.CompositeCheckpointHandler(**{
-        k: resolve_checkpoint_handler_from_json(v)
+        k: resolve_checkpoint_handler_from_json(v, restore_concurrent_gb)
         for k, v in handler_in_json.items()
     })
   raise ValueError(f'Unsupported checkpoint handler: {handler_in_json}')
@@ -496,13 +499,14 @@ def resolve_checkpoint_handler_from_json(
 
 def resolve_checkpoint_handler_from_path(
     ckpt_path: str,
+    restore_concurrent_gb: int | None = None,
 ) -> ocp.CheckpointHandler:
   """Resolves a checkpoint handler from a checkpoint path."""
   try:
     checkpoint_metadata = ocp.metadata.get_step_metadata(ckpt_path)
     if checkpoint_metadata.item_handlers is not None:
       return resolve_checkpoint_handler_from_json(
-          checkpoint_metadata.item_handlers
+          checkpoint_metadata.item_handlers, restore_concurrent_gb
       )
   except ValueError:
     logging.warning(
@@ -514,11 +518,15 @@ def resolve_checkpoint_handler_from_path(
   # checkpoint metadata. We need to infer it from the checkpoint structure.
   items = [p.name for p in epath.Path(ckpt_path).iterdir()]
   if '_METADATA' in items:
-    return ocp.PyTreeCheckpointHandler()
+    return ocp.PyTreeCheckpointHandler(
+        restore_concurrent_gb=restore_concurrent_gb
+    )
   handlers = {}
   for item in items:
     if item in ('state', 'default'):
-      handlers[item] = ocp.PyTreeCheckpointHandler()
+      handlers[item] = ocp.PyTreeCheckpointHandler(
+          restore_concurrent_gb=restore_concurrent_gb
+      )
     elif item in ('metadata', 'data'):
       handlers[item] = ocp.JsonCheckpointHandler()
   return ocp.CompositeCheckpointHandler(**handlers)
@@ -581,7 +589,9 @@ def load_checkpoint_from_path(
   target_abstract_state = common.get_raw_arrays(abstract_state)
 
   logging.info('Loading checkpoint from %s', ckpt_path)
-  handler = resolve_checkpoint_handler_from_path(ckpt_path)
+  handler = resolve_checkpoint_handler_from_path(
+      ckpt_path, restore_concurrent_gb=200
+  )
   start_time = time.time()
   with ocp.Checkpointer(handler) as checkpointer:
     item_metadata = checkpointer.metadata(ckpt_path).item_metadata

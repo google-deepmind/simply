@@ -161,6 +161,126 @@ class SamplingLibTest(parameterized.TestCase):
     )
     np.testing.assert_array_equal(log_likelihood, logprobs)
 
+  @parameterized.named_parameters(
+      ('top_k=1', 1), ('top_k=3', 3), ('top_k=5', 5),
+  )
+  def test_top_k_mask_matches_argsort(self, top_k: int):
+    """Verify top_k_mask matches a reference argsort-based implementation."""
+    logits = jax.random.normal(jax.random.key(42), (4, 3, 20))
+
+    # Reference implementation (argsort-based).
+    inner_size = logits.shape[-1]
+    indices = jnp.argsort(logits, axis=-1, descending=True)
+    ref_mask = jnp.arange(inner_size) < top_k
+    ref_mask = jnp.broadcast_to(ref_mask, indices.shape)
+    _, ref_mask = jax.lax.sort_key_val(indices, ref_mask, dimension=-1)
+
+    mask = sampling_lib.top_k_mask(logits, top_k=top_k)
+
+    np.testing.assert_array_equal(mask, ref_mask)
+
+  def test_top_k_mask_k_equals_vocab_size(self):
+    logits = jax.random.normal(jax.random.key(0), (2, 8))
+    mask = sampling_lib.top_k_mask(logits, top_k=8)
+    # All entries should be True when k == vocab_size
+    np.testing.assert_array_equal(mask, jnp.ones_like(mask, dtype=jnp.bool_))
+
+  def test_top_k_mask_k_exceeds_vocab_size(self):
+    logits = jax.random.normal(jax.random.key(0), (2, 8))
+    mask = sampling_lib.top_k_mask(logits, top_k=100)
+    np.testing.assert_array_equal(mask, jnp.ones_like(mask, dtype=jnp.bool_))
+
+  @parameterized.named_parameters(
+      ('top_k=2_top_p=0.5', 2, 0.5),
+      ('top_k=3_top_p=0.8', 3, 0.8),
+      ('top_k=5_top_p=0.95', 5, 0.95),
+      ('top_k=10_top_p=0.5', 10, 0.5),
+  )
+  def test_sample_fused_top_k_top_p_properties(self, top_k, top_p):
+    """Sampled tokens from fused top-k+top-p are within the top-k set."""
+    logits = jax.random.normal(jax.random.key(7), (4, 3, 20))
+
+    top_k_only = sampling_lib.top_k_mask(logits, top_k=top_k)
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(0), logits, top_k=top_k, top_p=top_p,
+    )
+    tokens_onehot = jax.nn.one_hot(tokens, 20, dtype=jnp.bool)
+
+    # Sampled tokens must be within the top-k set.
+    np.testing.assert_array_equal(tokens_onehot & top_k_only, tokens_onehot)
+
+    # Log-probs should be non-positive.
+    self.assertTrue(jnp.all(logprobs <= 0))
+
+  @parameterized.named_parameters(
+      ('greedy', 0.0, -1, 1.0),
+      ('top_k_1', 1.0, 1, 1.0),
+      ('no_mask', 0.8, -1, 1.0),
+      ('top_k_only', 0.8, 5, 1.0),
+      ('top_p_only', 0.8, -1, 0.9),
+      ('top_k_and_top_p', 0.8, 5, 0.95),
+  )
+  def test_sample_from_logits_all_modes(self, temperature, top_k, top_p):
+    logits = jax.random.normal(jax.random.key(0), (3, 2, 10))
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(1), logits,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+    )
+    self.assertEqual(tokens.shape, (3, 2))
+    self.assertEqual(logprobs.shape, (3, 2))
+    # Tokens should be valid indices
+    self.assertTrue(jnp.all(tokens >= 0))
+    self.assertTrue(jnp.all(tokens < 10))
+
+  @parameterized.named_parameters(
+      ('greedy', 0.0, -1, 1.0),
+      ('top_k_1', 1.0, 1, 1.0),
+      ('no_mask', 0.8, -1, 1.0),
+      ('top_k_only', 0.8, 5, 1.0),
+      ('top_p_only', 0.8, -1, 0.9),
+      ('top_k_and_top_p', 0.8, 5, 0.95),
+  )
+  def test_log_likelihood_matches_sample_logprobs(
+      self, temperature, top_k, top_p
+  ):
+    logits = jax.random.normal(jax.random.key(0), (3, 2, 10))
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(1), logits,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+    )
+    log_likelihood = sampling_lib.compute_log_likelihood(
+        logits, tokens,
+        temperature=temperature, top_k=top_k, top_p=top_p,
+    )
+    np.testing.assert_allclose(log_likelihood, logprobs, rtol=1e-5)
+
+  def test_greedy_returns_argmax(self):
+    logits = jax.random.normal(jax.random.key(0), (2, 5, 10))
+    tokens, _ = sampling_lib.sample_from_logits(
+        jax.random.key(1), logits, temperature=0.0
+    )
+    np.testing.assert_array_equal(tokens, jnp.argmax(logits, axis=-1))
+
+  def test_top_k_1_returns_argmax(self):
+    logits = jax.random.normal(jax.random.key(0), (2, 5, 10))
+    tokens, _ = sampling_lib.sample_from_logits(
+        jax.random.key(1), logits, top_k=1
+    )
+    np.testing.assert_array_equal(tokens, jnp.argmax(logits, axis=-1))
+
+  def test_top_k_mask_large_vocab(self):
+    logits = jax.random.normal(jax.random.key(0), (2, 1024))
+    mask = sampling_lib.top_k_mask(logits, top_k=5)
+    np.testing.assert_array_equal(jnp.sum(mask, axis=-1), 5)
+
+  def test_same_seed_same_result(self):
+    logits = jax.random.normal(jax.random.key(0), (3, 2, 10))
+    key = jax.random.key(42)
+    t1, lp1 = sampling_lib.sample_from_logits(key, logits, top_k=5, top_p=0.9)
+    t2, lp2 = sampling_lib.sample_from_logits(key, logits, top_k=5, top_p=0.9)
+    np.testing.assert_array_equal(t1, t2)
+    np.testing.assert_array_equal(lp1, lp2)
+
 
 if __name__ == '__main__':
   absltest.main()

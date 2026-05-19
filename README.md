@@ -43,6 +43,18 @@ Write a report to /tmp/optimizer_report.md.
 
 See the [full guide](docs/automated_ai_research_example.md) for more interesting examples including RL algorithm search for post-training. Have fun playing around with different prompts and interacting with the agent for longer research.
 
+Simply also includes a built-in agent harness (`simply/agent/`) with Bash tool and context management for autonomous long-running research tasks. Quick test:
+
+```bash
+pip install ".[agent]"
+python -m simply.agent.main \
+    --task_file=simply/agent/example_tasks/code_stats.md \
+    --env="Local:." \
+    --llm="LiteLLM:vertex_ai/gemini-2.5-pro"
+```
+
+See the [agent README](simply/agent/README.md) for setup and configuration details.
+
 ## Dependencies
 
 The main dependencies are:

@@ -410,13 +410,25 @@ def create_input_processor(config, **kwargs) -> InputProcessorInterface:
   return InputProcessorRegistry.get(input_processor_name)(**kwargs)
 
 
+def _scatter_mask(shape: tuple[int, ...], indices: jax.Array) -> jax.Array:
+  """Creates a boolean mask with True at the given indices along the last axis.
+
+  Args:
+    shape: Shape of the output mask.
+    indices: Indices to set True. Shape is ``shape[:-1] + (k,)`` where k is the
+      number of indices per position.
+
+  Returns:
+    Boolean mask of the given shape.
+  """
+  return jnp.any(jax.nn.one_hot(indices, shape[-1], dtype=jnp.bool_), axis=-2)
+
+
 def top_k_mask(logits: jax.Array, top_k: int) -> jax.Array:
-  inner_size = logits.shape[-1]
-  indices = jnp.argsort(logits, axis=-1, descending=True)
-  mask = jnp.arange(inner_size) < top_k
-  mask = jnp.broadcast_to(mask, indices.shape)
-  _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
-  return mask
+  """Masks all but the top-k logits."""
+  k = max(min(top_k, logits.shape[-1]), 1)
+  _, top_k_indices = jax.lax.top_k(logits, k)
+  return _scatter_mask(logits.shape, top_k_indices)
 
 
 def top_p_mask(logits: jax.Array, top_p: float) -> jax.Array:
@@ -427,6 +439,34 @@ def top_p_mask(logits: jax.Array, top_p: float) -> jax.Array:
   mask = cumsum[..., :-1] < top_p
   _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
   return mask
+
+
+def _fused_top_k_top_p_mask(
+    logits: jax.Array, top_k: int, top_p: float,
+) -> jax.Array:
+  """Fused top-k + top-p mask without sorting the full vocabulary.
+
+  Selects the top-k candidates in O(n) via ``jax.lax.top_k``, re-normalizes
+  softmax over only those k candidates, then applies the top-p cumulative
+  probability threshold.
+
+  Args:
+    logits: Logits array with vocabulary on the last axis.
+    top_k: Number of top candidates to consider.
+    top_p: Cumulative probability threshold within the top-k candidates.
+
+  Returns:
+    Boolean mask of shape ``logits.shape``.
+  """
+  vocab_size = logits.shape[-1]
+  k = max(min(top_k, vocab_size), 1)
+  # top_k returns values in descending order.
+  top_k_vals, top_k_indices = jax.lax.top_k(logits, k)
+  probs = jax.nn.softmax(top_k_vals, axis=-1)
+  cumsum = jnp.cumulative_sum(probs, axis=-1, include_initial=True)
+  top_p_keep = cumsum[..., :-1] < top_p
+  indicator = jax.nn.one_hot(top_k_indices, vocab_size, dtype=jnp.bool_)
+  return jnp.any(indicator & top_p_keep[..., None], axis=-2)
 
 
 def sample_from_logits(
@@ -465,12 +505,9 @@ def sample_from_logits(
 
   def masked_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
     logits = logits / temperature
-
     mask = jax.lax.cond(
         jnp.logical_and(top_k > 0, top_p < 1),
-        lambda: (
-            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
-        ),
+        lambda: _fused_top_k_top_p_mask(logits, top_k=top_k, top_p=top_p),
         lambda: jax.lax.cond(
             top_k > 0,
             lambda: top_k_mask(logits, top_k=top_k),
@@ -491,8 +528,12 @@ def sample_from_logits(
         simple_sample_fn,
         logits,
     )
+
   return jax.lax.cond(
-      jnp.logical_or(temperature == 0, top_k == 1), greedy_fn, sample_fn, logits
+      jnp.logical_or(temperature == 0, top_k == 1),
+      greedy_fn,
+      sample_fn,
+      logits,
   )
 
 
@@ -516,27 +557,27 @@ def compute_log_likelihood(
         jnp.full(shape, common.neg_inf(dtype), dtype=dtype),
     )
 
-  def simple_sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+  def simple_sample_score_fn(
+      logits: jax.Array, tokens: jax.Array
+  ) -> jax.Array:
     # The shape of logits is (batch_size, seq_len, vocab_size).
     m = distributions.Categorical(logits / temperature)
     return m.log_prob(tokens)
 
-  def masked_sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+  def masked_sample_score_fn(
+      logits: jax.Array, tokens: jax.Array
+  ) -> jax.Array:
     # The shape of logits is (batch_size, seq_len, vocab_size).
     logits = logits / temperature
-
     mask = jax.lax.cond(
         jnp.logical_and(top_k > 0, top_p < 1),
-        lambda: (
-            top_k_mask(logits, top_k=top_k) & top_p_mask(logits, top_p=top_p)
-        ),
+        lambda: _fused_top_k_top_p_mask(logits, top_k=top_k, top_p=top_p),
         lambda: jax.lax.cond(
             top_k > 0,
             lambda: top_k_mask(logits, top_k=top_k),
             lambda: top_p_mask(logits, top_p=top_p),
         ),
     )
-
     m = distributions.MaskedCategorical(
         logits, mask=mask, neg_inf=common.neg_inf(logits.dtype)
     )

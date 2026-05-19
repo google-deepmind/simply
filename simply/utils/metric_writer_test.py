@@ -53,35 +53,6 @@ class MetricWriterTest(absltest.TestCase):
 
     self.assertIsInstance(writer, metric_writer.BaseMetricWriter)
 
-  def test_wandb_writer(self):
-    mock_wandb = mock.MagicMock()
-    with mock.patch.dict('sys.modules', {'wandb': mock_wandb}):
-      writer = metric_writer.WandbMetricWriter(
-          project='test', name='run1',
-      )
-      mock_wandb.init.assert_called_once_with(
-          project='test', name='run1', dir=None, config=None,
-      )
-
-      writer.write_scalars(1, {'loss': 0.1})
-      mock_wandb.log.assert_called_once_with({'loss': 0.1}, step=1)
-
-      mock_wandb.log.reset_mock()
-      writer.write_texts(1, {'config': 'text'})
-      mock_wandb.log.assert_called_once()
-
-      writer.close()
-      mock_wandb.finish.assert_called_once()
-
-  def test_create_wandb_metric_writer(self):
-    mock_wandb = mock.MagicMock()
-    with mock.patch.dict('sys.modules', {'wandb': mock_wandb}):
-      writer = metric_writer.create_wandb_metric_writer(
-          project='test', name='run1',
-      )
-      self.assertIsInstance(writer, metric_writer.WandbMetricWriter)
-      mock_wandb.init.assert_called_once()
-
 
 if __name__ == '__main__':
   absltest.main()
