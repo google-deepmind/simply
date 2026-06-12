@@ -2705,7 +2705,6 @@ dependencies = [
     { name = "setuptools" },
     { name = "tensorboard" },
     { name = "tensorboardx" },
-    { name = "tensorflow-datasets" },
     { name = "tokenizers" },
     { name = "wandb" },
 ]
@@ -2754,8 +2753,7 @@ requires-dist = [
     { name = "tensorboardx" },
     { name = "tensorflow", marker = "sys_platform == 'darwin' and extra == 'tfds'" },
     { name = "tensorflow-cpu", marker = "sys_platform != 'darwin' and extra == 'tfds'" },
-    { name = "tensorflow-datasets", specifier = ">=4.9.9" },
-    { name = "tensorflow-datasets", marker = "extra == 'tfds'" },
+    { name = "tensorflow-datasets", marker = "extra == 'tfds'", specifier = ">=4.9.9" },
     { name = "tokenizers" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
