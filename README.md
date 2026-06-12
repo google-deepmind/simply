@@ -99,6 +99,22 @@ python setup/setup_assets.py --datasets-only
 
 This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`. (Currently we only included a few datasets and models for testing, and will add more soon.)
 
+### Quick setup with uv
+
+[uv](https://docs.astral.sh/uv/) provides a fast way to set up the environment and download assets in one go:
+
+```bash
+# Install dependencies
+uv sync
+
+# Download both models and datasets
+uv run python setup/setup_assets.py
+
+# Or download only models/datasets
+uv run python setup/setup_assets.py --models-only
+uv run python setup/setup_assets.py --datasets-only
+```
+
 ## Citation
 
 If you find *Simply* helpful, please cite the following BibTeX:
