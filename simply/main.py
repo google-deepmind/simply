@@ -166,7 +166,10 @@ def main(argv: Sequence[str]) -> None:
   del argv
 
   import jax
-  jax.distributed.initialize()  # setup jax for multi-host training.
+  try:
+    jax.distributed.initialize()  # multi-host (TPU/Slurm/MPI auto-detected)
+  except ValueError:
+    pass  # single-host run: no coordinator needed
 
   experiment_helper.setup_work_unit()
   config, experiment_dir = load_experiment_config()
