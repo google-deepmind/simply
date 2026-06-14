@@ -352,9 +352,14 @@ def _str_is_int(x: str) -> bool:
 
 def _str_to_int(x: str) -> int:
   x = x.replace(',', '')
-  # TODO: Handle the case where the value is larger than 2^53.
-  x = float(x)
-  return int(x)
+  # Parse integer-formatted strings directly so we don't lose precision for
+  # values larger than 2^53, which `float()` cannot represent exactly (e.g.
+  # '9007199254740993' would round to 9007199254740992). Fall back to `float()`
+  # for non-integer formats like '1.0' or '5e3'.
+  try:
+    return int(x)
+  except ValueError:
+    return int(float(x))
 
 
 def _inject_implicit_mixed_number(step: str) -> str:
