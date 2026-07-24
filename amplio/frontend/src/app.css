@@ -1,0 +1,400 @@
+:root {
+	/* Ayu Dark palette (https://github.com/ayu-theme). Near-black surfaces,
+	   warm-gray text, gold accent, saturated syntax hues for semantics. */
+	--bg: #0b0e14; /* editor bg */
+	--bg-elev: #11161f; /* cards / panels */
+	--bg-elev2: #1a212c; /* popovers / selection */
+	--border: #232b36; /* dividers */
+	--text: #bfbdb6; /* editor fg */
+	--text-dim: #8a9199; /* muted (brightened from ayu comment for readability) */
+	--text-strong: #e6e1cf; /* ayu bright fg — bold/emphasis + headings, so they read above body text */
+	--accent: #e6b450; /* ayu accent (gold) */
+	--accent-dim: #b3812f; /* muted gold — borders / focus rings */
+	--ok: #aad94c; /* string green */
+	--chat: #95e6cb; /* aqua / teal */
+	--code: #95e6cb; /* inline-code tint (ayu aqua) — distinct from the gold link color */
+	--on-accent: #0b0e14; /* dark fg on a bright accent/chat fill */
+	--warn: #ff8f40; /* keyword orange */
+	--err: #f07178; /* markup red */
+	--child: #d2a6ff; /* constant purple — sub-agent / child_result accent */
+	/* Severity ramp for the battery-style StatChip gauges (cpu/mem/gcert). A
+	   green→yellow→amber→red gradient distinct from the semantic --ok/--warn/--err
+	   so the 4 tiers read as a continuous scale. Single source of truth — chips
+	   reference these rather than hardcoding hex. */
+	--gauge-ok: #8ad19a;
+	--gauge-low: #fdd663;
+	--gauge-warning: #fbbc04;
+	--gauge-critical: #ff6b6b;
+	--mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+	/* Type scale (rem, relative to the 14px root). Rendered markdown (.md) keeps
+	   its own em-based sizes so it scales with its container. */
+	--fs-xs: 0.7rem;
+	--fs-sm: 0.78rem;
+	--fs-md: 0.85rem;
+	--fs-lg: 1rem;
+	--fs-xl: 1.1rem;
+
+	/* Corner radii. --radius-pill for fully-rounded chips/badges. */
+	--radius-xs: 4px;
+	--radius-sm: 6px;
+	--radius-md: 8px;
+	--radius-lg: 10px;
+	--radius-pill: 999px;
+
+	color-scheme: dark;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+html,
+body {
+	margin: 0;
+}
+body {
+	/* Fixed to the viewport so the flex chain is bounded: the run page is an
+	   app-shell (header/nav fixed, content scrolls internally) and the dashboard
+	   scrolls inside <main>. Without a fixed height nothing bounds the content
+	   and the whole page scrolls, dragging the chrome out of view. */
+	height: 100dvh;
+	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg);
+	color: var(--text);
+	font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+	font-size: 14px;
+	line-height: 1.5;
+}
+
+a {
+	color: var(--accent);
+	text-decoration: none;
+}
+a:hover {
+	text-decoration: underline;
+}
+
+button {
+	font: inherit;
+	color: var(--text);
+	background: var(--bg-elev2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 0.4rem 0.8rem;
+	cursor: pointer;
+}
+button:hover:not(:disabled) {
+	border-color: var(--accent-dim);
+}
+button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+button.primary {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: var(--on-accent);
+}
+button.danger {
+	border-color: color-mix(in srgb, var(--err) 45%, var(--border));
+}
+button.danger:hover {
+	border-color: var(--err);
+}
+
+/* Text-like fields stretch; checkboxes/radios keep their native box. */
+input:not([type='checkbox']):not([type='radio']),
+textarea,
+select {
+	font: inherit;
+	color: var(--text);
+	background: var(--bg);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 0.45rem 0.6rem;
+	width: 100%;
+}
+textarea {
+	resize: vertical;
+	font-family: inherit;
+}
+
+.card {
+	background: var(--bg-elev);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	padding: 0.9rem 1.1rem;
+}
+
+.dim {
+	color: var(--text-dim);
+}
+.small {
+	font-size: var(--fs-sm);
+}
+.err {
+	color: var(--err);
+}
+.mono {
+	font-family: var(--mono);
+}
+.pre {
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-family: var(--mono);
+	font-size: var(--fs-md);
+	margin: 0;
+}
+
+/* Rendered markdown (chat bubbles, phase summaries, …). Applied via the `.md`
+   class on a {@html renderMarkdown(...)} container. */
+.md {
+	line-height: 1.6;
+	/* Force character-level breaking of long unbreakable runs (file paths, URLs,
+	   CitC aliases) that appear as PLAIN prose — not just in `code` spans. Without
+	   this, a bare `third_party/.../a_very_long_file_name.md` in a paragraph, a
+	   raw link, or a heading overflows its box (worst in a narrow grid column or
+	   the side panel). `overflow-wrap: anywhere` only breaks mid-word when no
+	   normal break opportunity exists, so ordinary prose still wraps at spaces.
+	   min-width:0 lets the block actually shrink inside a flex/grid parent so the
+	   wrap can take effect. Fenced `pre` blocks keep horizontal scroll (own rule). */
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+.md p {
+	margin: 0.7rem 0;
+}
+.md :first-child {
+	margin-top: 0;
+}
+.md p:last-child {
+	margin-bottom: 0;
+}
+.md pre {
+	background: var(--bg);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 0.5rem 0.7rem;
+	margin: 0.7rem 0;
+	overflow-x: auto;
+	font-size: var(--fs-md);
+}
+.md code {
+	font-family: var(--mono);
+	font-size: 0.88em;
+}
+.md :not(pre) > code {
+	/* Elevated fill (lighter than the page) + a warm-aqua tint so inline code
+	   reads as a distinct token, not same-color prose. Uses --bg-elev2/--code
+	   theme tokens, never ad-hoc hex. */
+	background: var(--bg-elev2);
+	color: var(--code);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+	padding: 0.05rem 0.3rem;
+	/* Inline code is often a long unbreakable token (file path, CitC alias,
+	   URL). Without this, a span like `third_party/.../file.md` would
+	   overflow its containing block (a narrow grid column most painfully).
+	   anywhere lets the browser fall back to mid-token wrapping when no
+	   word boundary is available — pre blocks keep horizontal scroll via
+	   their own rule above. */
+	overflow-wrap: anywhere;
+}
+/* Artifact-path pill: `$AMPLIO_ARTIFACT_DIR/<path>` mentions rewritten by
+   linkifyArtifactPaths into a clickable chip (the prefix is dropped; only the
+   relative path shows). Reads as an actionable link, distinct from plain inline
+   code: accent-tinted, a leading file glyph, pointer cursor. The chat view wires
+   the click via event delegation on data-artifact-path. */
+.md .artifact-pill {
+	/* Rendered as a <button> (native keyboard access); reset the button chrome
+	   (appearance:none kills the native buttonface box that otherwise shows as a
+	   second fill under our own) and let it flow inline within prose. */
+	appearance: none;
+	-webkit-appearance: none;
+	font: inherit;
+	display: inline;
+	cursor: pointer;
+	color: var(--accent);
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+	border-radius: var(--radius-xs);
+	padding: 0.02rem 0.3rem 0.02rem 0.95rem;
+	font-family: var(--mono);
+	font-size: 0.88em;
+	overflow-wrap: anywhere;
+	/* Leading file glyph via background-image keeps the markup a plain <span>
+	   (no icon component needed through {@html}). */
+	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 256 256' fill='%23e6b450'><path d='M213.66 82.34l-56-56A8 8 0 0 0 152 24H56a16 16 0 0 0-16 16v176a16 16 0 0 0 16 16h144a16 16 0 0 0 16-16V88a8 8 0 0 0-2.34-5.66zM152 88V44l44 44z'/></svg>");
+	background-repeat: no-repeat;
+	background-position: 0.28rem center;
+	background-size: 0.72em;
+}
+.md .artifact-pill:hover {
+	background-color: color-mix(in srgb, var(--accent) 22%, transparent);
+	border-color: var(--accent);
+}
+/* Emphasis reads by COLOR, not just weight: on the low-contrast body gray a
+   weight bump alone is nearly invisible. Bold gets the bright fg token; italic
+   stays body-colored (its slant is enough). Kept separate from inline code so
+   the two emphasis signals don't look alike. */
+.md strong {
+	color: var(--text-strong);
+	font-weight: 650;
+}
+.md em {
+	font-style: italic;
+}
+.md ul,
+.md ol {
+	margin: 0.6rem 0;
+	padding-left: 1.7rem;
+}
+.md li {
+	margin: 0.3rem 0;
+}
+/* Dim the list markers so the text is the figure and the bullets are a quiet
+   left rail — strengthens the sense of indentation/hierarchy. */
+.md li::marker {
+	color: var(--text-dim);
+}
+.md a {
+	color: var(--accent);
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5 {
+	margin: 1.5rem 0 0.5rem;
+	color: var(--text-strong);
+	font-weight: 650;
+	line-height: 1.25;
+}
+.md h1 {
+	font-size: 1.25em;
+}
+.md h2 {
+	font-size: 1.12em;
+}
+.md h3 {
+	font-size: 1.08em;
+}
+.md h4,
+.md h5 {
+	font-size: 1em;
+}
+.md hr {
+	border: none;
+	border-top: 1px solid var(--border);
+	margin: 0.7rem 0;
+}
+.md blockquote {
+	margin: 0.7rem 0;
+	padding-left: 0.7rem;
+	border-left: 3px solid var(--border);
+	color: var(--text-dim);
+}
+.md img {
+	max-width: 100%;
+}
+.md table {
+	border-collapse: collapse;
+	margin: 0.7rem 0;
+	font-size: 0.92em;
+	display: block;
+	width: max-content;
+	max-width: 100%;
+	overflow-x: auto;
+}
+.md th,
+.md td {
+	border: 1px solid var(--border);
+	padding: 0.25rem 0.5rem;
+	text-align: left;
+}
+/* Header row: elevated fill + bright text so it reads clearly ABOVE the body
+   cells (on --bg the old var(--bg) fill gave almost no contrast). Mirrors how
+   headings use --text-strong. */
+.md th {
+	background: var(--bg-elev2);
+	color: var(--text-strong);
+	font-weight: 600;
+}
+/* GFM task lists: no bullet, checkbox inline with its text. */
+.md li:has(input[type='checkbox']) {
+	list-style: none;
+	margin-left: -1.2rem;
+}
+.md input[type='checkbox'] {
+	width: auto;
+	margin: 0 0.4rem 0 0;
+	vertical-align: middle;
+}
+
+/* Syntax highlighting for language-tagged code fences AND the artifact source
+   preview. highlight.js emits <span class="hljs-…"> tokens; we map those token
+   classes onto the existing Ayu palette variables (no imported theme) so
+   highlighted code matches the rest of the UI by construction. Scoped to tokens
+   living inside a rendered-markdown block (.md) OR an .hljs code block (the
+   artifact <pre class="pre hljs">), via :where() to keep specificity flat. */
+:where(.md, .hljs) code.hljs {
+	color: var(--text);
+}
+:where(.md, .hljs) .hljs-comment,
+:where(.md, .hljs) .hljs-quote {
+	color: var(--text-dim);
+	font-style: italic;
+}
+:where(.md, .hljs) .hljs-keyword,
+:where(.md, .hljs) .hljs-built_in,
+:where(.md, .hljs) .hljs-type,
+:where(.md, .hljs) .hljs-meta,
+:where(.md, .hljs) .hljs-doctag {
+	color: var(--warn);
+}
+:where(.md, .hljs) .hljs-string,
+:where(.md, .hljs) .hljs-regexp,
+:where(.md, .hljs) .hljs-symbol,
+:where(.md, .hljs) .hljs-addition {
+	color: var(--ok);
+}
+:where(.md, .hljs) .hljs-number,
+:where(.md, .hljs) .hljs-literal,
+:where(.md, .hljs) .hljs-variable,
+:where(.md, .hljs) .hljs-template-variable,
+:where(.md, .hljs) .hljs-attr,
+:where(.md, .hljs) .hljs-attribute {
+	color: var(--child);
+}
+:where(.md, .hljs) .hljs-title,
+:where(.md, .hljs) .hljs-title.function_,
+:where(.md, .hljs) .hljs-title.class_,
+:where(.md, .hljs) .hljs-section,
+:where(.md, .hljs) .hljs-name {
+	color: var(--accent);
+}
+:where(.md, .hljs) .hljs-params {
+	color: var(--chat);
+}
+:where(.md, .hljs) .hljs-deletion {
+	color: var(--err);
+}
+:where(.md, .hljs) .hljs-emphasis {
+	font-style: italic;
+}
+:where(.md, .hljs) .hljs-strong {
+	font-weight: 600;
+}
+
+/* Shared spinner for in-progress icons (e.g. StatusBadge "ongoing"). */
+.spin {
+	animation: spin 1s linear infinite;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}

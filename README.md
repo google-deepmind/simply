@@ -55,6 +55,8 @@ python -m simply.agent.main \
 
 See the [agent README](simply/agent/README.md) for setup and configuration details.
 
+For a more full-featured, long-horizon agent harness, this repo also vendors [**Amplio**](amplio/README.md) under [`amplio/`](amplio/) — a standalone Go framework that runs an LLM in a loop with generic tools (shell, file edit, sub-agent spawn, inter-agent messaging), backed by a crash-resistant DB-first design and a web UI. It is a self-contained Go module with its own build (`cd amplio && make build`); see the [Amplio README](amplio/README.md) to get started.
+
 ## Dependencies
 
 The main dependencies are:
