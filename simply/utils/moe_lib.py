@@ -938,7 +938,7 @@ def _overlap_fn(
           use_barriers=config.use_pipelined_ra2a_barriers)
     elif config.ep_method == "ag":
       split_fn = surround_compute_with_ag(
-          axis_name, compute_fn, collective_methods=AG_PIPELINE_COLLECTIVES,
+          axis_name, compute_fn, collective_methods=AG_PIPELINE_COLLECTIVES,  # pyrefly: ignore[bad-argument-type]
           use_barriers=config.use_pipelined_ra2a_barriers)
     else:
       raise ValueError(f"Unsupported ep_method: `{config.ep_method}`")
@@ -946,8 +946,8 @@ def _overlap_fn(
         (fut1, fut3), (y1, meta2, *extra_args))
 
     # perform remaining non-communication tasks for y1 and y3
-    y1_next = finalize_fn1(y1_next, meta1) if 0 <= i < splits else y1_next
-    y3_next = finalize_fn3(y3_next, meta3) if 2 <= i < splits + 2 else y3_next
+    y1_next = finalize_fn1(y1_next, meta1) if 0 <= i < splits else y1_next  # pyrefly: ignore[not-callable]
+    y3_next = finalize_fn3(y3_next, meta3) if 2 <= i < splits + 2 else y3_next  # pyrefly: ignore[not-callable]
 
   return y1_next, y2_next, y3_next
 
@@ -959,8 +959,7 @@ def run_moe_pipelined_shard_map(
     scales: jax.Array | None = None,
     compute_block: ComputeBlockCallable | None = None,
     axis_name: str, experts_per_tok: int, num_experts: int, splits: int = 1,
-    config: PipelinedMoEConfig = PipelinedMoEConfig(),
-    metrics: dict[str, Any] | None = None
+    config: PipelinedMoEConfig = PipelinedMoEConfig()
 ):
   """Execute a piplined MoE layer in full assuming expert axis is manual."""
   assert x.ndim == 3, f"Tokens must be at 3D, but got x = {jax.typeof(x)}"
@@ -1010,13 +1009,13 @@ def run_moe_pipelined_shard_map(
 
       for i in range(splits + 2):
         overlap_fn_ = partial(overlap_fn_, i=i)
-        meta1 = all_metas[i] if 0 <= i < splits else 0
+        meta1 = all_metas[i] if 0 <= i < splits else 0  # pyrefly: ignore[unsupported-operation]
         y1, meta2 = None, None
         if 1 <= i < splits + 1:
-          y1, meta2 = (y1s[i - 1], all_metas[i - 1])
+          y1, meta2 = (y1s[i - 1], all_metas[i - 1])  # pyrefly: ignore[unsupported-operation]
         y2, meta3 = None, None
         if 2 <= i < splits + 2:
-          y2, meta3 = (y2s[i - 2], all_metas[i - 2])
+          y2, meta3 = (y2s[i - 2], all_metas[i - 2])  # pyrefly: ignore[unsupported-operation]
         y1, y2, y3 = overlap_fn_(y1, y2, meta1, meta2, meta3, x_next,
                                  *extra_args)
         x_next = x_[i + 1, ...] if (i < splits - 1) else None
@@ -1046,7 +1045,7 @@ def run_moe_pipelined_shard_map(
   if config.ep_method == "ag":
     y, metrics_ = ag_pipeline(x_, scales_, shard_idxs_)
   else:
-    ra2a_metas = [moe_methods.compute_meta(shard_idxs_[i, ...], scales_[i])
+    ra2a_metas = [moe_methods.compute_meta(shard_idxs_[i, ...], scales_[i])  # pyrefly: ignore[bad-argument-type]
                   for i in range(splits)]
     if config.dropless_fallback:
       no_dropping = jnp.all(~jnp.array(
@@ -1056,7 +1055,4 @@ def run_moe_pipelined_shard_map(
     else:  # ra2a without fallback
       y, metrics_ = ra2a_pipeline(x_, scales_, shard_idxs_, ra2a_metas)
 
-  if metrics is not None:
-    assert isinstance(metrics, dict)
-    metrics.update(metrics_)
-  return y
+  return y, metrics_

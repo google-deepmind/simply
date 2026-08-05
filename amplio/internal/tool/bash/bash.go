@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 	"unicode/utf8"
 
@@ -79,10 +80,26 @@ func agentEnv(runID, sessionID string) []string {
 	if sessionID != "" {
 		env = append(env, config.EnvSessionID+"="+sessionID)
 	}
+	// Deprecated, kept because scripts and agents already written against it —
+	// including every watcher currently running — must keep working. New agents
+	// are taught `amplio-notify` instead, and this can go once runs predating it
+	// have ended.
 	if exe, err := os.Executable(); err == nil {
 		env = append(env, config.EnvNotify+"="+exe)
 	}
+	// Both entry points arrive on PATH from one directory: `amplio-notify` (what
+	// the prompt teaches) and `amplio` (what the task-manager skill teaches). The
+	// directory holds only those two symlinks, so prepending cannot shadow
+	// anything else on the agent's PATH.
+	if dir := config.ShimDir(); dirHasShim(dir) {
+		env = append(env, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
 	return env
+}
+
+func dirHasShim(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, config.NotifyShimName))
+	return err == nil
 }
 
 func makeExecutor(cwd string, extraEnv []string) tool.Executor {
@@ -137,6 +154,13 @@ func execute(ctx context.Context, command, cwd string, extraEnv []string, timeou
 	cmd.Stdin = nil // EOF on stdin so interactive prompts fail fast
 	cmd.Stdout = stdoutF
 	cmd.Stderr = stderrF
+	// ...and no controlling terminal, so prompts that bypass stdin by opening
+	// /dev/tty fail too instead of hanging on (and writing to) the terminal that
+	// runs `amplio serve`. See detachTerminal.
+	detachTerminal(cmd)
+	// On timeout, take the whole process group with it: killing only the shell
+	// leaves its children running, which is how a hung command becomes an orphan.
+	cmd.Cancel = func() error { return killGroup(cmd) }
 
 	start := time.Now()
 	err = cmd.Run()

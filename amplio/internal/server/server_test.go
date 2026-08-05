@@ -24,6 +24,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -232,7 +233,7 @@ func TestServer_ListAndGetRun(t *testing.T) {
 func TestServer_ListRuns_Pagination(t *testing.T) {
 	srv, _, store := newTestServer(t)
 	ctx := context.Background()
-	// Three runs with strictly increasing created_at, so the newest-first offset
+	// Three runs with strictly increasing created_at, so the newest-first keyset
 	// walk is deterministic: run-3, run-2, run-1.
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for i, id := range []string{"run-1", "run-2", "run-3"} {
@@ -509,6 +510,41 @@ func TestServer_Models(t *testing.T) {
 	}
 	if m = get(); len(m.Models) != 2 {
 		t.Fatalf("after remove: %+v, want 2", m)
+	}
+
+	// A "#nickname" relabels an endpoint that is already in the menu. Both entries
+	// stay: dropping either would discard something the operator asked for (the
+	// config entry can't be removed from the UI; the nickname is the whole point
+	// of the custom one). Both are flagged instead, since two rows that start
+	// IDENTICAL runs under different labels is usually a leftover.
+	if code, _ := doReq(t, http.MethodPost, ts.URL+"/api/models?token=secret",
+		`{"spec":"vertex:x#house-model"}`); code != http.StatusCreated {
+		t.Fatalf("POST nicknamed model: %d, want 201", code)
+	}
+	m = get()
+	if len(m.Models) != 3 {
+		t.Fatalf("after nickname add: %+v, want 3 (nickname must NOT collapse onto the plain spec)", m)
+	}
+	for _, e := range m.Models {
+		switch e.Spec {
+		case "vertex:x", "vertex:x#house-model":
+			if !e.Duplicate {
+				t.Errorf("entry %q: Duplicate = false, want true (shares a provider spec)", e.Spec)
+			}
+		default:
+			if e.Duplicate {
+				t.Errorf("entry %q: Duplicate = true, want false", e.Spec)
+			}
+		}
+		if e.Label == "" {
+			t.Errorf("entry %q has no label", e.Spec)
+		}
+	}
+	// The nickname is what the UI shows for that row — the point of the override.
+	for _, e := range m.Models {
+		if e.Spec == "vertex:x#house-model" && e.Label != "house-model" {
+			t.Errorf("nicknamed entry label = %q, want %q", e.Label, "house-model")
+		}
 	}
 }
 
@@ -787,6 +823,93 @@ func TestServer_ChatProjection(t *testing.T) {
 	}
 }
 
+// A RANGED chat request (from_step/to_step) is the read-only session-log viewer
+// browsing one closed phase: the phase's own turns come back as bubbles (no
+// boundary rollup), with no cards and no usage. It also works on a non-chatbot
+// session — an autonomous agent's turns project identically.
+func TestServer_ChatProjection_Ranged(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.CreateRun(ctx, db.RunRecord{RunID: testRun}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, db.SessionRecord{
+		RunID: testRun, SessionID: "main-agent", AgentType: "standard_agent", Status: db.SessionConcluded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finalize := func(step int, evs ...event.Event) {
+		t.Helper()
+		for range step {
+			if _, err := store.AdvanceStep(ctx, testRun, "main-agent"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.FinalizeStep(ctx, testRun, "main-agent", step, evs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finalize(1, &event.AssistantEvent{
+		Content:   "EARLY PHASE TEXT",
+		ToolCalls: []event.ToolCall{{ID: "tc1", Name: "bash"}},
+		Usage:     &event.Usage{PromptTokens: 10, CompletionTokens: 2, TotalTokens: 12},
+	})
+	// The call's result is pinned to the SAME step, so a one-step range still
+	// sees it and marks the chip completed.
+	finalize(2, &event.AssistantEvent{Content: "LATER PHASE TEXT"})
+	if err := store.AppendEventAtStep(ctx, testRun, "main-agent", 1,
+		&event.ToolResultEvent{ToolCallID: "tc1", Content: "RESULT BODY"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []struct {
+		id, title  string
+		start, end int
+	}{{"p1", "Phase A", 1, 1}, {"p2", "Phase B", 2, 2}} {
+		if err := store.AppendObservation(ctx, db.ObservationRecord{
+			ObsID: o.id, RunID: testRun, Kind: "phase_summary", SessionID: "main-agent",
+			Data: map[string]any{"title": o.title, "start_step": o.start, "end_step": o.end},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	base := ts.URL + "/api/runs/" + testRun + "/sessions/main-agent/chat"
+
+	// Live mode: step 1 is rolled into a card and hidden.
+	_, body := doReq(t, http.MethodGet, base+"?token=secret", "")
+	var live chatFeed
+	if err := json.Unmarshal(body, &live); err != nil {
+		t.Fatal(err)
+	}
+	if len(live.PhaseCards) != 1 || len(live.Messages) != 1 || live.Messages[0].Content != "LATER PHASE TEXT" {
+		t.Fatalf("live feed = %d cards / %+v messages, want 1 card + only the inline phase", len(live.PhaseCards), live.Messages)
+	}
+
+	// Ranged mode: exactly the requested phase, no cards, no usage.
+	_, body = doReq(t, http.MethodGet, base+"?from_step=1&to_step=1&token=secret", "")
+	var ranged chatFeed
+	if err := json.Unmarshal(body, &ranged); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranged.Messages) != 1 || ranged.Messages[0].Content != "EARLY PHASE TEXT" {
+		t.Fatalf("ranged messages = %+v, want only the step-1 turn", ranged.Messages)
+	}
+	if len(ranged.PhaseCards) != 0 {
+		t.Errorf("ranged phase_cards = %+v, want none (client has the phase index)", ranged.PhaseCards)
+	}
+	if ranged.Usage != nil {
+		t.Errorf("ranged usage = %+v, want nil (a historical slice has no latest turn)", ranged.Usage)
+	}
+	if tcs := ranged.Messages[0].ToolCalls; len(tcs) != 1 || !tcs[0].Completed {
+		t.Errorf("ranged tool_calls = %+v, want the same-step result to mark it completed", tcs)
+	}
+	if strings.Contains(string(body), "RESULT BODY") {
+		t.Errorf("tool_result body leaked into the ranged feed: %s", body)
+	}
+}
+
 func TestServer_ChatProjection_InboundMessages(t *testing.T) {
 	srv, _, store := newTestServer(t)
 	ctx := context.Background()
@@ -962,6 +1085,64 @@ func TestServer_EventsAndObservations(t *testing.T) {
 	}
 	if len(obs) != 1 || obs[0].Kind != "step_summary" || obs[0].Data["summary"] != "did hi" {
 		t.Fatalf("observations = %+v", obs)
+	}
+}
+
+// from_step/to_step fetch an inclusive step RANGE in one request (the log
+// viewer's "expand all" over a phase). An explicit step=N still wins.
+func TestServer_EventsStepRange(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	ctx := context.Background()
+	if err := store.CreateRun(ctx, db.RunRecord{RunID: testRun}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSession(ctx, db.SessionRecord{
+		RunID: testRun, SessionID: "main-agent", AgentType: "standard_agent", Status: db.SessionOngoing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for step := 1; step <= 4; step++ {
+		if _, err := store.AdvanceStep(ctx, testRun, "main-agent"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.FinalizeStep(ctx, testRun, "main-agent", step, []event.Event{
+			&event.AssistantEvent{Content: fmt.Sprintf("turn %d", step)},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	base := ts.URL + "/api/runs/" + testRun + "/sessions/main-agent/events"
+	steps := func(query string) []int {
+		t.Helper()
+		_, body := doReq(t, http.MethodGet, base+query+"&token=secret", "")
+		var evs []eventDTO
+		if err := json.Unmarshal(body, &evs); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]int, 0, len(evs))
+		for _, e := range evs {
+			out = append(out, e.Step)
+		}
+		return out
+	}
+
+	if got, want := steps("?from_step=2&to_step=3"), []int{2, 3}; !slices.Equal(got, want) {
+		t.Errorf("from_step=2&to_step=3 = %v, want %v", got, want)
+	}
+	if got, want := steps("?from_step=3"), []int{3, 4}; !slices.Equal(got, want) {
+		t.Errorf("from_step=3 (open end) = %v, want %v", got, want)
+	}
+	if got, want := steps("?to_step=2"), []int{1, 2}; !slices.Equal(got, want) {
+		t.Errorf("to_step=2 (open start) = %v, want %v", got, want)
+	}
+	if got, want := steps("?step=2&from_step=1&to_step=4"), []int{2}; !slices.Equal(got, want) {
+		t.Errorf("step=2 with a range = %v, want %v (explicit step wins)", got, want)
+	}
+	if got, want := steps("?from_step=bogus"), []int{1, 2, 3, 4}; !slices.Equal(got, want) {
+		t.Errorf("unparsable bound = %v, want the full stream %v", got, want)
 	}
 }
 
@@ -1503,4 +1684,57 @@ func nextSSE(t *testing.T, sc *bufio.Scanner) eventstream.RunEvent {
 	}
 	t.Fatal("stream ended before a data line")
 	return eventstream.RunEvent{}
+}
+
+// TestPatchRun_SeenBothDirections: the dashboard badge is server-authoritative,
+// so "mark as unread" is a PATCH like any other — and it has to actually restore
+// the badge, which is the half a "don't clear it" implementation would miss.
+func TestPatchRun_SeenBothDirections(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	ctx := context.Background()
+	seedRun(t, store, db.SessionOngoing, 3)
+	// The badge is "a root's status changed AFTER last_seen_at", and a fresh run
+	// is stamped seen at creation — so the transition has to happen after that,
+	// as it does in life.
+	time.Sleep(5 * time.Millisecond) // timestamps are millisecond-resolution
+	if err := store.UpdateSessionStatus(ctx, testRun, "main-agent", db.SessionConcluded); err != nil {
+		t.Fatal(err)
+	}
+
+	hasUpdates := func() bool {
+		runs, _, err := store.ListRunsWithSessions(ctx, db.ListRunsOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range runs {
+			if r.Run.RunID == testRun {
+				return runHasUpdates(r)
+			}
+		}
+		t.Fatalf("run %s not found", testRun)
+		return false
+	}
+
+	patch := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/api/runs/"+testRun, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PATCH %s = %d (%s)", body, w.Code, w.Body.String())
+		}
+	}
+
+	if !hasUpdates() {
+		t.Fatal("a concluded run should start with a badge")
+	}
+	patch(`{"seen":true}`)
+	if hasUpdates() {
+		t.Error("seen:true should clear the badge")
+	}
+	patch(`{"seen":false}`)
+	if !hasUpdates() {
+		t.Error("seen:false should put the badge back")
+	}
 }

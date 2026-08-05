@@ -60,7 +60,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'io')
-    self.assertSequenceEqual(layer.bias_partition, (None,))
+    self.assertSequenceEqual(layer.bias_partition, (None,))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (4,))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -78,7 +78,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'oi')
-    self.assertSequenceEqual(layer.bias_partition, ('model',))
+    self.assertSequenceEqual(layer.bias_partition, ('model',))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (2,))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -97,7 +97,7 @@ class EinsumLinearTest(absltest.TestCase):
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, '.io')
     self.assertEqual(layer.bias_shape, (2, 4))
-    self.assertSequenceEqual(layer.bias_partition, ('model', None))
+    self.assertSequenceEqual(layer.bias_partition, ('model', None))  # pyrefly: ignore[bad-argument-type]
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
     params = layer.init(pk)
@@ -112,7 +112,7 @@ class EinsumLinearTest(absltest.TestCase):
         output_partition=(('replica', 'data'), None, 'model', None),
     )
     layer.setup()
-    self.assertSequenceEqual(layer.bias_partition, (None,))
+    self.assertSequenceEqual(layer.bias_partition, (None,))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (4,))
 
   def test_gmoe_linear2(self):
@@ -126,7 +126,7 @@ class EinsumLinearTest(absltest.TestCase):
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, '.io')
     self.assertSequenceEqual(
-        layer.bias_partition, ('model', None)
+        layer.bias_partition, ('model', None)  # pyrefly: ignore[bad-argument-type]
     )
     self.assertEqual(layer.bias_shape, (2, 4))
     prng_key = jax.random.PRNGKey(0)
@@ -145,7 +145,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'oio')
-    self.assertSequenceEqual(layer.bias_partition, ('model', None))
+    self.assertSequenceEqual(layer.bias_partition, ('model', None))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (2, 4))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -172,7 +172,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, '.ioo')
-    self.assertSequenceEqual(layer.bias_partition, (None, 'model', None))
+    self.assertSequenceEqual(layer.bias_partition, (None, 'model', None))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (3, n_heads, per_head_dim))
     self.assertEqual(layer.bias_dim_annotation, '.hh')
     params = layer.init(pk)
@@ -190,7 +190,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'ioi')
-    self.assertSequenceEqual(layer.bias_partition, (None,))
+    self.assertSequenceEqual(layer.bias_partition, (None,))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (3,))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -208,7 +208,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'oi')
-    self.assertSequenceEqual(layer.bias_partition, ('model',))
+    self.assertSequenceEqual(layer.bias_partition, ('model',))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (2,))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -226,7 +226,7 @@ class EinsumLinearTest(absltest.TestCase):
     )
     layer.setup()
     self.assertEqual(layer.weight_dim_annotation, 'oi')
-    self.assertSequenceEqual(layer.bias_partition, ('model',))
+    self.assertSequenceEqual(layer.bias_partition, ('model',))  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(layer.bias_shape, (2,))
     prng_key = jax.random.PRNGKey(0)
     xk, pk = jax.random.split(prng_key)
@@ -243,9 +243,9 @@ class EmbeddingLinearTest(parameterized.TestCase):
     )
     prng_key = jax.random.PRNGKey(0)
     params = embedding_linear.init(prng_key)
-    self.assertIn('w', params)
-    self.assertNotIn('embed', params)
-    self.assertEqual(params['w'].shape, (10, 4))
+    self.assertIn('w', params)  # pyrefly: ignore[bad-argument-type]
+    self.assertNotIn('embed', params)  # pyrefly: ignore[bad-argument-type]
+    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
 
   def test_embedding_linear_untied_embedding(self):
     embedding_linear = module.EmbeddingLinear(
@@ -253,10 +253,10 @@ class EmbeddingLinearTest(parameterized.TestCase):
     )
     prng_key = jax.random.PRNGKey(0)
     params = embedding_linear.init(prng_key)
-    self.assertIn('w', params)
-    self.assertIn('embed', params)
-    self.assertEqual(params['w'].shape, (10, 4))
-    self.assertEqual(params['embed'].shape, (10, 4))
+    self.assertIn('w', params)  # pyrefly: ignore[bad-argument-type]
+    self.assertIn('embed', params)  # pyrefly: ignore[bad-argument-type]
+    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
+    self.assertEqual(params['embed'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
 
   @parameterized.parameters(True, False)
   def test_embedding_linear_embed(self, use_lookup):

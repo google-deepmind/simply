@@ -13,12 +13,12 @@
 # limitations under the License.
 """Utils that process pytree."""
 
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Sequence, Set
 import dataclasses
 import enum
 import json
 import re
-from typing import Any, Callable, cast
+from typing import Any, Callable, cast, overload
 import warnings
 
 from absl import logging
@@ -64,11 +64,11 @@ def tree_value(tree: PyTree, path: jax.tree_util.KeyPath | str) -> PyTree:
     if isinstance(item, jax.tree_util.DictKey):
       if item.key not in value:
         raise KeyError(f'{path} does not exist in tree at {item}.')
-      value = value[item.key]
+      value = value[item.key]  # pyrefly: ignore[bad-index, unsupported-operation]
     elif isinstance(item, jax.tree_util.SequenceKey):
-      if item.idx >= len(value):
+      if item.idx >= len(value):  # pyrefly: ignore[bad-argument-type]
         raise KeyError(f'{path} does not exist in tree at {item}.')
-      value = value[item.idx]
+      value = value[item.idx]  # pyrefly: ignore[bad-index, unsupported-operation]
     else:
       raise KeyError(f'Unsupported key type: {type(item)}:{item}')
   return value
@@ -108,24 +108,24 @@ def set_tree_value(
       if not isinstance(item, jax.tree_util.DictKey):
         raise ValueError(f'Path item {item} does not match subtree: {tree}')
       if i + 1 == len(path):
-        tree[item.key] = value
+        tree[item.key] = value  # pyrefly: ignore[unsupported-operation]
       elif tree.get(item.key) is None:
-        tree[item.key] = construct_tree_with_path_value(path[i + 1 :], value)
+        tree[item.key] = construct_tree_with_path_value(path[i + 1 :], value)  # pyrefly: ignore[unsupported-operation]
         break
       else:
-        tree = tree[item.key]
+        tree = tree[item.key]  # pyrefly: ignore[bad-index, unsupported-operation]
     elif tree_is_sequence(tree):
       if not isinstance(item, jax.tree_util.SequenceKey):
         raise ValueError(f'Path item {item} does not match subtree: {tree}')
-      if item.idx >= len(tree):
-        tree.extend([None] * (item.idx + 1 - len(tree)))
+      if item.idx >= len(tree):  # pyrefly: ignore[bad-argument-type]
+        tree.extend([None] * (item.idx + 1 - len(tree)))  # pyrefly: ignore[bad-argument-type]
       if i + 1 == len(path):
-        tree[item.idx] = value
-      elif tree[item.idx] is None:
-        tree[item.idx] = construct_tree_with_path_value(path[i + 1 :], value)
+        tree[item.idx] = value  # pyrefly: ignore[unsupported-operation]
+      elif tree[item.idx] is None:  # pyrefly: ignore[bad-index, unsupported-operation]
+        tree[item.idx] = construct_tree_with_path_value(path[i + 1 :], value)  # pyrefly: ignore[unsupported-operation]
         break
       else:
-        tree = tree[item.idx]
+        tree = tree[item.idx]  # pyrefly: ignore[bad-index, unsupported-operation]
     else:
       raise ValueError(f'Cannot access path {path[i:]} in tree {tree}')
 
@@ -159,9 +159,9 @@ def check_trees_match_sequence_length(trees: Sequence[PyTree], length: int):
   for tree in trees:
     if not tree_is_sequence(tree):
       raise ValueError(f'Expect tree to be Sequence: {tree}')
-    if len(tree) != length:
+    if len(tree) != length:  # pyrefly: ignore[bad-argument-type]
       raise ValueError(
-          f'Expect tree length to be {length}, but got {len(tree)} instead.'
+          f'Expect tree length to be {length}, but got {len(tree)} instead.'  # pyrefly: ignore[bad-argument-type]
       )
 
 
@@ -192,15 +192,15 @@ def traverse_tree_with_path(
     res = {}
     for key in keys:
       path = f'{root_path}/{key}' if root_path else key
-      values = [subtree[key] for subtree in trees]
+      values = [subtree[key] for subtree in trees]  # pyrefly: ignore[bad-index, unsupported-operation]
       res[key] = traverse_tree_with_path(fn, *values, root_path=path)
     return res
   if tree_is_sequence(first_tree):
-    length = len(first_tree)
+    length = len(first_tree)  # pyrefly: ignore[bad-argument-type]
     check_trees_match_sequence_length(trees[1:], length)
     res = []
     for i in range(length):
-      values = [subtree[i] for subtree in trees]
+      values = [subtree[i] for subtree in trees]  # pyrefly: ignore[bad-index, unsupported-operation]
       res.append(
           traverse_tree_with_path(fn, *values, root_path=f'{root_path}[{i}]')
       )
@@ -233,11 +233,28 @@ def tree_leaves_with_tag(tree, tag='loss'):
       yield leaf, path
 
 
+
+@overload
+def to_flat_dict(
+    tree: PyTree,
+    sep: str,
+    is_leaf: Callable[[Any], bool] | None = None,
+) -> dict[str, Any]: ...
+
+
+@overload
 def to_flat_dict(
     tree: PyTree,
     sep: str = '',
     is_leaf: Callable[[Any], bool] | None = None,
-) -> Mapping[str, Any] | Mapping[jax.tree_util.KeyPath, Any]:
+) -> dict[str, Any] | dict[tuple[str, ...], Any]: ...
+
+
+def to_flat_dict(
+    tree: PyTree,
+    sep: str = '',
+    is_leaf: Callable[[Any], bool] | None = None,
+) -> dict[str, Any] | dict[tuple[str, ...], Any]:
   """Converts a tree into a flattened dictionary.
 
   Basically the same as `orbax.checkpoint.utils.to_flat_dict`.
@@ -254,8 +271,7 @@ def to_flat_dict(
   """
   tree = common.get_raw_arrays(tree)
   path_leaves = jax.tree_util.tree_leaves_with_path(tree, is_leaf=is_leaf)
-  print(f'{tree=}')
-  output = {}
+  output: dict[Any, Any] = {}
   for path, leaf in path_leaves:
     keytuple = []
     for entry in path:
@@ -270,7 +286,6 @@ def to_flat_dict(
     output[keytuple] = leaf
   return output
 
-
 def load(jtree: PyTree) -> Any:
   """Loads data objects (dataclasses and numpy arrays) in a json-like tree.
 
@@ -281,12 +296,12 @@ def load(jtree: PyTree) -> Any:
     A tree like object that contains data objects if any exists.
   """
   if tree_is_mapping(jtree):
-    if '__dataclass__' in jtree:
-      module_cls = registry.RootRegistry.get(jtree['__dataclass__'])
+    if '__dataclass__' in jtree:  # pyrefly: ignore[not-iterable]
+      module_cls = registry.RootRegistry.get(jtree['__dataclass__'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       assert dataclasses.is_dataclass(module_cls)
       input_params = {}
       for k in dataclasses.fields(module_cls):
-        if k.name not in jtree:
+        if k.name not in jtree:  # pyrefly: ignore[not-iterable]
           if k.default is not dataclasses.MISSING:
             input_params[k.name] = k.default
           elif k.default_factory is not dataclasses.MISSING:
@@ -296,18 +311,18 @@ def load(jtree: PyTree) -> Any:
                 f'Field {k.name} without default value not found in {jtree}.'
             )
         else:
-          input_params[k.name] = load(jtree[k.name])
+          input_params[k.name] = load(jtree[k.name])  # pyrefly: ignore[bad-index, unsupported-operation]
       return module_cls(**input_params)
-    if '__enum__' in jtree:
-      enum_cls = registry.RootRegistry.get(jtree['__enum__'])
+    if '__enum__' in jtree:  # pyrefly: ignore[not-iterable]
+      enum_cls = registry.RootRegistry.get(jtree['__enum__'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       assert isinstance(enum_cls, enum.EnumType)
-      return enum_cls(jtree['value'])
-    if '__numpy_ndarray_dtype__' in jtree:
-      dtype = jtree['__numpy_ndarray_dtype__']
-      return np.asarray(jtree['data'], dtype=dtype)
+      return enum_cls(jtree['value'])  # pyrefly: ignore[bad-index, no-matching-overload, unsupported-operation]
+    if '__numpy_ndarray_dtype__' in jtree:  # pyrefly: ignore[not-iterable]
+      dtype = jtree['__numpy_ndarray_dtype__']  # pyrefly: ignore[bad-index, unsupported-operation]
+      return np.asarray(jtree['data'], dtype=dtype)  # pyrefly: ignore[bad-index, no-matching-overload, unsupported-operation]
     return {k: load(v) for k, v in getattr(jtree, 'items')()}
   if tree_is_sequence(jtree):
-    return [load(v) for v in jtree]
+    return [load(v) for v in jtree]  # pyrefly: ignore[not-iterable]
   return jtree
 
 
@@ -396,7 +411,7 @@ def concatenate_pytrees(trees: Sequence[PyTree]) -> PyTree:
             f'Expect tree keys to be {keys}, but got {tree.keys()} instead.'
         )
     for key in keys:
-      subtrees = [tree[key] for tree in trees]
+      subtrees = [tree[key] for tree in trees]  # pyrefly: ignore[bad-index, unsupported-operation]
       concatenated[key] = concatenate_pytrees(subtrees)
     return concatenated
 
@@ -405,8 +420,8 @@ def concatenate_pytrees(trees: Sequence[PyTree]) -> PyTree:
     for tree in trees:
       if not tree_is_sequence(tree):
         raise ValueError(f'Expect tree to be Sequence: {tree}')
-      concatenated.extend(tree)
-    return type(first_tree)(concatenated)
+      concatenated.extend(tree)  # pyrefly: ignore[bad-argument-type]
+    return type(first_tree)(concatenated)  # pyrefly: ignore[bad-argument-count, bad-argument-type, bad-instantiation, missing-argument]
 
   if dataclasses.is_dataclass(first_tree):
     tree_cls = first_tree.__class__
@@ -452,11 +467,11 @@ def trim_none(tree: PyTree) -> PyTree:
         trimmed_tree[k] = v
     return trimmed_tree if trimmed_tree else None
   if tree_is_sequence(tree):
-    trimmed_tree = [None] * len(tree)
+    trimmed_tree = [None] * len(tree)  # pyrefly: ignore[bad-argument-type]
     should_trim = True
-    for i, v in enumerate(tree):
+    for i, v in enumerate(tree):  # pyrefly: ignore[bad-argument-type]
       v = trim_none(v)
-      trimmed_tree[i] = v
+      trimmed_tree[i] = v  # pyrefly: ignore[unsupported-operation]
       if v is not None:
         should_trim = False
     return None if should_trim else trimmed_tree
@@ -475,3 +490,90 @@ def load_pytree_from(path: epath.PathLike) -> Any:
   path = epath.Path(path)
   with path.open('r') as f:
     return load(json.load(f))
+
+## Utilities for filtering trees
+
+
+def filter_tree(
+    tree: PyTree,
+    predicate: Callable[[Any, Any], bool] | str | None,
+) -> tuple[PyTree, PyTree]:
+  """Split a tree based on a predicate.
+
+  Example predicate:
+
+  ```
+  def is_attn(path, value):
+    del value
+    return 'attn' in path
+
+  is_attn("/decoder/block_0/attn/q_proj/w", w) -> True
+  is_attn("/decoder/block_3/mlp/ffn0/w", ffn_w) -> False
+  ```
+
+  Args:
+    tree: The tree to filter.
+    predicate: The predicate to apply to each leaf node. Strings will be
+      dereferenced using `registry.FunctionRegistry`.
+
+  Returns:
+    Two trees of the same structure, containing the leaves that satisfy the
+    predicate and the leaves that do not, respectively. Leaves not in that tree
+    are replaced with `None` (to preserve structure).
+  """
+  if predicate is None:
+    predicate = lambda path, value: True
+  elif isinstance(predicate, str):
+    predicate = registry.FunctionRegistry.get(predicate, raise_error=True)
+
+  # Convert jax tree paths to nice strings.
+  def _pred(key, value):
+    path = jax.tree_util.keystr(key, simple=True, separator='/')
+    return predicate(path, value)
+
+  true_branch = jax.tree.map_with_path(
+      lambda k, v: v if _pred(k, v) else None, tree
+  )
+  false_branch = jax.tree.map_with_path(
+      lambda k, v: v if not _pred(k, v) else None, tree
+  )
+  return true_branch, false_branch
+
+
+def merge_filtered_trees(left: PyTree, right: PyTree):
+  """Inverse of filter_tree for any filter predicate."""
+  return jax.tree.map(
+      lambda x, y: x if x is not None else y,
+      left,
+      right,
+      is_leaf=lambda l: l is None,
+  )
+
+
+def filtered_map(fn, tree, *rest, default=None):
+  """Maps a function over a tree, skipping None values.
+
+  Args:
+    fn: The function to apply to each leaf node.
+    tree: The tree to map over.
+    *rest: The rest of the trees to map over.
+    default: A pytree of default values to use for leaves that are None.
+  """
+  args = (tree, *rest)
+  if default is not None:
+    args = (default, *args)
+
+  def _wrapped(*args):
+    def_val = None
+    # if a tree was passed, pull default from that
+    # note that if the tree is `None` (a valid tree),
+    # the code paths are identical.
+    if default is not None:
+      def_val, *args = args
+
+    if any(x is None for x in args):
+      return def_val
+
+    return fn(*args)
+
+  return jax.tree.map(_wrapped, *args, is_leaf=lambda l: l is None)

@@ -270,7 +270,7 @@ SamplingInput = str | ChunkSequence
 
 def chunks_as_text(chunks: ChunkSequence):
   texts = [c.content for c in chunks if c.type == Chunk.Type.TEXT]
-  return ''.join(texts)
+  return ''.join(texts)  # pyrefly: ignore[no-matching-overload]
 
 
 def input_as_chunks(sampling_input: SamplingInput) -> ChunkSequence:
@@ -399,7 +399,7 @@ class EmbeddingTextInputProcessor(BasicTextInputProcessor):
     if max_input_len is not None:
       # NOTE: This may truncate the embeddings.
       tokens = tokens[-max_input_len:]
-    return ProcessedInput(tokens=tokens, extra_inputs=extra_inputs)
+    return ProcessedInput(tokens=tokens, extra_inputs=extra_inputs)  # pyrefly: ignore[bad-argument-type]
 
 
 def create_input_processor(config, **kwargs) -> InputProcessorInterface:
@@ -501,7 +501,7 @@ def sample_from_logits(
     m = distributions.Categorical(logits)
     tokens = m.sample(prng_key)
     logprobs = m.log_prob(tokens)
-    return tokens, logprobs
+    return tokens, logprobs  # pyrefly: ignore[bad-return]
 
   def masked_sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
     logits = logits / temperature
@@ -519,7 +519,7 @@ def sample_from_logits(
     )
     tokens = m.sample(prng_key)
     logprobs = m.log_prob(tokens)
-    return tokens, logprobs
+    return tokens, logprobs  # pyrefly: ignore[bad-return]
 
   def sample_fn(logits: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jax.lax.cond(
@@ -562,7 +562,7 @@ def compute_log_likelihood(
   ) -> jax.Array:
     # The shape of logits is (batch_size, seq_len, vocab_size).
     m = distributions.Categorical(logits / temperature)
-    return m.log_prob(tokens)
+    return m.log_prob(tokens)  # pyrefly: ignore[bad-return]
 
   def masked_sample_score_fn(
       logits: jax.Array, tokens: jax.Array
@@ -581,7 +581,7 @@ def compute_log_likelihood(
     m = distributions.MaskedCategorical(
         logits, mask=mask, neg_inf=common.neg_inf(logits.dtype)
     )
-    return m.log_prob(tokens)
+    return m.log_prob(tokens)  # pyrefly: ignore[bad-return]
 
   def sample_score_fn(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     return jax.lax.cond(

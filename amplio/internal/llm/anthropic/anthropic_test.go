@@ -45,20 +45,34 @@ func TestParseCacheTTL(t *testing.T) {
 	}
 }
 
-// TestSpecReqOptsExcludesClientOnlyArgs guards the fix for the cache_ttl leak:
-// client-only spec args (interpreted by parseCacheTTL, not the API) must NOT be
-// forwarded to the request body as raw overrides, or Anthropic rejects the call
-// with 400 "cache_ttl: Extra inputs are not permitted". specReqOpts emits one
-// option per forwarded arg, so we assert cache_ttl produces none while a genuine
-// body override (thinking.budget_tokens) still does.
-func TestSpecReqOptsExcludesClientOnlyArgs(t *testing.T) {
-	if got := specReqOpts(url.Values{"cache_ttl": {"1h"}}); len(got) != 0 {
-		t.Errorf("specReqOpts(cache_ttl=1h) produced %d opts, want 0 (client-only arg must not reach the body)", len(got))
-	}
-
-	args := url.Values{"cache_ttl": {"1h"}, "thinking.budget_tokens": {"2048"}}
-	if got := specReqOpts(args); len(got) != 1 {
-		t.Errorf("specReqOpts(cache_ttl + thinking.budget_tokens) produced %d opts, want 1 (only the real body override)", len(got))
+// TestClientArgsNeverReachTheBody guards the fix for the cache_ttl leak: a
+// client arg (interpreted by parseCacheTTL, not by the API) must NOT be
+// forwarded to the request body as a raw override, or Anthropic rejects the call
+// with 400 "cache_ttl: Extra inputs are not permitted".
+//
+// The exclusion now happens in the split rather than inside specReqOpts, so the
+// test asserts the pair: cache_ttl lands on the client side and reaches
+// parseCacheTTL, while a genuine body override still becomes exactly one option.
+func TestClientArgsNeverReachTheBody(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		block, query url.Values
+	}{
+		{"block spelling", url.Values{"cache_ttl": {"1h"}}, url.Values{"thinking.budget_tokens": {"2048"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientArgs, err := llm.ClientArgs(tc.block, ClientArgs)
+			if err != nil {
+				t.Fatalf("ClientArgs: %v", err)
+			}
+			modelArgs := tc.query
+			if got := clientArgs.Get("cache_ttl"); got != "1h" {
+				t.Errorf("cache_ttl reached the client side as %q, want %q", got, "1h")
+			}
+			if got := specReqOpts(modelArgs); len(got) != 1 {
+				t.Errorf("specReqOpts produced %d opts, want 1 (only the real body override)", len(got))
+			}
+		})
 	}
 }
 func TestCoerce(t *testing.T) {

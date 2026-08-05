@@ -17,12 +17,14 @@ package server
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"amplio/internal/agent/critic"
 	"amplio/internal/db"
 	"amplio/internal/eventstream"
 	"amplio/internal/lessons"
+	"amplio/internal/llm"
 	"amplio/internal/runtime"
 	"amplio/internal/skills"
 	"amplio/internal/sysstat"
@@ -56,6 +58,14 @@ type Server struct {
 	// deferred return signals "delta below threshold, previous report unchanged"
 	// so the handler can respond 200 (deferred) vs 201 (created).
 	genReport func(ctx context.Context, runID string) (report *critic.RunReport, deferred bool, err error)
+
+	// lentSeen remembers which specs have already been logged at INFO, so lending
+	// announces a model once instead of once per request.
+	lentSeen sync.Map
+
+	// lendProvider builds a provider for the lending listener; nil unless
+	// LendingHandler was called (see llmapi.go).
+	lendProvider func(spec string) (llm.Provider, error)
 
 	// testLLM validates an agent-LLM spec (build the provider + one trivial Call),
 	// for the About page's pre-flight tester. nil = unconfigured (endpoint 501).
@@ -184,7 +194,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/about/test-llm", s.requireAuth(s.handleTestLLM))
 	mux.HandleFunc("POST /api/workspaces/new", s.requireAuth(s.handleCreateWorkspace))
 
-	// Routes that depend on internal-only backends (e.g. CitC workspace alias
+	// Routes that depend on optional backends (e.g. workspace alias
 	// management). Stub in the OSS build; tagged file installs the real
 	// handlers — see routes_extras{,_internal}.go.
 	s.registerInternalRoutes(mux)

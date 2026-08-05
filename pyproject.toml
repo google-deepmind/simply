@@ -1,6 +1,6 @@
 [project]
 name = "simply"
-version = "0.3.7"
+version = "0.3.9"
 description = "Simply: Minimal Code for Frontier LLM Research in JAX"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,7 +15,7 @@ dependencies = [
     "setuptools<81",
     "tensorboard>=2.20.0",
     "tensorboardX",
-    "jax",
+    "jax>=0.10",
     "tokenizers",
     "wandb>=0.25.0",
 ]
@@ -26,7 +26,7 @@ gpu = [
     "jax[cuda13]; sys_platform == 'linux'",
 ]
 tpu = [
-    "jax[tpu]>=0.8.2; sys_platform == 'linux'",
+    "jax[tpu]>=0.10; sys_platform == 'linux'",
 ]
 tfds = [
     "tensorflow-cpu; sys_platform != 'darwin'",
@@ -39,6 +39,13 @@ gcloud = [
 math-eval = [
     "sympy",
     "pylatexenc",
+]
+serving = [
+    "grpcio",
+    "grpcio-health-checking",
+    "grpcio-reflection",
+    "grpcio-tools",
+    "protobuf>=6.33",
 ]
 agent = [
     "litellm",

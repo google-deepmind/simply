@@ -116,7 +116,7 @@ func TestRespawnDoesNotRivalLiveParkedSession(t *testing.T) {
 
 	runReg := NewRunRegistry()
 	mgr := NewRunManager(store, func(string) (llm.Provider, error) { return &llm.MockProvider{Model: "m"}, nil }, runReg, plain.Factory)
-	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession))
+	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession, mgr.SessionStatus))
 
 	// (1) Respawn A. Its goroutine starts and blocks at the gate BEFORE
 	// registering — exactly the pre-Register window where the bug bites.

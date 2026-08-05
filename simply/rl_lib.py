@@ -74,7 +74,7 @@ ExperimentHelper = exp_helper.ExperimentHelper
 
 
 class RewardNormalizerRegistry(registry.RootRegistry):
-  namespace: str = 'RewardNormalizer'
+  namespace: str = 'RewardNormalizer'  # pyrefly: ignore[bad-override]
 
 
 class RewardNormalizer:
@@ -226,7 +226,7 @@ class RLTrainingExampleBatch:
     return dataclasses.replace(
         self,
         reward=normalizer.normalize(
-            self.reward, self.in_batch_example_id, self.is_valid_for_training
+            self.reward, self.in_batch_example_id, self.is_valid_for_training  # pyrefly: ignore[bad-argument-type]
         ),
     )
 
@@ -286,7 +286,7 @@ def compute_logprobs(
     )
     logits = jnp.astype(logits, jnp.float32)
     m = distributions.Categorical(logits)
-    logprobs = masked.masked(m.log_prob(targets), mask=mask)
+    logprobs = masked.masked(m.log_prob(targets), mask=mask)  # pyrefly: ignore[bad-argument-type]
     return logprobs
 
   batch_size = batch['input_tokens'].shape[0]
@@ -355,7 +355,7 @@ def compute_stats(
       stats['truncated'] = so.is_truncated
       stats['reward'] = rewarded_per_response.reward
       stats['correct'] = rewarded_per_response.correct
-      stats['eval_mask'] = not np.isnan(rewarded_per_response.reward)
+      stats['eval_mask'] = not np.isnan(rewarded_per_response.reward)  # pyrefly: ignore[no-matching-overload]
       stats['train_sample_mask'] = rewarded_per_response.is_valid_for_training
       for reward_type in getattr(evaluation, 'reward_types', ()):
         stats[f'is_reward_type/{reward_type}'] = reward_type in (
@@ -593,14 +593,14 @@ def create_train_batch(
             'extra_inputs': global_train_batch.extra_inputs,
         },
     )
-    global_train_batch = dataclasses.replace(
+    global_train_batch = dataclasses.replace(  # pyrefly: ignore[bad-specialization]
         global_train_batch,
-        ref_logprobs=jax.experimental.multihost_utils.process_allgather(
+        ref_logprobs=jax.experimental.multihost_utils.process_allgather(  # pyrefly: ignore[unexpected-keyword]
             ref_logprobs, tiled=True
         ),
     )
 
-  return global_train_batch
+  return global_train_batch  # pyrefly: ignore[bad-return]
 
 
 def compute_return(reward: Array, mask: Array, gamma: float = 1.0) -> Array:
@@ -608,7 +608,7 @@ def compute_return(reward: Array, mask: Array, gamma: float = 1.0) -> Array:
 
   if gamma == 1.0:
     ret = jnp.flip(jnp.cumsum(jnp.flip(reward, axis=-1), axis=-1), axis=-1)
-    return masked.masked(ret, mask=mask)
+    return masked.masked(ret, mask=mask)  # pyrefly: ignore[bad-argument-type]
 
   def _update_fn(g: Array, r: Array) -> tuple[Array, Array]:
     g = r + gamma * g
@@ -622,7 +622,7 @@ def compute_return(reward: Array, mask: Array, gamma: float = 1.0) -> Array:
       length=seq_len,
       reverse=True,
   )
-  return masked.masked(ret.T, mask=mask)
+  return masked.masked(ret.T, mask=mask)  # pyrefly: ignore[bad-argument-type]
 
 
 def compute_ppo_loss(
@@ -667,19 +667,19 @@ def compute_ppo_loss(
   logits = jnp.astype(logits, jnp.float32)
   m = distributions.Categorical(logits)
 
-  logpi = masked.masked(m.log_prob(targets), mask=answer_mask)
-  logpi_old = masked.masked(batch.logprobs, mask=answer_mask)
+  logpi = masked.masked(m.log_prob(targets), mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
+  logpi_old = masked.masked(batch.logprobs, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   if batch.ref_logprobs is not None:
-    logpi_ref = masked.masked(batch.ref_logprobs, mask=answer_mask)
+    logpi_ref = masked.masked(batch.ref_logprobs, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   else:
     logpi_ref = logpi_old
 
   if use_grpo:
     # K3 estimator from http://joschu.net/blog/kl-approx.html.
-    logr = masked.masked(logpi_ref - logpi, mask=answer_mask)
-    kl = masked.masked(jnp.expm1(logr) - logr, mask=answer_mask)
+    logr = masked.masked(logpi_ref - logpi, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
+    kl = masked.masked(jnp.expm1(logr) - logr, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   else:
-    kl = masked.masked(logpi - logpi_ref, mask=answer_mask)
+    kl = masked.masked(logpi - logpi_ref, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
 
   index = jnp.arange(kl.shape[0])
   if use_grpo:
@@ -696,35 +696,35 @@ def compute_ppo_loss(
 
   if normalize_advantage:
     mean, std = masked.masked_mean_std(adv, mask=answer_mask)
-    adv = masked.masked((adv - mean) / (std + 1e-5), mask=answer_mask)
+    adv = masked.masked((adv - mean) / (std + 1e-5), mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
 
   if max_abs_advantage is not None:
     adv = jnp.clip(adv, -max_abs_advantage, max_abs_advantage)
 
-  adv = jax.lax.stop_gradient(masked.masked(adv, mask=answer_mask))
+  adv = jax.lax.stop_gradient(masked.masked(adv, mask=answer_mask))  # pyrefly: ignore[bad-argument-type]
 
   if use_policy_logp_as_sampler_logp:
     # In pure on-policy learning, we may take logpi as logpi_old to avoid logp
     # diff that may be caused by sharding diff.
     logpi_old = jax.lax.stop_gradient(logpi)
 
-  logp_diff = masked.masked(logpi - logpi_old, mask=answer_mask)
+  logp_diff = masked.masked(logpi - logpi_old, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   abs_logp_diff = jnp.abs(logp_diff)
 
-  ratio = masked.masked(jnp.exp(logp_diff), mask=answer_mask)
+  ratio = masked.masked(jnp.exp(logp_diff), mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   if policy_ratio_cap is not None:
     # Applies dual-clip PPO. https://arxiv.org/abs/1912.09729.
     assert policy_ratio_cap > 1.0 + ppo_clip_eps_high
     ratio = jnp.minimum(ratio, policy_ratio_cap)
   clipped_ratio = masked.masked(
       jnp.clip(ratio, 1.0 - ppo_clip_eps_low, 1.0 + ppo_clip_eps_high),
-      mask=answer_mask,
+      mask=answer_mask,  # pyrefly: ignore[bad-argument-type]
   )
 
-  surr1 = masked.masked(ratio * adv, mask=answer_mask)
-  surr2 = masked.masked(clipped_ratio * adv, mask=answer_mask)
+  surr1 = masked.masked(ratio * adv, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
+  surr2 = masked.masked(clipped_ratio * adv, mask=answer_mask)  # pyrefly: ignore[bad-argument-type]
   per_token_ppo_loss = masked.masked(
-      -jnp.minimum(surr1, surr2), mask=answer_mask
+      -jnp.minimum(surr1, surr2), mask=answer_mask  # pyrefly: ignore[bad-argument-type]
   )
 
   loss = masked.masked_mean(per_token_ppo_loss, mask=answer_mask)
@@ -732,27 +732,27 @@ def compute_ppo_loss(
     kl_loss = masked.masked_mean(kl, mask=answer_mask)
     loss += kl_coeff * kl_loss
 
-  loss = sharding_lib.with_sharding_constraint(loss, None)
+  loss = sharding_lib.with_sharding_constraint(loss, None)  # pyrefly: ignore[bad-argument-type]
 
   entropy = jax.lax.stop_gradient(
       masked.masked_mean(m.entropy(), mask=answer_mask)
   )
-  entropy = sharding_lib.with_sharding_constraint(entropy, None)
+  entropy = sharding_lib.with_sharding_constraint(entropy, None)  # pyrefly: ignore[bad-argument-type]
 
   kl_divergence = jax.lax.stop_gradient(
       masked.masked_mean(kl, mask=answer_mask)
   )
-  kl_divergence = sharding_lib.with_sharding_constraint(kl_divergence, None)
+  kl_divergence = sharding_lib.with_sharding_constraint(kl_divergence, None)  # pyrefly: ignore[bad-argument-type]
 
   policy_ratio = jax.lax.stop_gradient(
       masked.masked_mean(ratio, mask=answer_mask)
   )
-  policy_ratio = sharding_lib.with_sharding_constraint(policy_ratio, None)
+  policy_ratio = sharding_lib.with_sharding_constraint(policy_ratio, None)  # pyrefly: ignore[bad-argument-type]
   policy_ratio_max = sharding_lib.with_sharding_constraint(
-      jax.lax.stop_gradient(masked.masked_max(ratio, mask=answer_mask)), None
+      jax.lax.stop_gradient(masked.masked_max(ratio, mask=answer_mask)), None  # pyrefly: ignore[bad-argument-type]
   )
   policy_ratio_min = sharding_lib.with_sharding_constraint(
-      jax.lax.stop_gradient(masked.masked_min(ratio, mask=answer_mask)), None
+      jax.lax.stop_gradient(masked.masked_min(ratio, mask=answer_mask)), None  # pyrefly: ignore[bad-argument-type]
   )
 
   return loss, {
@@ -873,7 +873,7 @@ def run_experiment(
   train_iter_state = None
   if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
     data_state = ckpt_lib.load_data_state_from_dir(
-        helper.ckpt_dir, helper.ckpt_mngr.latest_step()
+        helper.ckpt_dir, helper.ckpt_mngr.latest_step()  # pyrefly: ignore[bad-argument-type]
     )
     assert isinstance(data_state, Mapping)
     train_iter_state = data_state.get('train_iter_state', None)
@@ -965,16 +965,29 @@ def run_experiment(
   train_iter = iter(train_set)
   if train_iter_state is not None:
     logging.info('Restoring training iter state: %s.', train_iter_state)
-    train_iter.set_state(train_iter_state)
+    train_iter.set_state(train_iter_state)  # pyrefly: ignore[bad-argument-type]
 
-  eval_iter = None
-  eval_iter_init_state = None
-  if config.validation_dataset:
-    eval_set = data_lib.create_iter_dataset(config, training=False)
+  # Build per-entry eval iterators for `config.validation_datasets`.
+  # Each entry is a `data_lib.DatasetConfig`. The metric prefix is
+  # `<source.name>/...` so per-dataset numbers are independently
+  # plottable. We materialize the iterator eagerly (one per entry) and
+  # snapshot its init state so each eval pass starts from byte zero.
+  # Stored as a list of `(name, eval_iter, eval_iter_init_state)`
+  # tuples in the same order as `config.validation_datasets`.
+  eval_iters: list[tuple[str, Any, Any]] = []
+  for ds_cfg in config.validation_datasets:
+    source = ds_cfg.source
+    if isinstance(source, str):
+      source = data_lib.DataSourceRegistry.get_instance(source)
+    name = getattr(source, 'name', None) or type(source).__name__
+    eval_set = data_lib.create_iter_dataset(
+        config, training=False, ds_config=ds_cfg
+    )
     eval_iter = iter(eval_set)
-    # This usually is not needed, just in case eval_set.__iter__ is adopting
-    # improper stateful implementation.
+    # This usually is not needed, just in case eval_set.__iter__ is
+    # adopting improper stateful implementation.
     eval_iter_init_state = eval_iter.get_state()
+    eval_iters.append((name, eval_iter, eval_iter_init_state))
 
   logging.info(
       'sharding_config.data_partition: %s',
@@ -1222,7 +1235,7 @@ def run_experiment(
                   reward_result.metrics.get('COT/non_cot_generation_length'),
               )
 
-            is_nan_reward = np.isnan(rewarded_per_response.reward)
+            is_nan_reward = np.isnan(rewarded_per_response.reward)  # pyrefly: ignore[no-matching-overload]
             num_nan_samples += is_nan_reward
             so = rewarded_per_response.sampling_output
             assert so is not None
@@ -1235,7 +1248,7 @@ def run_experiment(
                 or (
                     tool_executor
                     and config.filter_throttled
-                    and so.is_throttled
+                    and so.is_throttled  # pyrefly: ignore[missing-attribute]
                 )
             )
             rewarded_per_prompt_batch[i] = dataclasses.replace(
@@ -1330,7 +1343,7 @@ def run_experiment(
     )
     logging.info('train_batch: %s', jax.tree.map(np.shape, train_batch))
 
-    replay_buffer.extend(train_batch)
+    replay_buffer.extend(train_batch)  # pyrefly: ignore[bad-argument-type]
     print(f'len(replay_buffer): {len(replay_buffer)}')
 
     if len(replay_buffer) >= replay_buffer_size:
@@ -1346,7 +1359,12 @@ def run_experiment(
         )
 
         # TODO: Merge this process with xm decode eval script.
-        if config.validation_dataset and (
+        # Loop over `config.validation_datasets`. Each entry produces a
+        # `<name>/eval_accuracy` scalar. For backwards compatibility,
+        # when there is exactly one entry we also emit the legacy
+        # bare `eval_accuracy` scalar (consumed by existing dashboards
+        # and the early-stop predicate).
+        if eval_iters and (
             steps % config.validation_eval_interval == 0
             or steps == config.num_train_steps
         ):
@@ -1355,74 +1373,105 @@ def run_experiment(
           eval_sampling_params = dataclasses.replace(
               sampling_params, num_samples=1
           )
+          eval_batch_size = (
+              config.validation_eval_batch_size
+              if config.validation_eval_batch_size > 0
+              else config.batch_size
+          )
           with js.set_mesh(decoding_mesh):
             decoding_params = jax.tree_util.tree_map(
                 common.convert_array_with_abstract,
                 state['params'],
                 abstract_decoding_params,
             )
-            prng_key, subkey = jax.random.split(prng_key)
-            eval_verdicts = []
-            assert eval_iter is not None
-            eval_iter.set_state(eval_iter_init_state)
-            eval_steps = 0
-            eval_batch_size = (
-                config.validation_eval_batch_size
-                if config.validation_eval_batch_size > 0
-                else config.batch_size
-            )
-            for eval_batch in eval_iter:
-              if (
-                  config.validation_num_eval_steps > 0
-                  and eval_steps >= config.validation_num_eval_steps
-              ):
-                break
-              eval_prompt_batch = []
-              for example in eval_batch:
-                eval_prompt_batch.append(
-                    evaluation.get_sampling_input(example, lm_format)
-                )
-              if tool_executor:
-                eval_sampling_outputs = tool_executor.sample_with_tool(
-                    lm_interface,
-                    lm_format,
-                    eval_prompt_batch,
-                    prng_key=subkey,
-                    params=decoding_params,
-                    sampling_params=eval_sampling_params,
-                    prefill_size=config.sampling_prefill_size,
-                    max_turns=config.max_turns,
-                    max_tool_response_len=config.sampling_max_tool_response_len,
-                )
-              else:
-                eval_sampling_outputs = lm_interface.generate(
-                    eval_prompt_batch,
-                    prng_key=subkey,
-                    params=decoding_params,
-                    sampling_params=eval_sampling_params,
-                    prefill_size=config.sampling_prefill_size,
-                    scoring_inputs=False,
-                    batch_size=eval_batch_size,
-                )
-              for example, eval_so in zip(
-                  eval_batch, eval_sampling_outputs, strict=True
-              ):
-                eval_verdicts.extend([
-                    evaluation.evaluate(example, so.output_text)['correct']
-                    for so in eval_so
-                ])
-              eval_steps += 1
+            per_ds_accuracies: dict[str, float] = {}
+            for name, eval_iter, eval_iter_init_state in eval_iters:
+              prng_key, subkey = jax.random.split(prng_key)
+              eval_verdicts = []
+              eval_iter.set_state(eval_iter_init_state)
+              eval_steps = 0
+              for eval_batch in eval_iter:
+                if (
+                    config.validation_num_eval_steps > 0
+                    and eval_steps >= config.validation_num_eval_steps
+                ):
+                  break
+                eval_prompt_batch = []
+                for example in eval_batch:
+                  eval_prompt_batch.append(
+                      evaluation.get_sampling_input(example, lm_format)
+                  )
+                if tool_executor:
+                  eval_sampling_outputs = tool_executor.sample_with_tool(
+                      lm_interface,
+                      lm_format,
+                      eval_prompt_batch,
+                      prng_key=subkey,
+                      params=decoding_params,
+                      sampling_params=eval_sampling_params,
+                      prefill_size=config.sampling_prefill_size,
+                      max_turns=config.max_turns,
+                      max_tool_response_len=(
+                          config.sampling_max_tool_response_len
+                      ),
+                  )
+                else:
+                  eval_sampling_outputs = lm_interface.generate(
+                      eval_prompt_batch,
+                      prng_key=subkey,
+                      params=decoding_params,
+                      sampling_params=eval_sampling_params,
+                      prefill_size=config.sampling_prefill_size,
+                      scoring_inputs=False,
+                      batch_size=eval_batch_size,
+                  )
+                for example, eval_so in zip(
+                    eval_batch, eval_sampling_outputs, strict=True
+                ):
+                  eval_verdicts.extend([
+                      evaluation.evaluate(example, so.output_text)['correct']
+                      for so in eval_so  # pyrefly: ignore[not-iterable]
+                  ])
+                eval_steps += 1
+              ds_accuracy = float(
+                  np.sum(eval_verdicts) / len(eval_verdicts)
+              )
+              per_ds_accuracies[name] = ds_accuracy
+              logging.info(
+                  'validation_datasets[%r] eval_accuracy=%f', name, ds_accuracy
+              )
             del decoding_params
-            eval_accuracy = np.sum(eval_verdicts) / len(eval_verdicts)
-            final_result['eval_accuracy'] = float(eval_accuracy)
-            final_result['eval_accuracy_history'].append(eval_accuracy)
-            helper.write_scalars(steps, {'eval_accuracy': eval_accuracy})
-            should_early_stop = should_early_stop or (
-                config.early_stop
-                and config.early_stop.should_stop(
-                    steps, {'eval_accuracy': eval_accuracy}
-                )
-            )
+            # Emit per-dataset scalars (`<name>/eval_accuracy`).
+            ds_scalars = {
+                f'{name}/eval_accuracy': acc
+                for name, acc in per_ds_accuracies.items()
+            }
+            helper.write_scalars(steps, ds_scalars)
+            # Backwards-compat: a single-entry `validation_datasets`
+            # mirrors the legacy bare `eval_accuracy` scalar so
+            # existing dashboards and the early-stop predicate keep
+            # working unchanged.
+            if len(per_ds_accuracies) == 1:
+              eval_accuracy = next(iter(per_ds_accuracies.values()))
+              final_result['eval_accuracy'] = eval_accuracy
+              final_result['eval_accuracy_history'].append(eval_accuracy)
+              helper.write_scalars(steps, {'eval_accuracy': eval_accuracy})
+              should_early_stop = should_early_stop or (
+                  config.early_stop
+                  and config.early_stop.should_stop(
+                      steps, {'eval_accuracy': eval_accuracy}
+                  )
+              )
+            else:
+              # Multi-entry: surface the per-dataset accuracies in
+              # `final_result` under their qualified names; no legacy
+              # mirror to avoid silently picking one as "the" metric.
+              for ds_name, acc in per_ds_accuracies.items():
+                final_result[f'{ds_name}/eval_accuracy'] = acc
+              should_early_stop = should_early_stop or (
+                  config.early_stop
+                  and config.early_stop.should_stop(steps, ds_scalars)
+              )
             helper.flush()
             eval_time = time.time() - eval_start_time
             logging.info(

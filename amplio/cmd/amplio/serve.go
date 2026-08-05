@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -27,10 +28,12 @@ import (
 	"strconv"
 	"time"
 
-	"amplio/internal/agent/critic"
 	"amplio/internal/config"
 	"amplio/internal/db"
+	"amplio/internal/embed"
 	"amplio/internal/eventstream"
+	"amplio/internal/llm"
+	"amplio/internal/llm/bridge"
 	amlog "amplio/internal/log"
 	"amplio/internal/runtime"
 	"amplio/internal/server"
@@ -40,7 +43,7 @@ import (
 )
 
 func serveCmd() *cobra.Command {
-	var listen string
+	var listen, lendLLM string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Start the amplio web server (hosts runs and the UI)",
@@ -53,29 +56,38 @@ func serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return executeServe(cfg, listen)
+			return executeServe(cfg, listen, lendLLM)
 		},
 	}
 	cmd.Flags().StringVar(&listen, "listen", "",
 		"HTTP bind address host:port; overrides $AMPLIO_LISTEN and config.toml [listen]")
+	cmd.Flags().StringVar(&lendLLM, "lend-llm", "",
+		"bind address host:port for the LLM lending listener (empty disables); "+
+			"overrides $AMPLIO_LEND_LLM and config.toml [lend_llm]")
 	return cmd
 }
 
 // listenAddr applies the serve bind-address precedence: --listen flag >
 // $AMPLIO_LISTEN > config.toml [listen] (cfgListen already holds the file value
-// or the built-in default).
+// or the built-in default). The lending listener uses the same rule, via
+// addrFrom.
 func listenAddr(flagVal, envVal, cfgListen string) string {
+	return addrFrom(flagVal, envVal, cfgListen)
+}
+
+// addrFrom is flag > env > config, the precedence every address setting uses.
+func addrFrom(flagVal, envVal, cfgVal string) string {
 	switch {
 	case flagVal != "":
 		return flagVal
 	case envVal != "":
 		return envVal
 	default:
-		return cfgListen
+		return cfgVal
 	}
 }
 
-func executeServe(cfg config.Config, listenOverride string) error {
+func executeServe(cfg config.Config, listenOverride, lendOverride string) error {
 	dataDir := config.DataDir()
 	// System tiers are already validated by resolveConfig. --listen has its own
 	// serve-only precedence (flag > env > resolved config). serve additionally
@@ -148,7 +160,7 @@ func executeServe(cfg config.Config, listenOverride string) error {
 		})
 	})
 
-	// Wire any corp-only extras (CitC alias cache, etc.). Stub in the OSS build.
+	// Wire any build-specific extras. Stub in the OSS build.
 	setupCorpExtras(bc)
 
 	// System status watcher: one goroutine probes server-host signals
@@ -259,6 +271,13 @@ func executeServe(cfg config.Config, listenOverride string) error {
 	srv.SetSecureCookie(useTLS)
 	srv.SetLLMTester(testLLM)
 	srv.SetFollowupSuggester(makeFollowupSuggester(store, sysEnv.systemHQ))
+	if lendAddr := addrFrom(lendOverride, os.Getenv(config.EnvLendLLM), cfg.LendLLM); lendAddr != "" {
+		stopLending, err := serveLending(lendAddr, cfg, srv, sysEnv.embedder)
+		if err != nil {
+			return err
+		}
+		defer stopLending()
+	}
 	go srv.Bridge(ctx)
 
 	// HTTP log middleware: quiet by default (2xx → Debug, hidden at info level),
@@ -363,7 +382,6 @@ func recoverRuns(ctx context.Context, store db.Store, mgr *runtime.RunManager) i
 	return total
 }
 
-// backfillReports generates any missing run reports for already-concluded runs,
 // openLogFile creates a fresh per-serve log file under config.LogsDir() with
 // a timestamped name (one per serve invocation, so restarts don't append to a
 // stale tail). Append mode is harmless given the timestamp grain, but kept
@@ -375,35 +393,60 @@ func openLogFile() (*os.File, error) {
 	return os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 }
 
-// one at a time. Run in a background goroutine (off the startup path) so it never
-// blocks serving; the per-run watermark makes already-reported runs no-ops.
-func backfillReports(ctx context.Context, store db.Store, fin *critic.Finalizer) {
-	// Limit:-1 = unbounded: backfill must visit every concluded run, not a page.
-	runs, _, err := store.ListRuns(ctx, db.ListRunsOpts{Limit: -1})
-	if err != nil {
-		slog.Warn("report backfill: list runs failed", "error", err)
-		return
+// serveLending starts the LLM lending listener and returns a stop function.
+//
+// A second listener rather than routes on the main one. This port serves generations, embeddings
+// and the model list, and nothing else exists on it to reach.
+func serveLending(addr string, cfg config.Config, srv *server.Server, embedder embed.Embedder) (func(), error) {
+	tokenEnv := cfg.LendLLMTokenEnv
+	if tokenEnv == "" {
+		// The same default the bridge provider reads, so both ends of a tunnel
+		// are configured alike.
+		tokenEnv = bridge.DefaultTokenEnv
 	}
-	for _, run := range runs {
-		if ctx.Err() != nil {
-			return
-		}
-		safeFinalize(fin, ctx, run.RunID)
+	token := os.Getenv(tokenEnv)
+	if token == "" {
+		// Refusing beats defaulting: an open lending port is an invitation to
+		// spend someone else's model budget. Its own secret, too — the server
+		// token also authorises starting runs, i.e. a shell here.
+		return nil, fmt.Errorf("lend_llm is set but %s is empty; set it to a shared secret "+
+			"that callers will present as a bearer token", tokenEnv)
 	}
-}
+	// Cached: a served API builds a provider per request, and construction mints
+	// credentials and builds the connection pool that makes the second request
+	// fast. A run builds one provider and uses it for hours.
+	handler := srv.LendingHandler(token, llm.CacheProviders(createProvider), lentEmbedder(embedder))
 
-// safeFinalize runs the critic for one run with panic recovery, so a single
-// bad run (LLM provider crash, panicking deserialization, etc.) doesn't kill
-// either the live-trigger goroutine (would crash the server) or the backfill
-// loop (would prevent subsequent runs from being processed). The Finalizer's
-// own `defer tracker.Unregister(id)` runs ahead of the panic propagation, so
-// the ephemeral registry is left clean — recover here only protects the
-// caller's goroutine identity.
-func safeFinalize(fin *critic.Finalizer, ctx context.Context, runID string) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Error("critic panicked", "run_id", runID, "panic", r)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen for lending on %s: %w", addr, err)
+	}
+	lendSrv := &http.Server{
+		Handler: handler,
+		// No write timeout: a generation streams for minutes. Reading headers is
+		// the part an idle connection can abuse.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := lendSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("lending listener stopped", "error", err)
 		}
 	}()
-	fin.OnMainAgentConcluded(ctx, runID)
+	slog.Warn("lending LLM: authenticated callers on this port may spend this machine's model credentials",
+		"addr", ln.Addr().String(), "models", len(cfg.Run.LLMs), "token_env", tokenEnv)
+
+	return func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = lendSrv.Shutdown(shutdownCtx)
+	}, nil
+}
+
+// lentEmbedder maps a nil embed.Embedder to a nil interface: an interface value
+// holding a nil pointer passes a != nil check and then panics on first use.
+func lentEmbedder(e embed.Embedder) bridge.Embedder {
+	if e == nil {
+		return nil
+	}
+	return e
 }

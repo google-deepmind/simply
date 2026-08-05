@@ -27,6 +27,10 @@
 	// its model immediately rather than populating after the fetch resolves.
 	const cached = cachedModelMenu();
 	let models = $state<ModelEntry[]>(cached?.models ?? []);
+	// Label of the current selection. Falls back to the raw spec when the menu
+	// hasn't loaded yet, or when the run was started with a spec no longer listed
+	// — the pill must never go blank just because we can't shorten it.
+	const selectedLabel = $derived(models.find((m) => m.spec === value)?.label || value);
 	let open = $state(false);
 	let adding = $state(false);
 	let newSpec = $state('');
@@ -92,6 +96,18 @@
 		}
 	}
 
+	// keepFocus stops a menu button from TAKING focus on mousedown (the click
+	// still fires). Without it, add/remove destroy the very button that was
+	// clicked, the browser then moves focus to <body> and fires focusout with a
+	// null relatedTarget, and StartRunForm reads that as "focus left the form" —
+	// so removing a model collapsed the whole composer out from under the menu.
+	// The parent's own guard hides it intermittently: typing in the "add model"
+	// input marks the form dirty, and a dirty form stays expanded, which is why
+	// the collapse looked random.
+	function keepFocus(e: MouseEvent) {
+		e.preventDefault();
+	}
+
 	async function remove(e: Event, spec: string) {
 		e.stopPropagation();
 		try {
@@ -104,22 +120,45 @@
 </script>
 
 <div class="wrap" use:clickOutside={() => (open = false)}>
-	<button type="button" class="trigger" title="Agent model" onclick={() => (open = !open)}>
+	<button
+		type="button"
+		class="trigger"
+		title={value ? `Agent model\n${value}` : 'Agent model'}
+		onclick={() => (open = !open)}
+	>
 		<CubeIcon size={16} />
-		<span class="label">{value || 'select model'}</span>
+		<span class="label">{selectedLabel || 'select model'}</span>
 		<span class="caret"><CaretDownIcon size={12} /></span>
 	</button>
 	{#if open}
 		<div class="menu">
 			{#each models as m (m.spec)}
 				<div class="row" class:selected={m.spec === value}>
-					<button type="button" class="pick" onclick={() => select(m.spec)}>{m.spec}</button>
+					<!-- Two lines rather than a tooltip: the spec is what you are actually
+					     choosing, so it stays legible at the moment of choosing. The label
+					     is lossy and may be flat wrong for an unusual spec. -->
+					<button type="button" class="pick" onclick={() => select(m.spec)}>
+						<span class="pick-label">
+							{m.label || m.spec}
+							{#if m.duplicate}
+								<span
+									class="dup"
+									title="Another entry has the same provider spec, differing only by its #nickname. Both start identical runs, but they will be labelled differently everywhere."
+									>duplicate</span
+								>
+							{/if}
+						</span>
+						{#if m.label && m.label !== m.spec}
+							<span class="pick-spec">{m.spec}</span>
+						{/if}
+					</button>
 					{#if m.removable}
 						<button
 							type="button"
 							class="rm"
 							title="Remove"
 							aria-label="Remove model"
+							onmousedown={keepFocus}
 							onclick={(e) => remove(e, m.spec)}
 						>
 							<MinusIcon size={14} />
@@ -139,10 +178,15 @@
 							else if (e.key === 'Escape') adding = false;
 						}}
 					/>
-					<button type="button" class="ok" onclick={add}>add</button>
+					<button type="button" class="ok" onmousedown={keepFocus} onclick={add}>add</button>
 				</div>
 			{:else}
-				<button type="button" class="addrow" onclick={() => (adding = true)}>
+				<button
+					type="button"
+					class="addrow"
+					onmousedown={keepFocus}
+					onclick={() => (adding = true)}
+				>
 					<PlusIcon size={13} /> Add model…
 				</button>
 			{/if}
@@ -181,12 +225,23 @@
 		position: absolute;
 		bottom: calc(100% + 4px);
 		left: 0;
-		min-width: 240px;
+		/* Floor, not a fit: short labels ("opus-5") would otherwise collapse the
+		   menu to a sliver, and the rows below carry a dimmed second line that
+		   reads badly in a narrow column. */
+		min-width: 300px;
 		/* Cap horizontal growth so a long custom spec (e.g. with several query
 		   params) wraps inside the menu rather than pushing the trailing
 		   remove button past the viewport edge (where it can't be clicked).
 		   28rem fits ~50 chars of typical model spec on one line. */
 		max-width: 28rem;
+		/* Safety guard, not a fit. The menu opens UPWARD, so what actually bounds
+		   it is the gap between the trigger and the top of the viewport — which CSS
+		   can't see. 65vh approximates that generously: it leaves a normal menu
+		   alone and only engages when the list would otherwise run off-screen,
+		   where the top entries would be unreachable rather than merely clipped. */
+		max-height: 65vh;
+		overflow-y: auto;
+		overscroll-behavior: contain; /* don't chain the scroll to the page behind */
 		background: var(--bg-elev2);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-md);
@@ -226,6 +281,31 @@
 	}
 	.pick:hover {
 		color: var(--accent);
+	}
+	.pick-label {
+		display: block;
+	}
+	/* The full spec, dimmed and smaller: present for verification, not competing
+	   with the label for attention. Inherits the .pick word-break so a long spec
+	   still fills each line rather than orphaning fragments. */
+	.pick-spec {
+		display: block;
+		font-size: 0.78em;
+		color: var(--text-dim);
+		margin-top: 0.1rem;
+	}
+	/* Informational, not alarming: two entries for one endpoint is how a relabel
+	   looks mid-flight, so this is a nudge to tidy up, not an error. */
+	.dup {
+		margin-left: 0.35rem;
+		font-size: 0.7em;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: var(--warn, var(--text-dim));
+		border: 1px solid currentColor;
+		border-radius: var(--radius-xs);
+		padding: 0 0.25rem;
+		vertical-align: 0.1em;
 	}
 	.rm,
 	.ok {

@@ -18,13 +18,27 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"amplio/internal/llm"
 )
 
 // modelEntry is one option in the agent-model menu. Config entries are
 // read-only; custom (DB) entries are removable.
+//
+// Label is a derived display name (internal/llm.ShortLabel), sent so the menu
+// and the run chips agree on one implementation. Spec remains the identity and
+// the only value ever submitted back — the UI must keep it visible next to the
+// label, not behind it.
 type modelEntry struct {
 	Spec      string `json:"spec"`
+	Label     string `json:"label"`
 	Removable bool   `json:"removable"`
+	// Duplicate marks an entry whose provider spec is shared with another entry —
+	// they differ only by the "#nickname" display label. Not an error (relabelling
+	// an existing endpoint is done exactly this way), but worth flagging: the two
+	// start identical runs that will then be LABELLED differently everywhere, so
+	// it is usually a leftover rather than an intent.
+	Duplicate bool `json:"duplicate"`
 }
 
 type modelMenu struct {
@@ -34,6 +48,12 @@ type modelMenu struct {
 
 // handleListModels returns the union of config.toml's [run].llms (read-only) and
 // the user-added custom models (removable), deduped, config order first.
+//
+// Dedup is on the VERBATIM spec, so "x" and "x#nickname" are two entries. That
+// is deliberate: adding a nickname for an already-listed endpoint is exactly how
+// an operator relabels one (e.g. a reused test endpoint whose checkpoint
+// changed), and silently collapsing it onto the unlabelled entry would discard
+// the thing they just asked for.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	custom, err := s.store.ListCustomModels(r.Context())
 	if err != nil {
@@ -47,16 +67,32 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[spec] = true
-		menu.Models = append(menu.Models, modelEntry{Spec: spec, Removable: false})
+		menu.Models = append(menu.Models, modelEntry{Spec: spec, Label: llm.ShortLabel(spec), Removable: false})
 	}
 	for _, spec := range custom {
 		if spec == "" || seen[spec] {
 			continue // a custom that duplicates a config entry stays read-only
 		}
 		seen[spec] = true
-		menu.Models = append(menu.Models, modelEntry{Spec: spec, Removable: true})
+		menu.Models = append(menu.Models, modelEntry{Spec: spec, Label: llm.ShortLabel(spec), Removable: true})
 	}
+	markDuplicates(menu.Models)
 	writeJSON(w, http.StatusOK, menu)
+}
+
+// markDuplicates flags every entry that shares a provider spec with another,
+// i.e. entries that differ only by their "#nickname". Both stay in the menu —
+// suppressing one would silently discard the relabel the operator just asked
+// for, and the config-sourced entry (which can't be removed from the UI) is
+// often the one they wanted to override.
+func markDuplicates(entries []modelEntry) {
+	count := make(map[string]int, len(entries))
+	for _, e := range entries {
+		count[llm.BaseSpec(e.Spec)]++
+	}
+	for i := range entries {
+		entries[i].Duplicate = count[llm.BaseSpec(entries[i].Spec)] > 1
+	}
 }
 
 func (s *Server) handleAddModel(w http.ResponseWriter, r *http.Request) {

@@ -12,12 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux
+//go:build linux
 
-package subprocess
+package bridge
 
-import "os/exec"
+import (
+	"os/exec"
+	"syscall"
+)
 
-// setDeathSig is a no-op on platforms without parent-death signaling. The
-// explicit Shutdown path still reaps subprocesses on graceful exit.
-func setDeathSig(_ *exec.Cmd) {}
+// setDeathSig makes the bridge receive SIGTERM if the amplio process dies, so a
+// subprocess never outlives its parent even if amplio crashes (defense in depth
+// beyond the explicit Shutdown path).
+func setDeathSig(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Pdeathsig = syscall.SIGTERM
+}

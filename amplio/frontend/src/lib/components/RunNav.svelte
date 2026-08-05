@@ -16,21 +16,59 @@
 
 <script lang="ts">
 	import { page } from '$app/state';
-	import { TreeStructureIcon, ChatCircleIcon, FolderIcon } from 'phosphor-svelte';
+	import { TreeStructureIcon, ChatCircleIcon, FolderIcon, PathIcon, ScrollIcon } from 'phosphor-svelte';
+	import { logHref, recallSession } from '$lib/logView.svelte';
+	import type { SessionDTO } from '$lib/types';
 
-	let { runId }: { runId: string } = $props();
+	let { runId, sessions = [] }: { runId: string; sessions?: SessionDTO[] } = $props();
 
 	const base = $derived(`/runs/${runId}`);
 	const path = $derived(page.url.pathname);
+
+	// The two read-only viewers are per-session, so the rail needs a session to
+	// point at: whichever you looked at last in this run, else a per-mode default.
+	// The defaults differ because the modes suit different agents — the trajectory
+	// is for the run's worker (the autonomous root), while a chat LOG is really
+	// about an interactive session, today only the chatbot. Any session can still
+	// be opened in either mode from the viewer's own selector; this is just where
+	// the rail lands you first. Empty until the run detail arrives — logHref then
+	// targets the index route, which redirects with the same rule.
+	function defaultSid(mode: 'trajectory' | 'chat'): string {
+		const remembered = recallSession(runId);
+		if (remembered && sessions.some((s) => s.session_id === remembered)) return remembered;
+		const roots = sessions.filter((s) => !s.parent_id);
+		const autonomous = roots.find((s) => s.agent_type !== 'chatbot') ?? roots[0];
+		if (mode === 'chat') {
+			return (sessions.find((s) => s.agent_type === 'chatbot') ?? autonomous)?.session_id ?? '';
+		}
+		return autonomous?.session_id ?? '';
+	}
+	// A session-log route: /runs/<id>/sessions[/<sid>[/chat]]. The chat-log page
+	// is the one ending in /chat — note the LIVE chat lives at /runs/<id>/chat and
+	// never matches this prefix.
+	const inLog = $derived(path.startsWith(`${base}/sessions`));
+	const inLogChat = $derived(inLog && path.endsWith('/chat'));
+
 	const items = $derived([
-		// Trajectory (/sessions/...) is part of the Overview domain → keep it lit.
 		{
 			label: 'Overview',
 			href: base,
 			icon: TreeStructureIcon,
-			active: path === base || path.startsWith(`${base}/sessions`)
+			active: path === base
 		},
 		{ label: 'Chat', href: `${base}/chat`, icon: ChatCircleIcon, active: path.startsWith(`${base}/chat`) },
+		{
+			label: 'Trajectory',
+			href: logHref(runId, defaultSid('trajectory'), 'trajectory'),
+			icon: PathIcon,
+			active: inLog && !inLogChat
+		},
+		{
+			label: 'Chat log',
+			href: logHref(runId, defaultSid('chat'), 'chat'),
+			icon: ScrollIcon,
+			active: inLogChat
+		},
 		{
 			label: 'Artifacts',
 			href: `${base}/artifacts`,

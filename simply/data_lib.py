@@ -38,7 +38,7 @@ Usage:
     ...
 """
 
-
+import ast
 from collections.abc import Mapping, Sequence
 import dataclasses
 import functools
@@ -134,6 +134,17 @@ def register_hf_vocabs():
 register_hf_vocabs()
 
 
+def register_byte_vocab():
+  """Registers the raw utf-8 byte-level vocab (256 bytes + 3 specials)."""
+  tokenization.TokenizerRegistry.register(
+      tokenization.ByteVocab,
+      name='byte256',
+  )
+
+
+register_byte_vocab()
+
+
 ################################################################################
 # Registries.
 ################################################################################
@@ -195,6 +206,38 @@ class TFDSSource:
 
   def __getitem__(self, index: int) -> dict[str, Any]:
     return self._source[index]
+
+
+@DataSourceRegistry.register
+@dataclasses.dataclass(frozen=True)
+class MockTFDSSource:
+  """Mock TFDS data source for testing.
+
+  Replaces TFDSSource without loading real data from tensorflow_datasets.
+  Generates dummy dictionary items.
+
+  Attributes:
+    name: Dummy dataset name.
+    split: Dummy split.
+    length: The number of mock examples to simulate.
+  """
+
+  name: str
+  split: str = 'train'
+  length: int = 1000
+
+  def __len__(self) -> int:
+    return self.length
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    if index < 0 or index >= self.length:
+      raise IndexError('list index out of range')
+    return {
+        'question': f'Dummy question {index}',
+        'answer': f'{index}',
+        'context': f'Dummy context {index}',
+        'text': f'Dummy text {index}',
+    }
 
 
 @DataSourceRegistry.register
@@ -846,6 +889,150 @@ class QualityValSource(QualityTrainSource):
   split: str = 'dev'
 
 
+@functools.partial(DataSourceRegistry.register, name='simply:arc_agi_2')
+@dataclasses.dataclass(frozen=True)
+class ArcAgi2Source:
+  """ARC-AGI-2 dataset source."""
+
+  path: str = os.path.join(DATASETS_DIR, 'arc_agi/arc_agi_2.json')
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _examples(self) -> list[dict[str, Any]]:
+    """Lazily loads and caches examples."""
+    with epath.Path(self.path).open('r') as f:
+      examples = json.load(f)
+    new_examples = []
+    for example in examples:
+      example_id = example['example_id']
+      new_examples.append({
+          'problem': example['problem'],
+          'answer': example['answer'],
+          'uid': f'arc_agi_2-{example_id}',
+      })
+    return new_examples[self.start_index : self.end_index]
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._examples[index]
+
+
+# =============================================================================
+# SWE-Bench Pro (official ScaleAI release).
+#
+# Reads the official HuggingFace `ScaleAI/SWE-bench_Pro` parquet (731 tasks,
+# 16 fields) and the companion `SWE-bench_Pro-os` per-instance run scripts
+# directly, and yields ONLY the original/raw data -- every official column
+# verbatim plus the two raw run-script files. This is a PURE data source: it
+# performs NO verification-env derivation.
+#
+# Layout under `<SWE_BENCH_PRO_DIR>`:
+#   SWE-bench_Pro/data/test-00000-of-00001.parquet   (the 731 tasks)
+#   SWE-bench_Pro-os/run_scripts/<instance_id>/{run_script.sh,parser.py}
+# =============================================================================
+SWE_BENCH_PRO_DIR = os.path.join(DATASETS_DIR, 'swe_bench_pro')
+
+
+def _sbp_parse_list(value: Any) -> list[Any]:
+  """Parses a parquet list cell (JSON-string, python-repr, or native list)."""
+  if value is None:
+    return []
+  if isinstance(value, (list, tuple, np.ndarray)):
+    return list(value)
+  s = str(value).strip()
+  if not s:
+    return []
+  try:
+    return list(json.loads(s))
+  except json.JSONDecodeError:
+    pass
+  try:
+    return list(ast.literal_eval(s))
+  except (ValueError, SyntaxError):
+    logging.warning('SBP: could not parse list field: %r', s[:120])
+    return []
+
+
+@functools.partial(DataSourceRegistry.register, name='simply:swe_bench_pro')
+@dataclasses.dataclass(frozen=True)
+class SweBenchProSource:
+  """Official SWE-Bench Pro dataset source (731 examples), RAW/PURE.
+
+  Reads the consolidated original JSON and yields ONLY the original data
+  fields -- no verification-env derivation. Each yielded example dict has:
+
+    Official (verbatim) columns:
+      instance_id, repo, base_commit, patch, test_patch, problem_statement
+      (RAW issue body), requirements, interface, repo_language, fail_to_pass,
+      pass_to_pass, issue_specificity, issue_categories, before_repo_set_cmd,
+      selected_test_files_to_run, dockerhub_tag.
+
+    Raw run scripts (original names, verbatim):
+      run_scripts -- {'run_script.sh': ..., 'parser.py': ...}.
+
+    Datasource-identity fields (every simply source sets these):
+      uid -- stable id, set to instance_id
+
+  The JSON-string list columns (fail_to_pass, pass_to_pass, issue_*,
+  selected_test_files_to_run) are parsed into real lists via `_sbp_parse_list`
+  (faithful representation of the raw cells, NOT env derivation).
+
+  All verification-env fields (sandbox image id, wrapped problem_statement,
+  test_cmd, golden_test_results) are derived on the fly by
+  `SweBenchProEvaluation.enrich_example` in the eval; they are deliberately
+  NOT set here.
+  """
+
+  path: str = os.path.join(SWE_BENCH_PRO_DIR, 'swe_bench_pro_original_731.json')
+  start_index: int | None = None
+  end_index: int | None = None
+
+  @functools.cached_property
+  def _examples(self) -> list[dict[str, Any]]:
+    """Lazily reads the consolidated JSON, caches raw-only examples."""
+    with epath.Path(self.path).open('r') as f:
+      rows = json.load(f)
+    examples: list[dict[str, Any]] = []
+    for p in rows:
+      example: dict[str, Any] = {
+          # -- Official columns, verbatim (RAW). --
+          'instance_id': p['instance_id'],
+          'repo': p['repo'],
+          'base_commit': p['base_commit'],
+          'patch': p['patch'],
+          'test_patch': p['test_patch'],
+          # RAW issue body (official `problem_statement`); the env derives the
+          # model-facing wrapped prompt from this on the fly.
+          'problem_statement': p['problem_statement'],
+          'requirements': p['requirements'],
+          'interface': p['interface'],
+          'repo_language': p['repo_language'],
+          'fail_to_pass': _sbp_parse_list(p['fail_to_pass']),
+          'pass_to_pass': _sbp_parse_list(p['pass_to_pass']),
+          'issue_specificity': _sbp_parse_list(p['issue_specificity']),
+          'issue_categories': _sbp_parse_list(p['issue_categories']),
+          'before_repo_set_cmd': p['before_repo_set_cmd'],
+          'selected_test_files_to_run': _sbp_parse_list(
+              p['selected_test_files_to_run']
+          ),
+          'dockerhub_tag': p['dockerhub_tag'],
+          # -- Raw run scripts, verbatim (original names). --
+          'run_scripts': p.get('run_scripts') or {},
+          'uid': p['instance_id'],
+      }
+      examples.append(example)
+    return examples[self.start_index : self.end_index]
+
+  def __len__(self) -> int:
+    return len(self._examples)
+
+  def __getitem__(self, index: int) -> dict[str, Any]:
+    return self._examples[index]
+
+
 def _register_gsm8k_variants():
   """Register GSM8K variants with limited examples."""
   for num_examples in [4, 32, 128]:
@@ -1048,7 +1235,7 @@ class ChatFormatTransform(grain.MapTransform):
     if isinstance(conversation, bytes):
       conversation = conversation.decode('utf-8')
 
-    messages = json.loads(conversation)
+    messages = json.loads(conversation)  # pyrefly: ignore[bad-argument-type]
 
     # Build tokens and loss mask together.
     lm_fmt = _get_lm_format(self.lm_format_name)
@@ -1177,6 +1364,7 @@ PACKING_NONE = 'none'
 # Controls how examples are organized after batching.
 BATCH_STACKED = 'stacked'      # Default grain behavior: stack arrays (columnar)
 BATCH_UNSTACKED = 'unstacked'  # Keep as list of individual examples
+BATCH_NONE = 'none'            # No batching, return as-is.
 
 
 def get_batch_fn(batch_mode: str):
@@ -1391,13 +1579,20 @@ def _create_map_dataset(
 def create_iter_dataset(
     config,
     training: bool = True,
+    ds_config: DatasetConfig | None = None,
 ) -> grain.IterDataset:
   """Main entry point for creating datasets.
 
   Args:
-    config: ExperimentConfig with dataset configuration. Must have dataset and
-      optionally validation_dataset.
+    config: ExperimentConfig with dataset configuration. Must have a
+      `dataset` field for training, and (for validation) caller-supplied
+      `ds_config` for the specific validation dataset to materialize.
     training: If True, creates training dataset; else validation dataset.
+    ds_config: When `training=False`, the `DatasetConfig` (or registry
+      string) of the specific validation dataset to materialize. Falls
+      back to `config.dataset` when omitted (legacy convenience).
+      Ignored when `training=True` (training always uses
+      `config.dataset`).
 
   Returns:
     A grain.IterDataset ready for iteration.
@@ -1409,7 +1604,19 @@ def create_iter_dataset(
     shuffle = True
     num_epochs = None
   else:
-    ds_config = getattr(config, 'validation_dataset', None) or config.dataset
+    if ds_config is None:
+      # Legacy fallback: no explicit validation ds_config -> try the
+      # deprecated `config.validation_dataset` shim (which forwards to
+      # `validation_datasets[0]` for single-entry configs); fall back
+      # to `config.dataset` if neither is set. New callers should pass
+      # `ds_config` explicitly (typically one entry of
+      # `config.validation_datasets`).
+      logging.warning(
+          'create_iter_dataset(training=False) called without `ds_config`;'
+          ' falling back to `config.validation_dataset or config.dataset`.'
+          ' New callers should pass `ds_config` explicitly.'
+      )
+      ds_config = config.validation_dataset or config.dataset
     batch_size = (
         config.validation_eval_batch_size
         if config.validation_eval_batch_size > 0
@@ -1460,17 +1667,23 @@ def create_iter_dataset(
 
   # Helper to apply batching and prefetching.
   def _finalize(iter_ds: grain.IterDataset) -> grain.IterDataset:
-    batch_fn = get_batch_fn(batch_mode)
     local_batch_size = batch_size
     if config.shard_data_method == 'BY_JAX_PROCESS':
+      if batch_mode == BATCH_NONE:
+        raise ValueError(
+            f'{batch_mode=} cannot be used with {config.shard_data_method=}'
+        )
       if batch_size % jax.process_count() != 0:
         raise ValueError(
             f'{batch_size=} cannot be divided by {jax.process_count()=}'
         )
       local_batch_size = batch_size // jax.process_count()
-    iter_ds = iter_ds.batch(
-        local_batch_size, drop_remainder=True, batch_fn=batch_fn
-    )
+    if batch_mode != BATCH_NONE:
+      iter_ds = iter_ds.batch(
+          local_batch_size,
+          drop_remainder=True,
+          batch_fn=get_batch_fn(batch_mode),
+      )
     return iter_ds.mp_prefetch(
         grain.MultiprocessingOptions(
             num_workers=prefetch_num_workers,

@@ -97,14 +97,14 @@ def execute_bash_locally(
     )
   except subprocess.TimeoutExpired as e:
     text = tools_lib.BashAction.format_output(
-        e.stdout.decode('utf-8', errors='backslashreplace')
+        e.stdout.decode('utf-8', errors='backslashreplace')  # pyrefly: ignore[bad-argument-type]
         if isinstance(e.stdout, bytes)
         else e.stdout,
-        e.stderr.decode('utf-8', errors='backslashreplace')
+        e.stderr.decode('utf-8', errors='backslashreplace')  # pyrefly: ignore[bad-argument-type]
         if isinstance(e.stderr, bytes)
         else e.stderr,
         1,
-        action.timeout,
+        action.timeout,  # pyrefly: ignore[bad-argument-type]
         action.max_output_length,
     )
     return f'Command timed out after {action.timeout} seconds.\n\n' + text

@@ -19,7 +19,14 @@
 
 export interface ModelEntry {
 	spec: string;
+	// Server-derived short display name (internal/llm.ShortLabel). Display only:
+	// `spec` is the identity and the value submitted back, and must stay visible
+	// beside the label rather than be replaced by it.
+	label: string;
 	removable: boolean;
+	// Another entry has the same provider spec, differing only by #nickname.
+	// Legal (that is how you relabel an endpoint) but usually a leftover.
+	duplicate: boolean;
 }
 
 export interface ModelMenu {
@@ -49,13 +56,14 @@ export interface RunSummary {
 	created_at: string;
 	workspace: string;
 	workspace_name: string;
-	// CitC-only workspace fields powering the "Open in Cider" pill action and
-	// the "Name workspace" overflow-menu item. Empty for non-CitC backends.
+	// Optional workspace fields, set only by backends that support naming and
+	// editor links; empty otherwise.
 	workspace_kind: 'citc' | 'plain' | 'jj' | 'external' | '';
 	workspace_alias: string; // "" when anonymous
-	workspace_numeric_id: number; // 0 when not CitC
-	cider_url: string; // "" when not openable in Cider (anonymous or non-CitC)
-	llm: string;
+	workspace_numeric_id: number; // 0 when the backend has no numeric id
+	cider_url: string; // "" when the workspace has no editor URL
+	llm: string; // full spec; the tooltip value, and the only form worth copying
+	llm_name: string; // short display label derived from llm (display only)
 	roots: RootInfo[];
 	// Primary-root convenience (autonomous agent if present, else chatbot root).
 	root_session_id: string;
@@ -192,13 +200,14 @@ export interface RunDetail {
 	archived: boolean;
 	workspace: string;
 	workspace_name: string;
-	// CitC-only workspace fields; mirrors RunSummary so the run header (which
-	// uses the same RunCard component) gets the same Open-in-Cider treatment.
+	// Optional workspace fields; mirrors RunSummary so the run header (which
+	// uses the same RunCard component) renders the pill the same way.
 	workspace_kind: 'citc' | 'plain' | 'jj' | 'external' | '';
 	workspace_alias: string;
 	workspace_numeric_id: number;
 	cider_url: string;
-	llm: string;
+	llm: string; // full spec; Overview shows it verbatim
+	llm_name: string; // short display label derived from llm (display only)
 	agent_type: string;
 	system_llm_hq: string;
 	system_llm_fast: string;
@@ -300,7 +309,8 @@ export interface ArtifactAllListing {
 
 // WorkspaceInfo feeds the New-Run workspace control.
 export interface WorkspaceInfo {
-	citc_available: boolean;
+	// Workspace sources this build offers beyond a plain path; empty when none.
+	workspace_modes: string[];
 	server_root: string;
 	recent: string[];
 }

@@ -346,9 +346,9 @@ def main(argv: Sequence[str]) -> None:
     for example, si, so in zip(
         batch, sampling_inputs, sampling_outputs, strict=True
     ):
-      assert len(so) == 1
+      assert len(so) == 1  # pyrefly: ignore[bad-argument-type]
       rewarded_sample = dict(
-          **example, lm_request=si, lm_response=so[0].output_text
+          **example, lm_request=si, lm_response=so[0].output_text  # pyrefly: ignore[bad-index]
       )
       if experiment_helper.is_primary_process():
         result = evaluation.evaluate(example, rewarded_sample['lm_response'])
@@ -359,8 +359,8 @@ def main(argv: Sequence[str]) -> None:
             'Evaluated example %d, which has %d input tokens and generated %d'
             ' output tokens',
             num_past_examples,
-            len(so[0].input_token_ids),
-            len(so[0].output_token_ids),
+            len(so[0].input_token_ids),  # pyrefly: ignore[bad-index]
+            len(so[0].output_token_ids),  # pyrefly: ignore[bad-index]
         )
       num_past_examples += 1
 

@@ -408,7 +408,6 @@ class GetDataSourceTest(absltest.TestCase):
 class MockExperimentConfig:
   """Mock experiment config for testing."""
   dataset: typing.Any
-  validation_dataset: typing.Any = None
   vocab_name: str = 'test_tokenizer'
   seq_len: int = 8
   batch_size: int = 2
@@ -455,11 +454,10 @@ class CreateIterDatasetTest(absltest.TestCase):
   def test_validation_mode_produces_finite_batches(self):
     """Test validation mode produces finite number of batches."""
     ds_config = data_lib.DatasetConfig(source='test_source')
-    config = MockExperimentConfig(
-        dataset=ds_config,
-        validation_dataset=ds_config,
+    config = MockExperimentConfig(dataset=ds_config)
+    dataset = data_lib.create_iter_dataset(
+        config, training=False, ds_config=ds_config
     )
-    dataset = data_lib.create_iter_dataset(config, training=False)
 
     batches = list(dataset)
     self.assertLen(batches, 4)  # 8 examples / batch_size 2
@@ -468,11 +466,10 @@ class CreateIterDatasetTest(absltest.TestCase):
     """Test that batch contents are tokenized correctly."""
     ds_config = data_lib.DatasetConfig(
         source='test_source', add_bos=True, add_eos=True)
-    config = MockExperimentConfig(
-        dataset=ds_config,
-        validation_dataset=ds_config,
+    config = MockExperimentConfig(dataset=ds_config)
+    dataset = data_lib.create_iter_dataset(
+        config, training=False, ds_config=ds_config
     )
-    dataset = data_lib.create_iter_dataset(config, training=False)
 
     batch = next(iter(dataset))
     # First example: 'aaa' -> [97, 97, 97, eos=2]

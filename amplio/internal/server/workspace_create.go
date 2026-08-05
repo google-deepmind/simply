@@ -25,17 +25,17 @@ import (
 
 // handleCreateWorkspace creates a fresh anonymous workspace and returns its
 // absolute path. ONLY accepts `new:` / `anon:` specs — opening an existing
-// workspace (citc-alias, path) is not a "create" operation and stays in
+// workspace (an alias, a path) is not a "create" operation and stays in
 // /api/runs's own resolver call. This split lets the UI render an honest
 // two-stage progress indicator: creation is the slow step (5-30s on the
-// CitC backend); opening is fast and deserves no separate stage.
+// backends that materialize one); opening is fast and needs no separate stage.
 //
 // Callers that want one-shot start (CLI, automation) keep passing the
 // spec directly to POST /api/runs and let the server resolve internally.
 // The two-call flow is purely for UIs that want creation progress
 // visibility.
 //
-// Auth: write-equivalent (creates a CitC worktree), behind requireAuth.
+// Auth: write-equivalent (materializes a workspace), behind requireAuth.
 func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Spec string `json:"spec"`
@@ -48,10 +48,10 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !isCreationSpec(spec) {
 		writeErr(w, http.StatusBadRequest,
 			"only `new:` / `anon:` specs are accepted here; pass other specs "+
-				"(citc:<alias>, paths) directly to POST /api/runs to open them")
+				"(existing workspaces, paths) directly to POST /api/runs to open them")
 		return
 	}
-	// The OS user is still needed locally to resolve a citc workspace, but
+	// The OS user is still needed locally to resolve a named workspace, but
 	// it is no longer recorded on the run itself (single-user amplio).
 	ws, err := resolver.Resolve(spec, os.Getenv("USER"))
 	if err != nil {

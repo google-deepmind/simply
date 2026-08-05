@@ -21,6 +21,7 @@ import tensorboardX
 _HAS_CLU = False
 
 
+import numpy as np
 class BaseMetricWriter(abc.ABC):
   """Base class for metric writers."""
 
@@ -30,6 +31,10 @@ class BaseMetricWriter(abc.ABC):
 
   @abc.abstractmethod
   def write_texts(self, step: int, texts: dict[str, str]) -> None:
+    pass
+
+  @abc.abstractmethod
+  def write_images(self, step: int, images: dict[str, Any]) -> None:
     pass
 
   @abc.abstractmethod
@@ -61,6 +66,27 @@ class TensorboardXMetricWriter(BaseMetricWriter):
         logging.info('writing texts: %s: %s', key, text)
       else:
         self._writer.add_text(key, text, step)
+
+  def write_images(self, step: int, images: dict[str, Any]) -> None:
+    """Writes images to tensorboardX."""
+
+    def _fix_img(img):
+      img = np.array(img)
+      if img.ndim == 2:
+        img = img[None, :, :]
+      elif img.ndim == 3:
+        # [H, W, C] -> [C, H, W]
+        img = np.transpose(img, (2, 0, 1))
+      else:
+        raise ValueError(f'Unsupported image dimension: {img.shape} for {key}')
+      return img
+
+    for key, image in images.items():
+      if self.just_logging:
+        logging.info('writing images: %s: %s', key, image)
+      elif image is not None:
+        # Standardize on [H, W, C] input, so transpose if needed.
+        self._writer.add_image(key, _fix_img(image), step)
 
   def flush(self) -> None:
     self._writer.flush()

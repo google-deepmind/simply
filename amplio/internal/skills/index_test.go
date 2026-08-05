@@ -50,7 +50,7 @@ func (c *countingEmbedder) ModelID() string { return c.inner.ModelID() }
 
 func TestIndex_BuildSearchLoad(t *testing.T) {
 	dir := t.TempDir()
-	writeSkill(t, dir, "blaze", "build run and test code with blaze", "# Blaze\nbody")
+	writeSkill(t, dir, "bazel", "build run and test code with bazel", "# Bazel\nbody")
 	writeSkill(t, dir, "spanner", "query spanner sql databases", "# Spanner\nbody")
 	writeSkill(t, dir, "gmail", "read and send email messages", "# Gmail\nbody")
 	// A directory without a SKILL.md must be ignored, not fatal.
@@ -85,8 +85,8 @@ func TestIndex_BuildSearchLoad(t *testing.T) {
 		t.Fatalf("search hits=%+v, want spanner first", hits)
 	}
 
-	if e, ok := ix.Load("blaze"); !ok || e.Description == "" {
-		t.Fatalf("load blaze: %+v ok=%v", e, ok)
+	if e, ok := ix.Load("bazel"); !ok || e.Description == "" {
+		t.Fatalf("load bazel: %+v ok=%v", e, ok)
 	}
 
 	// A fresh index over the SAME store reuses cached vectors (no re-embed).
@@ -109,7 +109,7 @@ func TestIndex_BuildSearchLoad(t *testing.T) {
 // and let an unstable sort pick arbitrary winners.
 func TestIndex_DegenerateQueryReturnsEmpty(t *testing.T) {
 	dir := t.TempDir()
-	writeSkill(t, dir, "blaze", "build run and test code with blaze", "# Blaze\nbody")
+	writeSkill(t, dir, "bazel", "build run and test code with bazel", "# Bazel\nbody")
 	writeSkill(t, dir, "spanner", "query spanner sql databases", "# Spanner\nbody")
 
 	store, err := sqlite.Open(":memory:")

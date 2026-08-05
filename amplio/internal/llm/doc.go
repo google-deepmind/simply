@@ -14,6 +14,7 @@
 
 // Package llm defines the LLM provider abstraction.
 //
-// Concrete implementations (Anthropic Vertex AI, Beyond API, etc.) live in
+// Concrete implementations (Anthropic Vertex AI, OpenAI, subprocess bridges,
+// etc.) live in
 // sub-packages. The mock provider in this package is for tests.
 package llm

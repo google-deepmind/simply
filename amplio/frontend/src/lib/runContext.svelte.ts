@@ -40,8 +40,8 @@ const STRUCTURAL = new Set([
 	'run_updated',
 	'ephemeral_agents',
 	'observation',
-	// A CitC workspace alias resolving changes RunDetail (alias / cider_url); the
-	// run-detail page must refetch to upgrade the "Open in Cider" pill live (the
+	// A workspace alias resolving changes RunDetail (alias / editor url); the
+	// run-detail page must refetch to upgrade the workspace pill to a link (the
 	// dashboard already refetches on any non-ephemeral event).
 	'workspace_alias',
 	'refetch_all'

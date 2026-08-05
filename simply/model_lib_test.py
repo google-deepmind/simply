@@ -15,7 +15,12 @@
 
 import dataclasses
 import functools
+import math
+import os
+import pathlib
+import tempfile
 from typing import cast
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -24,8 +29,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from simply import config_lib
+from simply import data_lib
 from simply import model_lib
 from simply.utils import common
+from simply.utils import experiment_helper as exp_helper
 from simply.utils import optimizers as opt_lib
 from simply.utils import pytree
 from simply.utils import registry
@@ -239,7 +246,7 @@ class ModelLibTest(parameterized.TestCase):
             [-0.00745952, -0.23477697, 0.95938516, -0.10769912]
         ]
     ]
-    self.assertTrue(np.allclose(np.array(expected_logits), logits, atol=1e-5))
+    np.testing.assert_allclose(np.array(expected_logits), logits, atol=1e-5)
 
   def test_grad_accumulation(self):
     # Generate test data
@@ -384,6 +391,21 @@ class ModelLibTest(parameterized.TestCase):
     print(dim_annotations)
     print('=' * 50)
     self.assertEqual(dim_annotations, expected_dim_annotations)
+
+  def test_embed_linear_output_partition(self):
+    # Verify that output and weight partitions match the sharding config.
+    sharding_config = config_lib.gspmd_sharding()
+    tfm_lm = model_lib.TransformerLM(self.config, sharding_config)
+    self.assertEqual(
+        tfm_lm.embed_linear.weight_partition, sharding_config.embed_partition
+    )
+    self.assertEqual(
+        tfm_lm.embed_linear.output_partition, sharding_config.logits_partition
+    )
+    self.assertEqual(
+        tfm_lm.embed_linear.einsum_linear.output_partition,
+        sharding_config.logits_partition,
+    )
 
   @parameterized.parameters(
       {'activation_dtype_name': 'float8_e4m3fn'},
@@ -553,10 +575,16 @@ class ModelLibTest(parameterized.TestCase):
     mask = jnp.expand_dims(mask, range(1, len(q.shape) - len(mask.shape) + 1))
     output1, _ = model_lib.attn(q, k, v, mask, dtype=jnp.float32)
     output2 = model_lib.chunked_local_attn(
-        q, k, v, mask, window_size=window_size, dtype=jnp.float32
+        q, k, v, mask, window_size=window_size, dtype=jnp.float32  # pyrefly: ignore[bad-argument-type]
     )
     self.assertEqual(output1.shape, q.shape)
     self.assertTrue(np.allclose(output1, output2, atol=1e-5))
+
+  # NOTE: Parity tests for `_chunked_local_flash_attention` live in
+  # `model_lib_multi_device_test.py` because they require
+  # `XLA_FLAGS=--xla_force_host_platform_device_count=4`, which must be set
+  # before JAX initializes its backend and would break the rest of this
+  # suite (which assumes a single device).
 
   @parameterized.parameters(
       {'use_scan': True},
@@ -658,10 +686,10 @@ class ModelLibTest(parameterized.TestCase):
         batch_size=2,
     )
     for so1, so2 in zip(outputs1, outputs2):
-      self.assertEqual(so1.input_token_ids, so2.input_token_ids)
-      self.assertEqual(so1.output_token_ids, so2.output_token_ids)
-      self.assertEqual(so1.input_token_scores, so2.input_token_scores)
-      self.assertEqual(so1.output_token_scores, so2.output_token_scores)
+      self.assertEqual(so1.input_token_ids, so2.input_token_ids)  # pyrefly: ignore[missing-attribute]
+      self.assertEqual(so1.output_token_ids, so2.output_token_ids)  # pyrefly: ignore[missing-attribute]
+      self.assertEqual(so1.input_token_scores, so2.input_token_scores)  # pyrefly: ignore[missing-attribute]
+      self.assertEqual(so1.output_token_scores, so2.output_token_scores)  # pyrefly: ignore[missing-attribute]
 
   def test_lm_interface_generate_without_scoring(self):
     vocab = tokenization.TestVocab([str(i) for i in range(10)])
@@ -716,7 +744,7 @@ class ModelLibTest(parameterized.TestCase):
     )
     text = '1 2 3 4 5 6 7'
     tokens = np.array([vocab.bos_id] + vocab.encode(text)).reshape([1, -1])
-    token_scores = lm_interface.score_tokens(tokens=tokens)
+    token_scores = lm_interface.score_tokens(tokens=tokens)  # pyrefly: ignore[bad-argument-type]
     with jax.disable_jit():
       outputs = lm_interface.generate(
           input_text=text,
@@ -754,7 +782,7 @@ class ModelLibTest(parameterized.TestCase):
     text = '1 2 3'
     tokens = np.array([vocab.bos_id] + vocab.encode(text)).reshape([1, -1])
     token_scores = lm_interface.score_tokens(
-        tokens=tokens, scoring_params=scoring_params
+        tokens=tokens, scoring_params=scoring_params  # pyrefly: ignore[bad-argument-type]
     )
     self.assertLen(token_scores, 3)  # 1 BOS + 3 encoded tokens, thus 3 scores
 
@@ -838,8 +866,8 @@ class ModelLibTest(parameterized.TestCase):
       logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
 
       token_logprobs = sampling_lib.compute_log_likelihood(
-          logits,
-          all_tokens[:, 1:],
+          logits,  # pyrefly: ignore[bad-argument-type]
+          all_tokens[:, 1:],  # pyrefly: ignore[bad-argument-type]
           temperature=sampling_params.temperature,
           top_k=sampling_params.top_k,
           top_p=sampling_params.top_p,
@@ -908,8 +936,8 @@ class ModelLibTest(parameterized.TestCase):
           params, all_tokens[:, :-1], segment_ids=None, segment_positions=None
       )
       token_ll = sampling_lib.compute_log_likelihood(
-          logits,
-          all_tokens[:, 1:],
+          logits,  # pyrefly: ignore[bad-argument-type]
+          all_tokens[:, 1:],  # pyrefly: ignore[bad-argument-type]
           temperature=scoring_params.temperature,
           top_k=scoring_params.top_k,
           top_p=scoring_params.top_p,
@@ -978,8 +1006,8 @@ class ModelLibTest(parameterized.TestCase):
           params, all_tokens[:, :-1], segment_ids=None, segment_positions=None
       )
       token_ll = sampling_lib.compute_log_likelihood(
-          logits,
-          all_tokens[:, 1:],
+          logits,  # pyrefly: ignore[bad-argument-type]
+          all_tokens[:, 1:],  # pyrefly: ignore[bad-argument-type]
           temperature=sampling_params.temperature,
           top_k=sampling_params.top_k,
           top_p=sampling_params.top_p,
@@ -1034,8 +1062,8 @@ class ModelLibTest(parameterized.TestCase):
         all_tokens = np.array([so.input_token_ids + so.output_token_ids])
         logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
         token_ll = sampling_lib.compute_log_likelihood(
-            logits,
-            all_tokens[:, 1:],
+            logits,  # pyrefly: ignore[bad-argument-type]
+            all_tokens[:, 1:],  # pyrefly: ignore[bad-argument-type]
             temperature=sampling_params.temperature,
             top_k=sampling_params.top_k,
             top_p=sampling_params.top_p,
@@ -1107,8 +1135,8 @@ class ModelLibTest(parameterized.TestCase):
         all_tokens = np.array([so.input_token_ids + so.output_token_ids])
         logits, _ = self.tfm_lm.apply(params, all_tokens[:, :-1])
         token_ll = sampling_lib.compute_log_likelihood(
-            logits,
-            all_tokens[:, 1:],
+            logits,  # pyrefly: ignore[bad-argument-type]
+            all_tokens[:, 1:],  # pyrefly: ignore[bad-argument-type]
             temperature=sampling_params.temperature,
             top_k=sampling_params.top_k,
             top_p=sampling_params.top_p,
@@ -1145,7 +1173,7 @@ class ModelLibTest(parameterized.TestCase):
         'decoder_loss_weights': np.ones(shape=(batch_size, seq_len)),
         'decoder_segment_ids': np.ones(shape=(batch_size, seq_len)),
         'decoder_positions': einops.repeat(
-            np.arange(start=0, stop=seq_len), 'l -> b l', b=batch_size),
+            np.arange(start=0, stop=seq_len), 'l -> b l', b=batch_size),  # pyrefly: ignore[no-matching-overload]
     }
     logits1, _ = self.tfm_lm.apply(params, batch['decoder_input_tokens'])
     logits2, _ = self.tfm_lm.apply(
@@ -1188,6 +1216,46 @@ class ModelLibTest(parameterized.TestCase):
         )
     )
     self.assertLen(lm.blocks, 3)
+
+  def test_profiling_xplane_creation(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      with mock.patch.dict(
+          os.environ, {'TEST_UNDECLARED_OUTPUTS_DIR': tmpdir}
+      ):
+        config = lm_test()
+        config = dataclasses.replace(
+            config,
+            num_train_steps=6,
+            profile_steps=(2, 4),
+            dataset=data_lib.DatasetConfig(source='dummy'),
+            should_save_ckpt=False,
+            tb_log_interval=100,
+        )
+
+        batch_size = config.batch_size
+        seq_len = config.seq_len
+        fake_batch = {
+            'decoder_input_tokens': np.zeros(
+                (batch_size, seq_len), dtype=np.int32
+            ),
+            'decoder_target_tokens': np.zeros(
+                (batch_size, seq_len), dtype=np.int32
+            ),
+        }
+
+        def fake_dataset_iter(*args, **kwargs):
+          del args, kwargs
+          while True:
+            yield fake_batch
+
+        with mock.patch.object(
+            data_lib, 'create_iter_dataset', return_value=fake_dataset_iter()
+        ):
+          model_lib.run_experiment(config, experiment_dir='')
+
+        proto_path = list(pathlib.Path(tmpdir).rglob('*.xplane.pb'))
+        msg = f'Expected 1 xplane.pb file, found: {proto_path}'
+        self.assertLen(proto_path, 1, msg=msg)
 
 
 class TestNpArrayQuantizer(tokenization.SimplyVocab[np.ndarray]):
@@ -1243,7 +1311,7 @@ def simple_moe(
     activation_dtype):
   # Use a naive dense MoE implementation to check equivalence.
   params = model_lib.get_raw_arrays(params)
-  router_w = jnp.asarray(params['router']['w'], activation_dtype)
+  router_w = jnp.asarray(params['router']['w'], activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
   router_logits = jnp.einsum('ie,bsi->bse', router_w, inputs)
   router_probs = jax.nn.softmax(router_logits, axis=-1)
   _, selected_indices = jax.lax.top_k(
@@ -1260,12 +1328,12 @@ def simple_moe(
         effective_router_probs, axis=-1, keepdims=True)
   effective_router_probs = jnp.asarray(
       effective_router_probs, dtype=activation_dtype)
-  ffn0_w = jnp.asarray(params['ffn_0']['w'], activation_dtype)
+  ffn0_w = jnp.asarray(params['ffn_0']['w'], activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
   projected_inputs = jnp.einsum('eio,bsi->ebso', ffn0_w, inputs)
   activation_fn = registry.FunctionRegistry.get(ffn_activation)
   if use_gated_activation_in_ffn:
     ffn0_gate_w = jnp.asarray(
-        params['ffn_0_gate']['w'], activation_dtype)
+        params['ffn_0_gate']['w'], activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
     gate = jnp.einsum('eio,bsi->ebso', ffn0_gate_w, inputs)
     middle = (
         jnp.asarray(activation_fn(gate), activation_dtype)
@@ -1275,7 +1343,7 @@ def simple_moe(
     middle = jnp.asarray(
         activation_fn(projected_inputs), activation_dtype
     )
-  ffn1_w = jnp.asarray(params['ffn_1']['w'], activation_dtype)
+  ffn1_w = jnp.asarray(params['ffn_1']['w'], activation_dtype)  # pyrefly: ignore[bad-index, unsupported-operation]
   expert_outputs = jnp.einsum('eio,ebsi->ebso', ffn1_w, middle)
   outputs = jnp.einsum(
       'ebsd,bse->bsd', expert_outputs, effective_router_probs
@@ -1376,14 +1444,14 @@ class MoETest(parameterized.TestCase):
         num_experts=num_experts,
         num_experts_per_token=num_experts_per_token,
         ep_capacity_factor=ep_capacity_factor,
-        ep_method=ep_method,
+        ep_method=ep_method,  # pyrefly: ignore[bad-argument-type]
         ffn_use_bias=False,
         use_gated_activation_in_ffn=use_gated_activation_in_ffn,
         activation_dtype=activation_dtype,
     )
 
     params = moe_ffn.init(prng_key)
-    moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
+    moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)  # pyrefly: ignore[not-iterable]
     simple_moe_fn = functools.partial(
         simple_moe,
         num_experts_per_token=num_experts_per_token,
@@ -1395,12 +1463,12 @@ class MoETest(parameterized.TestCase):
     simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
     self.assertEqual(moe_output.shape, simple_moe_output.shape)
     self.assertEqual(moe_output.dtype, simple_moe_output.dtype)
-    np.testing.assert_allclose(
+    np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
         moe_output, simple_moe_output, rtol=1e-2, atol=1e-2)
 
     def loss1(params, inputs, inputs_mask):
-      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
-      return jnp.sum(moe_output) / (batch_size * seq_len)
+      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)  # pyrefly: ignore[not-iterable]
+      return jnp.sum(moe_output) / (batch_size * seq_len)  # pyrefly: ignore[bad-argument-type]
 
     def loss2(params, inputs, inputs_mask):
       simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
@@ -1498,8 +1566,8 @@ class MoETest(parameterized.TestCase):
     np.testing.assert_allclose(err, jnp.zeros_like(err), atol=1e-2, rtol=0)
 
     def loss1(params, inputs, inputs_mask):
-      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)
-      return jnp.sum(moe_output) / (batch_size * seq_len)
+      moe_output, _ = moe_ffn.apply(params, inputs, inputs_mask=inputs_mask)  # pyrefly: ignore[not-iterable]
+      return jnp.sum(moe_output) / (batch_size * seq_len)  # pyrefly: ignore[bad-argument-type]
 
     def loss2(params, inputs, inputs_mask):
       simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
@@ -1513,6 +1581,203 @@ class MoETest(parameterized.TestCase):
       np.testing.assert_allclose(err, jnp.zeros_like(err), atol=4e-2, rtol=0)
 
     jax.tree.map(check_error, grad1, grad2)
+
+
+def _norm(x):
+  # Mirrors `model_lib.tree_norm`: accepts either a single array (when
+  # called per-leaf via `tree_map`) or a whole pytree (when called as the
+  # global-norm reduction). Flattening covers both cases uniformly.
+  flat = jax.tree_util.tree_leaves(x)
+  return jnp.sqrt(sum([jnp.sum(jnp.square(leaf)) for leaf in flat]))
+
+
+class ClipTreeFnTest(absltest.TestCase):
+  """Regression tests for `model_lib.clip_tree_fn`.
+
+  Pins the fix for the latent bug in which `add_log_info=True` silently
+  flipped clipping behavior from global-norm to per-leaf, even when
+  `clip_local=False`. After the fix, `add_log_info` controls only what
+  lands in `log_dict`; `clip_local` is the sole control of which clipped
+  tree is returned.
+
+  Behavior matrix exercised here:
+
+    | clip_local | add_log_info | returned clipped_tree |
+    | ---------- | ------------ | --------------------- |
+    | False      | False        | global                |
+    | False      | True         | global  <-- pinned    |
+    | True       | False        | per-leaf              |
+    | True       | True         | per-leaf              |
+  """
+
+  def setUp(self):
+    super().setUp()
+    # Two leaves with very different norms so that global-vs-per-leaf
+    # clipping produces visibly different outputs:
+    #   norm(a) = 2.0, norm(b) = sqrt(2*9) = ~4.2426
+    #   global tree norm = sqrt(4 + 18) = sqrt(22) ~= 4.6904
+    self.tree = {
+        'a': jnp.ones(4, dtype=jnp.float32),         # norm = 2.0
+        'b': jnp.ones(2, dtype=jnp.float32) * 3.0,   # norm = ~4.2426
+    }
+    self.threshold = 1.0  # forces a real (>1) scale-down in both modes.
+    self.global_norm = float(_norm(
+        jnp.concatenate([self.tree['a'], self.tree['b']])))
+    self.local_norm_a = float(_norm(self.tree['a']))
+    self.local_norm_b = float(_norm(self.tree['b']))
+    # Sanity: global and per-leaf must scale 'a' differently, otherwise
+    # the test would not actually distinguish the two branches.
+    assert not np.isclose(
+        self.global_norm, self.local_norm_a, atol=1e-6), (
+            self.global_norm, self.local_norm_a)
+
+  def _expected_global(self):
+    scale = self.threshold / self.global_norm
+    return {
+        'a': self.tree['a'] * scale,
+        'b': self.tree['b'] * scale,
+    }
+
+  def _expected_local(self):
+    return {
+        'a': self.tree['a'] * (self.threshold / self.local_norm_a),
+        'b': self.tree['b'] * (self.threshold / self.local_norm_b),
+    }
+
+  def _assert_tree_allclose(self, actual, expected):
+    jax.tree_util.tree_map(
+        lambda a, e: np.testing.assert_allclose(
+            np.asarray(a), np.asarray(e), rtol=1e-5, atol=1e-6),
+        actual, expected)
+
+  def test_clip_tree_fn_global_no_log(self):
+    clipped, log_dict = model_lib.clip_tree_fn(
+        self.tree, name='grad', threshold=self.threshold,
+        fn=_norm, fn_name='norm',
+        clip_local=False, add_log_info=False)
+    self._assert_tree_allclose(clipped, self._expected_global())
+    self.assertEqual(log_dict, {})
+
+  def test_clip_tree_fn_global_with_log(self):
+    # Regression test: pre-fix, `add_log_info=True` silently flipped this
+    # to per-leaf clipping. The fix decouples logging from behavior; the
+    # returned tree must still be the global-norm clip.
+    clipped, log_dict = model_lib.clip_tree_fn(
+        self.tree, name='grad', threshold=self.threshold,
+        fn=_norm, fn_name='norm',
+        clip_local=False, add_log_info=True)
+    self._assert_tree_allclose(clipped, self._expected_global())
+    # Guard against silent regression to per-leaf behavior.
+    expected_local = self._expected_local()
+    self.assertFalse(
+        np.allclose(np.asarray(clipped['a']),
+                    np.asarray(expected_local['a']),
+                    rtol=1e-5, atol=1e-6),
+        'clipped tree must NOT be per-leaf when clip_local=False '
+        '(latent-bug regression).')
+    self.assertCountEqual(
+        log_dict.keys(),
+        ['global_grad_norm', 'local_grad_norm',
+         'global_clipped_grad_norm', 'local_clipped_grad_norm'])
+    # global_grad_norm logs the pre-clip global norm.
+    np.testing.assert_allclose(
+        float(log_dict['global_grad_norm']), self.global_norm,
+        rtol=1e-5, atol=1e-6)
+    # local_grad_norm logs the pre-clip per-leaf norms.
+    np.testing.assert_allclose(
+        float(log_dict['local_grad_norm']['a']), self.local_norm_a,
+        rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        float(log_dict['local_grad_norm']['b']), self.local_norm_b,
+        rtol=1e-5, atol=1e-6)
+    # Post-clip global norm should equal threshold (we clipped to it).
+    np.testing.assert_allclose(
+        float(log_dict['global_clipped_grad_norm']), self.threshold,
+        rtol=1e-5, atol=1e-6)
+
+  def test_clip_tree_fn_local_no_log(self):
+    clipped, log_dict = model_lib.clip_tree_fn(
+        self.tree, name='upd', threshold=self.threshold,
+        fn=_norm, fn_name='norm',
+        clip_local=True, add_log_info=False)
+    self._assert_tree_allclose(clipped, self._expected_local())
+    self.assertEqual(log_dict, {})
+
+  def test_clip_tree_fn_local_with_log(self):
+    clipped, log_dict = model_lib.clip_tree_fn(
+        self.tree, name='upd', threshold=self.threshold,
+        fn=_norm, fn_name='norm',
+        clip_local=True, add_log_info=True)
+    self._assert_tree_allclose(clipped, self._expected_local())
+    self.assertCountEqual(
+        log_dict.keys(),
+        ['global_upd_norm', 'local_upd_norm',
+         'global_clipped_upd_norm', 'local_clipped_upd_norm'])
+    np.testing.assert_allclose(
+        float(log_dict['global_upd_norm']), self.global_norm,
+        rtol=1e-5, atol=1e-6)
+    # Each per-leaf clipped tensor should have post-clip norm == threshold.
+    np.testing.assert_allclose(
+        float(log_dict['local_clipped_upd_norm']['a']), self.threshold,
+        rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        float(log_dict['local_clipped_upd_norm']['b']), self.threshold,
+        rtol=1e-5, atol=1e-6)
+
+
+class ValBpbByteMaskTest(absltest.TestCase):
+  """Tests the loss-weight masking of the bpb byte denominator in run_eval.
+
+  The numerator accumulates nats over loss-weighted tokens only; the denominator
+  must count bytes over the SAME tokens. These tests reproduce the exact masked
+  byte-sum expression used in run_eval and assert:
+    - all-ones loss_weights -> identical to the old non-pad byte count;
+    - masked loss_weights -> denominator excludes the masked non-pad tokens.
+  """
+
+  def _byte_sum(self, token_bytes, targets, loss_weights):
+    """Mirrors run_eval's masked byte accumulation."""
+    token_bytes_jax = jnp.asarray(token_bytes, dtype=jnp.float32)
+    targets = jnp.asarray(targets)
+    if loss_weights is None:
+      byte_mask = (targets != 0).astype(jnp.float32)
+    else:
+      byte_mask = (jnp.asarray(loss_weights) > 0).astype(jnp.float32)
+    return float(jnp.sum(token_bytes_jax[targets] * byte_mask))
+
+  def test_all_ones_loss_weights_matches_nonpad(self):
+    # token id -> byte length; id 0 is pad (0 bytes).
+    token_bytes = [0, 1, 2, 3, 4]
+    targets = [[1, 2, 3, 0], [4, 1, 0, 0]]  # non-pad bytes: 1+2+3 + 4+1 = 11
+    ones = [[1, 1, 1, 1], [1, 1, 1, 1]]
+    nonpad = self._byte_sum(token_bytes, targets, loss_weights=None)
+    with_ones = self._byte_sum(token_bytes, targets, loss_weights=ones)
+    # All-ones weights count every token (including id 0, which has 0 bytes),
+    # so the byte total equals the non-pad total.
+    self.assertEqual(nonpad, 11.0)
+    self.assertEqual(with_ones, 11.0)
+
+  def test_masked_loss_weights_exclude_masked_tokens(self):
+    token_bytes = [0, 1, 2, 3, 4]
+    targets = [[1, 2, 3, 4]]  # all non-pad; bytes 1+2+3+4 = 10
+    # Mask out tokens 2 (2 bytes) and 4 (4 bytes): remaining bytes = 1 + 3 = 4.
+    loss_weights = [[1, 0, 1, 0]]
+    masked = self._byte_sum(token_bytes, targets, loss_weights=loss_weights)
+    unmasked = self._byte_sum(token_bytes, targets, loss_weights=None)
+    self.assertEqual(unmasked, 10.0)
+    self.assertEqual(masked, 4.0)
+    # The masked denominator is strictly smaller when tokens are masked.
+    self.assertLess(masked, unmasked)
+
+  def test_bpb_uses_masked_denominator(self):
+    # End-to-end arithmetic: bpb = nats / (ln2 * masked_bytes).
+    token_bytes = [0, 1, 2, 3, 4]
+    targets = [[1, 2, 3, 4]]
+    loss_weights = [[1, 0, 1, 0]]  # masked bytes = 4
+    masked_bytes = self._byte_sum(token_bytes, targets, loss_weights)
+    total_nats = 8.0  # e.g. 2 loss-weighted tokens * 4 nats/token
+    bpb = total_nats / (math.log(2) * max(masked_bytes, 1.0))
+    self.assertAlmostEqual(bpb, 8.0 / (math.log(2) * 4.0), places=6)
 
 
 if __name__ == '__main__':

@@ -52,15 +52,15 @@ class SamplingLibTest(parameterized.TestCase):
   def test_processed_input_batching(self):
     input1 = sampling_lib.ProcessedInput(
         tokens=[1, 2],
-        extra_inputs={'extra_field': np.ones((1, 3))},
+        extra_inputs={'extra_field': np.ones((1, 3))},  # pyrefly: ignore[bad-argument-type]
     )
     input2 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3, 4],
-        extra_inputs={'extra_field': np.ones((2, 2))},
+        extra_inputs={'extra_field': np.ones((2, 2))},  # pyrefly: ignore[bad-argument-type]
     )
     input3 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3],
-        extra_inputs={'extra_field': np.ones((3, 1))},
+        extra_inputs={'extra_field': np.ones((3, 1))},  # pyrefly: ignore[bad-argument-type]
     )
 
     batch = sampling_lib.ProcessedInputBatch.from_unpadded_inputs(

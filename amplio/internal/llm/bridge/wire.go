@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package subprocess
+package bridge
 
 import (
 	"encoding/json"
@@ -34,6 +34,11 @@ type wireRequest struct {
 	SystemPrompt string        `json:"system_prompt,omitempty"`
 	Messages     []wireMessage `json:"messages"`
 	Tools        []wireTool    `json:"tools,omitempty"`
+	// SessionID is the harness's conversation id, forwarded so a backend can key
+	// cache/routing affinity on it (the Claude provider sends it as
+	// X-Vertex-Ai-Session-Id). Dropping it costs prompt-cache hits, which at
+	// 100k-token prompts is a large fraction of both latency and spend.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 type wireMessage struct {
@@ -81,8 +86,13 @@ type wireResponse struct {
 }
 
 // wireLine is one NDJSON line of the /generate response.
+//
+// Readers must IGNORE unknown types rather than fail: that is what lets the
+// protocol grow (a "ping" keepalive, say) without a flag day between two
+// separately built binaries.
 type wireLine struct {
-	Type          string        `json:"type"` // "delta" | "final" | "error"
+	Type          string        `json:"type"`           // "delta" | "final" | "error" | "ping"
+	Code          string        `json:"code,omitempty"` // error class; see bridge.Error
 	Text          string        `json:"text,omitempty"`
 	Thoughts      string        `json:"thoughts,omitempty"`
 	ToolCallStart *wireTCStart  `json:"tool_call_start,omitempty"`
@@ -113,6 +123,7 @@ func (p *provider) toWire(req llm.Request) wireRequest {
 		MaxTokens:    maxTokens,
 		Temperature:  req.Temperature,
 		SystemPrompt: req.SystemPrompt,
+		SessionID:    req.SessionID,
 	}
 	for _, m := range req.Messages {
 		wm := wireMessage{
@@ -168,4 +179,95 @@ func (l *wireLine) toStreamEvent() llm.StreamEvent {
 		e.ToolCallDelta = &llm.ToolCallDelta{ID: l.ToolCallDelta.ID, ArgumentsDelta: l.ToolCallDelta.ArgumentsDelta}
 	}
 	return e
+}
+
+// --- conversions, serving side ---
+//
+// The inverses of the four above. They live next to their counterparts on
+// purpose: a field added to one direction and forgotten in the other is exactly
+// the bug this protocol exists to avoid, and the pair is far easier to eyeball
+// than a symmetric struct in another file.
+
+func (w *wireRequest) toLLM() llm.Request {
+	req := llm.Request{
+		SystemPrompt: w.SystemPrompt,
+		MaxTokens:    w.MaxTokens,
+		Temperature:  w.Temperature,
+		SessionID:    w.SessionID,
+	}
+	for _, m := range w.Messages {
+		msg := llm.Message{
+			Role:          llm.Role(m.Role),
+			Content:       m.Content,
+			ToolCallID:    m.ToolCallID,
+			IsError:       m.IsError,
+			ProviderExtra: m.ProviderExtra,
+		}
+		for _, tc := range m.ToolCalls {
+			msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
+		}
+		for _, att := range m.Attachments {
+			msg.Attachments = append(msg.Attachments, llm.Attachment{MimeType: att.MimeType, Base64Data: att.Base64Data})
+		}
+		req.Messages = append(req.Messages, msg)
+	}
+	for _, t := range w.Tools {
+		req.Tools = append(req.Tools, llm.ToolDef{Name: t.Name, Description: t.Description, Schema: t.Schema})
+	}
+	return req
+}
+
+func responseToWire(r *llm.Response) *wireResponse {
+	if r == nil {
+		return &wireResponse{}
+	}
+	out := &wireResponse{
+		Content:    r.Content,
+		Thoughts:   r.Thoughts,
+		StopReason: r.StopReason,
+		Usage: wireUsage{
+			PromptTokens:     r.Usage.PromptTokens,
+			CompletionTokens: r.Usage.CompletionTokens,
+			TotalTokens:      r.Usage.TotalTokens,
+			CacheReadTokens:  r.Usage.CacheReadTokens,
+			CacheWriteTokens: r.Usage.CacheWriteTokens,
+		},
+		ProviderExtra: r.ProviderExtra,
+	}
+	for _, tc := range r.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, wireToolCall{ID: tc.ID, Name: tc.Name, Arguments: tc.Arguments})
+	}
+	return out
+}
+
+func eventToWire(e llm.StreamEvent) wireLine {
+	l := wireLine{Type: "delta", Text: e.DeltaText, Thoughts: e.DeltaThoughts}
+	if e.ToolCallStart != nil {
+		l.ToolCallStart = &wireTCStart{ID: e.ToolCallStart.ID, Name: e.ToolCallStart.Name}
+	}
+	if e.ToolCallDelta != nil {
+		l.ToolCallDelta = &wireTCDelta{ID: e.ToolCallDelta.ID, ArgumentsDelta: e.ToolCallDelta.ArgumentsDelta}
+	}
+	return l
+}
+
+// --- embeddings ---
+//
+// Plain JSON in, plain JSON out: there is nothing to stream, and an embedding
+// call either produces every vector or none. A container without model
+// credentials needs this as much as it needs generation — without it, recall
+// (skills and lessons) is simply off.
+
+type wireEmbedRequest struct {
+	// Model is advisory: a bridge serves the embedder it was configured with, and
+	// says so in the response. Sending it lets a caller notice a mismatch rather
+	// than silently mixing two embedding spaces in one index.
+	Model string   `json:"model,omitempty"`
+	Texts []string `json:"texts"`
+}
+
+type wireEmbedResponse struct {
+	Model   string      `json:"model,omitempty"`
+	Vectors [][]float32 `json:"vectors"`
+	Error   string      `json:"error,omitempty"`
 }

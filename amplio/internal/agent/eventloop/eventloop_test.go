@@ -120,7 +120,7 @@ func testSetup(t *testing.T, runCfg ...config.RunConfig) (db.Store, string, *ses
 
 	runReg := runtime.NewRunRegistry()
 	registry := runReg.GetOrCreate(runID)
-	store.SetCommitListener(runtime.NewCommitNotifier(runReg, nil))
+	store.SetCommitListener(runtime.NewCommitNotifier(runReg, nil, nil))
 
 	return store, runID, registry
 }
@@ -198,6 +198,272 @@ func TestEventLoop_WorkThenConclude(t *testing.T) {
 	if assistantEvents != 1 {
 		t.Errorf("assistant events: %d, want 1", assistantEvents)
 	}
+}
+
+// An autonomous agent that ends a turn with NO tool calls AND empty content is
+// nudged back into the loop (a likely-accidental conclusion) instead of
+// concluding on nothing; a substantive next turn then concludes normally.
+func TestEventLoop_EmptyConclusionNudged(t *testing.T) {
+	store, runID, registry := testSetup(t)
+	ctx := context.Background()
+
+	mock := &llm.MockProvider{
+		Model: "test-model",
+		Responses: []llm.Response{
+			{Content: "", StopReason: "end_turn"},                        // accidental: no tools, no text
+			{Content: "Done: the answer is 42.", StopReason: "end_turn"}, // real conclusion
+		},
+	}
+	ag := newT(testCfg{
+		RunID: runID, SessionID: "main-agent", Task: "q",
+		SystemPrompt: "sp", LLM: mock, Store: store, Registry: registry,
+		Tools: []*tool.Tool{}, Workspace: plain.New("/tmp"),
+	})
+	if err := ag.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mock.CallCount() != 2 {
+		t.Errorf("call count = %d, want 2 (one nudge, then conclude)", mock.CallCount())
+	}
+	if n := countNudgeEvents(t, store, runID); n != 1 {
+		t.Errorf("nudge events = %d, want 1", n)
+	}
+	sess, _ := store.GetSession(ctx, runID, "main-agent")
+	if sess.Status != db.SessionConcluded {
+		t.Errorf("status = %q, want concluded", sess.Status)
+	}
+}
+
+// The nudge is only useful if the model actually SEES it. Asserts the shape of
+// the follow-up request: the empty assistant turn is replayed as a non-empty
+// placeholder (providers reject empty assistant messages) and the nudge follows
+// it as a user turn.
+func TestEventLoop_NudgeReachesTheModel(t *testing.T) {
+	store, runID, registry := testSetup(t)
+	ctx := context.Background()
+
+	mock := &llm.MockProvider{
+		Model: "test-model",
+		Responses: []llm.Response{
+			{Content: "", StopReason: "end_turn"},
+			{Content: "Done.", StopReason: "end_turn"},
+		},
+	}
+	ag := newT(testCfg{
+		RunID: runID, SessionID: "main-agent", Task: "q",
+		SystemPrompt: "sp", LLM: mock, Store: store, Registry: registry,
+		Tools: []*tool.Tool{}, Workspace: plain.New("/tmp"),
+	})
+	if err := ag.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recorded := mock.Recorded()
+	if len(recorded) != 2 {
+		t.Fatalf("recorded calls = %d, want 2", len(recorded))
+	}
+	second := recorded[1].Messages
+	var sawPlaceholder, sawNudge bool
+	for _, m := range second {
+		if m.Role == llm.RoleAssistant && m.Content == emptyAssistantPlaceholder {
+			sawPlaceholder = true
+		}
+		if m.Role == llm.RoleUser && m.Content == concludeNudgeText {
+			sawNudge = true
+		}
+		if m.Role == llm.RoleAssistant && m.Content == "" {
+			t.Errorf("an EMPTY assistant message reached the provider; many reject it")
+		}
+	}
+	if !sawPlaceholder {
+		t.Errorf("follow-up request lacks the %q placeholder for the empty turn", emptyAssistantPlaceholder)
+	}
+	if !sawNudge {
+		t.Errorf("follow-up request lacks the nudge; the model can't act on advice it never receives")
+	}
+	// The nudge must be the LAST message: providers require the turn to end on a
+	// user/tool-result message, and it reads as the instruction being answered.
+	if last := second[len(second)-1]; last.Role != llm.RoleUser || last.Content != concludeNudgeText {
+		t.Errorf("last message = %v/%q, want the nudge as a trailing user turn", last.Role, last.Content)
+	}
+}
+
+// Regression, from a real run: after one empty turn the placeholder we project
+// into the context becomes an exemplar, and the model answers with EXACTLY that
+// string. It is not empty, so the naive guard accepted it and the agent
+// "concluded" with the text "(empty response)". An echo must count as empty.
+func TestEventLoop_PlaceholderEchoIsNudged(t *testing.T) {
+	store, runID, registry := testSetup(t)
+	ctx := context.Background()
+
+	mock := &llm.MockProvider{
+		Model: "test-model",
+		Responses: []llm.Response{
+			{Content: emptyAssistantPlaceholder, StopReason: "end_turn"}, // parroted, not authored
+			{Content: "The real answer.", StopReason: "end_turn"},
+		},
+	}
+	ag := newT(testCfg{
+		RunID: runID, SessionID: "main-agent", Task: "q",
+		SystemPrompt: "sp", LLM: mock, Store: store, Registry: registry,
+		Tools: []*tool.Tool{}, Workspace: plain.New("/tmp"),
+	})
+	if err := ag.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := countNudgeEvents(t, store, runID); n != 1 {
+		t.Errorf("nudge events = %d, want 1 (the echo must not pass as a conclusion)", n)
+	}
+	events, err := store.GetEvents(ctx, runID, "main-agent", db.EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := ""
+	for _, rec := range events {
+		if a, ok := rec.Event.(*event.AssistantEvent); ok {
+			last = a.Content
+		}
+	}
+	if last != "The real answer." {
+		t.Errorf("final content = %q, want the run to end on real text", last)
+	}
+}
+
+// A crash between the empty turn and its nudge leaves a no-tool AssistantEvent
+// as the stream tail. On resume the at-rest path concludes without re-calling
+// the LLM — which must NOT silently bypass the accidental-conclusion guard, or
+// the guard is only as reliable as the process staying alive.
+func TestEventLoop_ResumeAtRestEmptyIsNudged(t *testing.T) {
+	store, runID, registry := testSetup(t)
+	ctx := context.Background()
+
+	// Simulate the crashed predecessor: a session whose tail is an EMPTY no-tool
+	// assistant turn, still marked ongoing (status never flipped).
+	if err := store.CreateSession(ctx, db.SessionRecord{
+		RunID: runID, SessionID: "main-agent", AgentType: "standard_agent", Status: db.SessionOngoing,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdvanceStep(ctx, runID, "main-agent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinalizeStep(ctx, runID, "main-agent", 1, []event.Event{
+		&event.UserEvent{Content: "do the thing"},
+		&event.AssistantEvent{Content: "", StopReason: "end_turn"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := &llm.MockProvider{
+		Model:     "test-model",
+		Responses: []llm.Response{{Content: "Actually, here is the result.", StopReason: "end_turn"}},
+	}
+	ag := newT(testCfg{
+		RunID: runID, SessionID: "main-agent", Task: "q",
+		SystemPrompt: "sp", LLM: mock, Store: store, Registry: registry,
+		Tools: []*tool.Tool{}, Workspace: plain.New("/tmp"),
+	})
+	if err := ag.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if mock.CallCount() == 0 {
+		t.Fatalf("the LLM was never called: the resume concluded on the empty turn, bypassing the nudge")
+	}
+	if n := countNudgeEvents(t, store, runID); n != 1 {
+		t.Errorf("nudge events = %d, want 1 on the resume path", n)
+	}
+	sess, _ := store.GetSession(ctx, runID, "main-agent")
+	if sess.Status != db.SessionConcluded {
+		t.Fatalf("status = %q, want concluded", sess.Status)
+	}
+	// And the recovered run ends with real content rather than nothing.
+	events, err := store.GetEvents(ctx, runID, "main-agent", db.EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := ""
+	for _, rec := range events {
+		if a, ok := rec.Event.(*event.AssistantEvent); ok {
+			last = a.Content
+		}
+	}
+	if last != "Actually, here is the result." {
+		t.Errorf("final assistant content = %q, want the post-nudge result", last)
+	}
+}
+
+// The nudge is BOUNDED: a model that keeps emitting empty turns is nudged at
+// most maxConcludeNudges times, then the empty conclusion is allowed through
+// (proves no infinite loop).
+func TestEventLoop_EmptyConclusionNudgeBounded(t *testing.T) {
+	store, runID, registry := testSetup(t)
+	ctx := context.Background()
+
+	// No responses → MockProvider returns an empty turn on every call.
+	mock := &llm.MockProvider{Model: "test-model"}
+	ag := newT(testCfg{
+		RunID: runID, SessionID: "main-agent", Task: "q",
+		SystemPrompt: "sp", LLM: mock, Store: store, Registry: registry,
+		Tools: []*tool.Tool{}, Workspace: plain.New("/tmp"),
+	})
+	if err := ag.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := maxConcludeNudges + 1; mock.CallCount() != want {
+		t.Errorf("call count = %d, want %d (maxConcludeNudges nudges then conclude)", mock.CallCount(), want)
+	}
+	if n := countNudgeEvents(t, store, runID); n != maxConcludeNudges {
+		t.Errorf("nudge events = %d, want %d", n, maxConcludeNudges)
+	}
+	sess, _ := store.GetSession(ctx, runID, "main-agent")
+	if sess.Status != db.SessionConcluded {
+		t.Errorf("status = %q, want concluded", sess.Status)
+	}
+}
+
+// A degenerate assistant turn (empty content, no tool calls) projects to a
+// NON-EMPTY placeholder (Gemini rejects an empty model turn) while PRESERVING
+// ProviderExtra, so thought signatures / thinking blocks still carry over. Turns
+// with content or tool calls are projected unchanged.
+func TestEventToMessage_EmptyAssistantPlaceholder(t *testing.T) {
+	ag := newT(testCfg{SessionID: "main-agent", Workspace: plain.New("/tmp")})
+
+	// Empty content + no tool calls → non-empty placeholder, ProviderExtra kept.
+	msg := ag.eventToMessage(&event.AssistantEvent{
+		Content:       "  ",
+		Thoughts:      "pondered",
+		ProviderExtra: map[string]any{"anthropic.thinking_blocks": []any{"sig"}},
+	})
+	if msg == nil {
+		t.Fatal("empty assistant turn projected to nil (dropped); want a placeholder message")
+	}
+	if msg.Role != llm.RoleAssistant || strings.TrimSpace(msg.Content) == "" {
+		t.Errorf("want non-empty assistant placeholder, got role=%q content=%q", msg.Role, msg.Content)
+	}
+	if msg.ProviderExtra["anthropic.thinking_blocks"] == nil {
+		t.Errorf("ProviderExtra (thought signatures/thinking blocks) must be preserved on the placeholder turn, got %v", msg.ProviderExtra)
+	}
+
+	// A turn with real content is unchanged.
+	if m := ag.eventToMessage(&event.AssistantEvent{Content: "hello"}); m == nil || m.Content != "hello" {
+		t.Errorf("content turn should be preserved verbatim, got %+v", m)
+	}
+	// A turn with tool calls (empty content) is preserved, not placeholdered.
+	m := ag.eventToMessage(&event.AssistantEvent{ToolCalls: []event.ToolCall{{ID: "1", Name: "bash", Arguments: "{}"}}})
+	if m == nil || len(m.ToolCalls) != 1 || m.Content == emptyAssistantPlaceholder {
+		t.Errorf("tool-call turn should be preserved, got %+v", m)
+	}
+}
+
+func countNudgeEvents(t *testing.T, store db.Store, runID string) int {
+	t.Helper()
+	events, _ := store.GetEvents(context.Background(), runID, "main-agent", db.EventFilter{})
+	n := 0
+	for _, e := range events {
+		if u, ok := e.Event.(*event.UserEvent); ok && u.Content == concludeNudgeText {
+			n++
+		}
+	}
+	return n
 }
 
 // bootstrap must persist the configured AgentType, not a hardcoded value, so the

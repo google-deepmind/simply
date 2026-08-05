@@ -36,7 +36,7 @@ def json_to_struct_pb(jtree: common.PyTree) -> struct_pb2.Value:
       res.struct_value.fields[k].CopyFrom(json_to_struct_pb(v))
   elif pytree.tree_is_sequence(jtree):
     res.list_value.SetInParent()
-    for v in jtree:
+    for v in jtree:  # pyrefly: ignore[not-iterable]
       res.list_value.values.append(json_to_struct_pb(v))
   elif jtree is None:
     res.null_value = struct_pb2.NULL_VALUE

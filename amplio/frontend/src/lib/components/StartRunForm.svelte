@@ -40,7 +40,8 @@
 	// button to "Creating workspace…" (which wrapped to a second line).
 	let workspaceSummary = $state('');
 	// Submit goes through two HTTP calls so the UI can show progress per
-	// stage: 'resolving' creates the workspace (slow, ~5-30s for new:citc/*),
+	// stage: 'resolving' creates the workspace (slow, ~5-30s when the backend
+	// has to materialize one),
 	// 'starting' fires the actual run (fast). Idle when nothing in flight.
 	let stage = $state<'idle' | 'resolving' | 'starting'>('idle');
 	const busy = $derived(stage !== 'idle');
@@ -107,9 +108,9 @@
 		error = '';
 		try {
 			// Stage 1 (slow path only): pre-create the workspace when the spec
-			// is `new:` / `anon:`. The backend's CitC creation flow takes
+			// is `new:` / `anon:`. Materializing a workspace takes
 			// 5-30s, so we want a visible "creating" stage. For other specs
-			// (citc-alias, path) the resolve is a fast open — skip the
+			// (an existing workspace, a path) the resolve is a fast open — skip the
 			// pre-create call entirely and let startRun's internal Resolve
 			// handle it in one shot. No fake "creating" flash for sub-second
 			// work.

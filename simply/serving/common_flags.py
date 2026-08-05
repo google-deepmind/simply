@@ -85,6 +85,12 @@ INTERMEDIATE_STEPS = flags.DEFINE_integer(
     'intermediate_steps', 1024, 'Intermediate steps for decoding.'
 )
 
+MAX_NUM_ISSUE_TOKENS = flags.DEFINE_integer(
+    'max_num_issue_tokens',
+    0,
+    'Maximum number of newly-issued tokens dispatched per prefill pass.',
+)
+
 RESPONSE_ASAP = flags.DEFINE_boolean(
     'response_asap',
     False,
@@ -98,3 +104,40 @@ LM_FORMAT = flags.DEFINE_string(
     'LM format to use. If not provided, use the default LM format in the'
     ' experiment config.',
 )
+
+ENABLE_PREFIX_CACHING = flags.DEFINE_boolean(
+    'enable_prefix_caching',
+    False,
+    'When True, enables the page batcher to reuse paged KV cache across'
+    ' requests that share an input prefix. The cache is held in host (CPU)'
+    ' RAM, per-process. False (default) disables the prefix cache entirely.'
+    ' See simply.serving.prefix_cache for details.',
+)
+
+FFN_WEIGHT_QUANT = flags.DEFINE_string(
+    'ffn_weight_quant',
+    None,
+    'FFN (MoE expert) weight-only quantization for decode, fused spec'
+    " '<dtype>[:<block_size>]' (e.g. 'int8', 'int4:128'; '' disables). dtype:"
+    " 'int8' (W8A16) or 'int4' (W4A16); optional block_size is the K-block"
+    ' group size (omitted = per-channel).',
+)
+
+KV_CACHE_QUANT = flags.DEFINE_string(
+    'kv_cache_quant',
+    None,
+    'Low-precision (fp8) paged KV cache for decode. Spec: <dtype>[:<scale>] or'
+    " <dtype>:<k_scale>,<v_scale>. dtype: 'fp8'/'fp8_e4m3' -> float8_e4m3fn,"
+    " 'fp8_e5m2' -> float8_e5m2; '' disables.",
+)
+
+
+def build_launch_args() -> dict[str, object]:
+  """Returns `{flag_name: value}` for every flag defined in this module."""
+  args: dict[str, object] = {}
+  for flag in flags.FLAGS.get_flags_for_module(__name__):
+    value = flag.value
+    if isinstance(value, list):
+      value = ','.join(value) if value is not None else None
+    args[flag.name] = value
+  return args

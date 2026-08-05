@@ -37,6 +37,9 @@ tensorboard --logdir /tmp/exp_1
 
 ### Testing
 ```bash
+# Serving tests need the generated gRPC stubs (one-off, see setup/gen_protos.py)
+pip install ".[serving]" && python setup/gen_protos.py
+
 # Run all tests
 pytest simply/
 
@@ -45,6 +48,10 @@ pytest simply/model_lib_test.py
 
 # Run specific test
 pytest simply/model_lib_test.py::ModelTest::test_forward_pass
+
+# Multi-device tests need their own process: they force 4 CPU devices via
+# XLA_FLAGS, which only takes effect before JAX initializes its backend.
+pytest simply/model_lib_multi_device_test.py
 ```
 
 ## Architecture
@@ -57,6 +64,14 @@ pytest simply/model_lib_test.py::ModelTest::test_forward_pass
 - **rl_lib.py** - RL training components (reward normalization, batching)
 - **tool_lib.py** - Tool use and execution framework
 
+### Subpackages (simply/)
+- **agent/** - Minimal agent harness (Bash tool, context management, LiteLLM)
+- **eval/** - Decode-based evaluation entry points and model backends
+- **kernels/** - Pallas kernels (ragged paged attention, grouped matmul)
+- **serving/** - gRPC serving stack (paged/vanilla servers, batching,
+  KV prefix cache). Stubs are generated from `serving/*.proto`.
+- **tools/** - Offline utilities (checkpoint conversion, dataset serialization)
+
 ### Utilities (simply/utils/)
 - **module.py** - SimplyModule base class with registry pattern
 - **common.py** - AnnotatedArray wrapper for metadata, PyTree types
@@ -64,6 +79,9 @@ pytest simply/model_lib_test.py::ModelTest::test_forward_pass
 - **sharding.py** - Multi-host sharding patterns (FSDP, TP, Expert Parallelism)
 - **sampling_lib.py** - Sampling schedules and input processing
 - **optimizers.py** - Adam, AdamW, SGD with learning rate schedules
+- **moe_lib.py** - MoE routing/dispatch, including pipelined expert parallelism
+- **quant.py** - Quantization helpers (clip-scale search, packing)
+- **sweep.py** - Config overlays and hyperparameter sweep expansion
 
 ### Key Design Patterns
 

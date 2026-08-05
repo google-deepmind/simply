@@ -196,7 +196,7 @@ func parseGeminiArgs(args url.Values) (geminiArgs, error) {
 // NewVertex builds a Gemini provider on the Vertex AI backend, reusing
 // VERTEXAI_PROJECT / VERTEXAI_LOCATION + ADC (the same auth as the embedder and
 // the Claude provider). args are spec `?k=v` thinking/temperature overrides.
-func NewVertex(model string, maxTokens int, args url.Values) (llm.Provider, error) {
+func NewVertex(model string, maxTokens int, _, args url.Values) (llm.Provider, error) {
 	g, err := parseGeminiArgs(args)
 	if err != nil {
 		return nil, err
@@ -222,7 +222,7 @@ func NewVertex(model string, maxTokens int, args url.Values) (llm.Provider, erro
 
 // NewAPIKey builds a Gemini provider on the Developer API backend using
 // GEMINI_API_KEY (falling back to GOOGLE_API_KEY) — the no-GCP, OSS-friendly path.
-func NewAPIKey(model string, maxTokens int, args url.Values) (llm.Provider, error) {
+func NewAPIKey(model string, maxTokens int, _, args url.Values) (llm.Provider, error) {
 	g, err := parseGeminiArgs(args)
 	if err != nil {
 		return nil, err

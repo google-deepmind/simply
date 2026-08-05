@@ -247,6 +247,10 @@ export const api = {
 	// operator viewed it). Single-operator, so the effect is global.
 	markRunSeen: (id: string) =>
 		req<void>(`/runs/${id}`, { method: 'PATCH', body: JSON.stringify({ seen: true }) }),
+	// markRunUnseen puts the badge back, for a run the operator looked at but is
+	// not done with.
+	markRunUnseen: (id: string) =>
+		req<void>(`/runs/${id}`, { method: 'PATCH', body: JSON.stringify({ seen: false }) }),
 	updateRun: (id: string, body: RunUpdate) =>
 		req<void>(`/runs/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 	getSysStat: () => req<SysStat>('/sysstat'),
@@ -259,7 +263,16 @@ export const api = {
 		req<EventDTO[]>(
 			`/runs/${id}/sessions/${sid}/events${step !== undefined ? `?step=${step}` : ''}`
 		),
+	// Every event in an inclusive step range, in ONE request — the log viewer's
+	// "expand all" over a phase (per-step fetching would be N round-trips).
+	getEventsRange: (id: string, sid: string, from: number, to: number) =>
+		req<EventDTO[]>(`/runs/${id}/sessions/${sid}/events?from_step=${from}&to_step=${to}`),
 	getChat: (id: string, sid: string) => req<ChatFeed>(`/runs/${id}/sessions/${sid}/chat`),
+	// Chat projection for an inclusive step range: the read-only log viewer
+	// rendering one phase. Unlike getChat, nothing is rolled up into cards — the
+	// requested range comes back verbatim (and usage is null).
+	getChatRange: (id: string, sid: string, from: number, to: number) =>
+		req<ChatFeed>(`/runs/${id}/sessions/${sid}/chat?from_step=${from}&to_step=${to}`),
 	getTrajectory: (id: string, sid: string) =>
 		req<Trajectory>(`/runs/${id}/sessions/${sid}/trajectory`),
 	getObservations: (id: string, sid: string) =>
@@ -328,13 +341,13 @@ export const api = {
 	// WITHOUT starting a run. Returns ok=false with a diagnostic on failure.
 	testLLM: (spec: string) =>
 		req<TestLLMResult>('/about/test-llm', { method: 'POST', body: JSON.stringify({ spec }) }),
-	// New-Run workspace control: CitC availability, the path to prefill, and the
-	// operator's recent named CitC workspaces (recency-ranked).
+	// New-Run workspace control: the workspace sources this build offers, the
+	// path to prefill, and recent workspaces (recency-ranked).
 	getWorkspaceInfo: () => req<WorkspaceInfo>('/workspaces'),
 	// Create a fresh anonymous workspace from a `new:` / `anon:` spec
-	// (the slow path: 5-30s on the CitC backend). Returns the resolved
+	// (the slow path: 5-30s on backends that materialize one). Returns the resolved
 	// absolute path; the UI then passes that path to startRun. Rejects
-	// non-creation specs (citc-alias, paths) with 400 — for those the UI
+	// non-creation specs (existing workspaces, paths) with 400 — for those the UI
 	// should call startRun directly with the spec and let the server
 	// resolve internally (fast open, no UX value in a separate stage).
 	createWorkspace: (spec: string) =>
@@ -342,17 +355,17 @@ export const api = {
 			method: 'POST',
 			body: JSON.stringify({ spec })
 		}),
-	// Live-check a run's CitC workspace alias by bypassing the cache and
-	// reading .citc/aliases.ascii directly; updates the cache as a side effect
+	// Live-check a run's workspace alias by bypassing the cache and reading the
+	// backend's alias record directly; updates the cache as a side effect
 	// so other tabs converge via the workspace_alias SSE event. Used by the
 	// Name-workspace modal on open to catch out-of-band attaches.
 	checkWorkspaceAlias: (id: string) =>
 		req<{ alias: string; cider_url: string }>(`/runs/${id}/workspace/check-alias`, {
 			method: 'POST'
 		}),
-	// Attach an operator-chosen alias to a run's anonymous CitC workspace via
-	// citc.Undelete and return the Cider URL. 400 on invalid alias; 409 when
-	// the workspace is already named, non-CitC, or CitC rejects the attach.
+	// Attach an operator-chosen alias to a run's unnamed workspace and return
+	// its editor URL. 400 on invalid alias; 409 when the workspace is already
+	// named, unsupported by the backend, or the backend rejects the attach.
 	attachWorkspaceAlias: (id: string, alias: string) =>
 		req<{ alias: string; cider_url: string }>(`/runs/${id}/workspace/alias`, {
 			method: 'POST',

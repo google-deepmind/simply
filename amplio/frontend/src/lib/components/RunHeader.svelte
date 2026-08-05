@@ -56,6 +56,7 @@
 			workspace_numeric_id: detail.workspace_numeric_id,
 			cider_url: detail.cider_url,
 			llm: detail.llm,
+			llm_name: detail.llm_name,
 			roots: [], // not consumed by RunCard
 			root_session_id: root?.session_id ?? '',
 			root_status: root?.status ?? '',

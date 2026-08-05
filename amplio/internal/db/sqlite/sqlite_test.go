@@ -95,10 +95,13 @@ func TestListRuns(t *testing.T) {
 		t.Error("expected hasMore=true")
 	}
 
-	// Offset pagination: skip the first 3, expect the remaining 2.
+	// Keyset pagination: continue after the last run of page 1; expect the
+	// remaining 2.
+	last := runs[len(runs)-1]
 	runs2, hasMore2, err := s.ListRuns(ctx, db.ListRunsOpts{
-		Limit:  10,
-		Offset: 3,
+		Limit:       10,
+		Before:      last.CreatedAt,
+		BeforeRunID: last.RunID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +122,7 @@ func TestListRuns(t *testing.T) {
 }
 
 // Runs list newest-first regardless of the starred flag (starring is a UI
-// filter, not a sort key); offset pagination walks that single global order
+// filter, not a sort key); keyset pagination walks that single global order
 // without duplicates or skips.
 func TestListRunsOrderAndPagination(t *testing.T) {
 	s := openTestStore(t)
@@ -153,17 +156,23 @@ func TestListRunsOrderAndPagination(t *testing.T) {
 		}
 	}
 
-	// Paginate the same ordering: page1(limit2) + page2(offset2) + page3(offset4)
-	// must equal `all` with no dupes/skips.
+	// Paginate the same ordering with the keyset cursor: each page continues after
+	// the previous page's last run. Must equal `all` with no dupes/skips.
 	var paged []string
-	for off := 0; off < 5; off += 2 {
-		p, _, err := s.ListRuns(ctx, db.ListRunsOpts{Limit: 2, Offset: off})
+	var before time.Time
+	var beforeID string
+	for range 10 { // bound the loop; 5 runs / 2 per page = 3 pages
+		p, more, err := s.ListRuns(ctx, db.ListRunsOpts{Limit: 2, Before: before, BeforeRunID: beforeID})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, r := range p {
 			paged = append(paged, r.RunID)
 		}
+		if !more || len(p) == 0 {
+			break
+		}
+		before, beforeID = p[len(p)-1].CreatedAt, p[len(p)-1].RunID
 	}
 	if len(paged) != 5 {
 		t.Fatalf("paged total = %d, want 5", len(paged))
@@ -171,6 +180,49 @@ func TestListRunsOrderAndPagination(t *testing.T) {
 	for i, id := range want {
 		if paged[i] != id {
 			t.Errorf("paged pos %d = %s, want %s", i, paged[i], id)
+		}
+	}
+}
+
+// Keyset pagination is gap/dup-free even when runs share the exact same
+// created_at (down to the millisecond) — the run_id tiebreaker makes the ordering
+// total. This is the case OFFSET pagination handled fine but a created_at-only
+// keyset would skip/duplicate at a page boundary landing on the tie.
+func TestListRuns_KeysetTieBreak(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// 5 runs with an IDENTICAL created_at → every row ties on the sort key.
+	ts := time.Now().UTC()
+	for range 5 {
+		if err := s.CreateRun(ctx, db.RunRecord{RunID: db.NewRunID(), CreatedAt: ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Page through 2 at a time; each run must appear exactly once.
+	seen := map[string]int{}
+	var before time.Time
+	var beforeID string
+	for range 10 { // bound the loop
+		p, more, err := s.ListRuns(ctx, db.ListRunsOpts{Limit: 2, Before: before, BeforeRunID: beforeID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range p {
+			seen[r.RunID]++
+		}
+		if !more || len(p) == 0 {
+			break
+		}
+		before, beforeID = p[len(p)-1].CreatedAt, p[len(p)-1].RunID
+	}
+	if len(seen) != 5 {
+		t.Fatalf("saw %d distinct runs across pages, want 5 (seen=%v)", len(seen), seen)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("run %s returned %d times across pages, want exactly 1", id, n)
 		}
 	}
 }
@@ -377,6 +429,51 @@ func TestAdvanceStepAndCurrentContext(t *testing.T) {
 	all, _ := s.GetEvents(ctx, runID, "s1", db.EventFilter{})
 	if len(all) != 2 {
 		t.Errorf("all events: %d", len(all))
+	}
+}
+
+func TestCountEnvNotices(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	runID := db.NewRunID()
+	_ = s.CreateRun(ctx, db.RunRecord{RunID: runID, CreatedAt: time.Now().UTC()})
+	_ = s.CreateSession(ctx, db.SessionRecord{RunID: runID, SessionID: "s1", Status: db.SessionOngoing, CreatedAt: time.Now().UTC()})
+
+	env := func(body string) *event.MessageEvent {
+		return &event.MessageEvent{Content: body, Sender: "environment (pid=1)", SenderType: event.SenderTypeEnvironment}
+	}
+	// Two env notices at the current step, plus three events that must NOT count:
+	// an agent-to-agent message (same event type, different sender), a user event,
+	// and an assistant turn. The cap is a budget for the environment alone.
+	_, _ = s.AppendEvent(ctx, runID, "s1", env("job done"))
+	_, _ = s.AppendEvent(ctx, runID, "s1", env("other job done"))
+	_, _ = s.AppendEvent(ctx, runID, "s1", &event.MessageEvent{Content: "hi", Sender: "sib", SenderType: event.SenderTypeAgent})
+	_, _ = s.AppendEvent(ctx, runID, "s1", &event.UserEvent{Content: "carry on"})
+	_, _ = s.AppendEvent(ctx, runID, "s1", &event.AssistantEvent{Content: "ok"})
+
+	n, err := s.CountEnvNotices(ctx, runID, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("count = %d, want 2 (only environment messages at the current step)", n)
+	}
+
+	// The budget is per STEP: taking the next turn resets it, which is what makes
+	// the same cap a per-turn allowance on a working session and a lifetime cap on
+	// a finished one (whose step never advances again).
+	if _, err := s.AdvanceStep(ctx, runID, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = s.CountEnvNotices(ctx, runID, "s1"); err != nil || n != 0 {
+		t.Errorf("after AdvanceStep: count = %d, err = %v; want 0", n, err)
+	}
+
+	// An unknown session is 0, not an error: the subselect yields NULL, and the
+	// caller's append reports the missing session on its own terms.
+	if n, err = s.CountEnvNotices(ctx, runID, "nope"); err != nil || n != 0 {
+		t.Errorf("unknown session: count = %d, err = %v; want 0, nil", n, err)
 	}
 }
 
@@ -849,6 +946,22 @@ func TestRunCountsAndStatusFilterAndMarkSeen(t *testing.T) {
 		t.Errorf("updates after mark-seen = %d, want 1", c2.Updates)
 	}
 	check(db.RunFilterUpdates, "run-failed")
+
+	// MarkRunUnseen puts it back: an operator who looked at a run but isn't done
+	// with it finds it again the same way they found it the first time. It must
+	// restore the badge, not merely fail to clear it — last_seen_at rewinds to
+	// created_at, so a NULL (which reads as SEEN here) would do the opposite.
+	if err := s.MarkRunUnseen(ctx, "run-done"); err != nil {
+		t.Fatal(err)
+	}
+	c3, err := s.RunCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Updates != 2 {
+		t.Errorf("updates after mark-unseen = %d, want 2", c3.Updates)
+	}
+	check(db.RunFilterUpdates, "run-done", "run-failed")
 }
 
 // A legacy run with NULL last_seen_at (added by ALTER, never stamped) must not

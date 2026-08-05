@@ -494,20 +494,27 @@ func (s *sqliteStore) ListRuns(ctx context.Context, opts db.ListRunsOpts) ([]db.
 		like := "%" + escapeLike(strings.ToLower(term)) + "%"
 		args = append(args, like, like, like, like)
 	}
+	// Keyset cursor: rows strictly older than (Before, BeforeRunID) in the
+	// (created_at DESC, run_id DESC) ordering. run_id breaks created_at ties so a
+	// page boundary landing on equal timestamps can't skip or duplicate a row
+	// (the OFFSET pagination this replaced did, under concurrent run creation).
+	// Appended last so its placeholders line up with these trailing args.
+	if !opts.Before.IsZero() {
+		wheres = append(wheres, "(created_at < ? OR (created_at = ? AND run_id < ?))")
+		bt := formatTime(opts.Before)
+		args = append(args, bt, bt, opts.BeforeRunID)
+	}
 	if len(wheres) > 0 {
 		query += " WHERE " + strings.Join(wheres, " AND ")
 	}
-	// Newest-first. Offset pagination (below) walks this single global ordering.
-	// Starred runs are surfaced via the "show starred" UI filter, not a pinned
-	// sort order, so they stay in their natural chronological position here.
-	query += " ORDER BY created_at DESC"
+	// Newest-first, with run_id as a stable tiebreaker so the ordering is TOTAL
+	// (required for the keyset cursor above to be gap/dup-free). Starred runs are
+	// surfaced via the "show starred" UI filter, not a pinned sort order, so they
+	// stay in their natural chronological position here.
+	query += " ORDER BY created_at DESC, run_id DESC"
 	if limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, limit+1) // +1 probe for has_more
-		if opts.Offset > 0 {
-			query += " OFFSET ?"
-			args = append(args, opts.Offset)
-		}
 	}
 
 	rows, err := s.sqlDB.QueryContext(ctx, query, args...)
@@ -1182,6 +1189,30 @@ func (s *sqliteStore) GetEventCount(ctx context.Context, runID, sessionID string
 	return count, err
 }
 
+// CountEnvNotices counts the environment notifications already sitting at the
+// session's current step. The step is resolved by subselect inside the same
+// statement rather than read separately, so a concurrent AdvanceStep can't make
+// the count refer to a step that is no longer current. A missing session yields
+// a NULL subselect, hence 0 — the subsequent append reports that properly.
+//
+// Served by idx_event_step (run_id, session_id, step), so this is a ranged
+// count over one step, not a scan of the session.
+func (s *sqliteStore) CountEnvNotices(ctx context.Context, runID, sessionID string) (int, error) {
+	var n int
+	err := s.sqlDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM Event
+		  WHERE run_id = ? AND session_id = ?
+		    AND step = (SELECT current_step FROM Session WHERE run_id = ? AND session_id = ?)
+		    AND json_extract(data, '$.type') = 'message'
+		    AND json_extract(data, '$.sender_type') = ?`,
+		runID, sessionID, runID, sessionID, event.SenderTypeEnvironment,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count env notices: %w", err)
+	}
+	return n, nil
+}
+
 func (s *sqliteStore) GetTailEvent(ctx context.Context, runID, sessionID string) (*db.EventRecord, error) {
 	rows, err := s.sqlDB.QueryContext(ctx,
 		`SELECT run_id, session_id, event_id, step, generation, data, created_at
@@ -1532,6 +1563,24 @@ func (s *sqliteStore) updateRunField(ctx context.Context, query string, value an
 // updates" badge. Deliberately does NOT touch updated_at (seeing a run is not a
 // modification of it) but DOES emit RunUpdated so live dashboards refetch and
 // drop the dot. Single-operator, so last_seen_at is a global fact.
+// MarkRunUnseen rewinds last_seen_at to created_at, which is the state a run
+// nobody has opened is in — so the badge reappears exactly when it would have
+// for a fresh run: on any relevant root status change since the run started.
+//
+// created_at rather than NULL: a NULL last_seen_at reads as SEEN here (legacy
+// rows), so it would clear the badge instead of restoring it.
+func (s *sqliteStore) MarkRunUnseen(ctx context.Context, runID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.sqlDB.ExecContext(ctx,
+		`UPDATE Run SET last_seen_at = created_at WHERE run_id = ?`, runID,
+	); err != nil {
+		return fmt.Errorf("mark run unseen: %w", err)
+	}
+	s.emit(db.RunUpdated{RunID: runID})
+	return nil
+}
+
 func (s *sqliteStore) MarkRunSeen(ctx context.Context, runID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

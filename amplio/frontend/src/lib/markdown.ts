@@ -173,22 +173,37 @@ export function linkifyArtifactPaths(html: string): string {
 // the previewed file's directory.
 const ABSOLUTE_URL_RE = /^([a-z][a-z0-9+.-]*:|\/\/|\/|#)/i;
 
-// resolveArtifactRel resolves a relative URL (from a previewed markdown file)
-// against that file's directory, normalizing . and .. segments, and returns a
-// same-origin /artifacts/raw URL. Any #fragment / ?query is preserved and
-// re-appended. A path that climbs above the artifact root is clamped at the root
-// (the server's os.Root also rejects escapes, so this is belt-and-suspenders).
-function resolveArtifactRel(runId: string, baseDir: string, url: string): string {
+// resolveArtifactPath resolves a relative URL (from a previewed markdown file)
+// against that file's directory, normalizing . and .. segments, into a path
+// relative to the ARTIFACT ROOT. Any #fragment / ?query is split off and
+// returned separately (callers re-append it where it makes sense). A path that
+// climbs above the artifact root is clamped at the root (the server's os.Root
+// also rejects escapes, so this is belt-and-suspenders).
+function resolveArtifactPath(
+	baseDir: string,
+	url: string,
+): { path: string; suffix: string; isDir: boolean } {
 	const hashIdx = url.search(/[?#]/);
 	const suffix = hashIdx >= 0 ? url.slice(hashIdx) : '';
 	const rawPath = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+	const decoded = decodeURIComponent(rawPath);
+	// A trailing slash is the author saying "directory" — it survives neither the
+	// segment walk below nor a join, so capture it first.
+	const isDir = decoded.endsWith('/');
 	const segs = baseDir ? baseDir.split('/') : [];
-	for (const seg of decodeURIComponent(rawPath).split('/')) {
+	for (const seg of decoded.split('/')) {
 		if (seg === '' || seg === '.') continue;
 		if (seg === '..') segs.pop();
 		else segs.push(seg);
 	}
-	return artifactRawUrl(runId, segs.join('/')) + suffix;
+	return { path: segs.join('/'), suffix, isDir };
+}
+
+// resolveArtifactRel is the raw-endpoint form, for embedded media (<img>) that
+// the browser must fetch directly.
+function resolveArtifactRel(runId: string, baseDir: string, url: string): string {
+	const { path, suffix } = resolveArtifactPath(baseDir, url);
+	return artifactRawUrl(runId, path) + suffix;
 }
 
 // rewriteRelativeUrls points a previewed markdown file's RELATIVE img/a URLs at
@@ -206,12 +221,27 @@ function rewriteRelativeUrls(html: string, runId: string, baseDir: string): stri
 	}
 	for (const a of doc.querySelectorAll('a[href]')) {
 		const href = a.getAttribute('href') ?? '';
-		if (href && !ABSOLUTE_URL_RE.test(href)) {
-			a.setAttribute('href', resolveArtifactRel(runId, baseDir, href));
-			// A rewritten link points at a raw file; open it in a new tab rather
-			// than replacing the app.
-			a.setAttribute('target', '_blank');
-			a.setAttribute('rel', 'noopener');
+		if (!href || ABSOLUTE_URL_RE.test(href)) continue;
+		const { path, isDir } = resolveArtifactPath(baseDir, href);
+		// An inter-file link is a link between DOCUMENTS, so it should land in the
+		// viewer, not dump the raw bytes: data-artifact-path is the in-app hook the
+		// artifact browser intercepts (see its artifactLinks action) to open the
+		// target in its own preview pane. A trailing slash marks a directory link.
+		a.setAttribute('data-artifact-path', isDir ? `${path}/` : path);
+		// The href stays a REAL link so ⌘/middle-click still opens a new tab — but
+		// pointed at the artifacts ROUTE, so that tab lands in the viewer too
+		// (previously this was the raw endpoint, i.e. an unrendered file dump).
+		// Directories have no route-level deep link yet, so they open at the root.
+		// The #fragment is dropped: it addresses a heading inside the target
+		// document, which the viewer doesn't (yet) anchor to.
+		a.setAttribute(
+			'href',
+			path && !isDir
+				? `/runs/${runId}/artifacts?file=${encodeURIComponent(path)}`
+				: `/runs/${runId}/artifacts`,
+		);
+		if (!a.getAttribute('title')) {
+			a.setAttribute('title', path ? `${path} — open in the artifact viewer` : 'artifact root');
 		}
 	}
 	return doc.body.innerHTML;

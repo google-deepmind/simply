@@ -19,7 +19,7 @@ package server
 import "amplio/internal/workspace"
 
 // attachCorpWorkspaceMeta is the stub for the OSS build. The internal build
-// (see read_extras_internal.go) populates Alias / NumericID / CiderURL when
-// ws is a CitC workspace; in OSS those fields are always zero and drop out
+// (see read_extras_internal.go) populates Alias / NumericID / CiderURL for
+// backends that provide them; here those fields are always zero and drop out
 // of the JSON via the omitempty tags on the DTO.
 func attachCorpWorkspaceMeta(*workspaceMeta, workspace.Workspace) {}

@@ -184,7 +184,7 @@ def make_eval_data(
   """Returns a PyGrain dataset for evaluation, from Simply experiment config."""
   overrides = {'use_packing': False}
   if config.use_validation_set:
-    overrides['split'] = 'validation'
+    overrides['split'] = 'validation'  # pyrefly: ignore[bad-assignment]
     if config.validation_dataset_name is not None:
       overrides['dataset_name'] = config.validation_dataset_name
     if config.validation_eval_batch_size > 0:

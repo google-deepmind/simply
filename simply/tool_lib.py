@@ -233,8 +233,8 @@ class ToolExecutor:
       cs = sampling_lib.input_as_chunks(sampling_input)
       tokens = lm_interface.input_processor.encode(cs).tokens
       if include_bos_token:
-        return tokens
-      return tokens[1:]
+        return tokens  # pyrefly: ignore[bad-return]
+      return tokens[1:]  # pyrefly: ignore[bad-return]
 
     result_start_tokens = _encode(self.result_start_marker)
     result_end_tokens = _encode(self.result_end_marker)
@@ -245,7 +245,7 @@ class ToolExecutor:
     for num_turn in range(max_turns):
       if not any(is_active_list):
         break
-      prng_key, subkey = jax.random.split(prng_key)
+      prng_key, subkey = jax.random.split(prng_key)  # pyrefly: ignore[bad-argument-type]
       sampling_outputs = lm_interface.generate(
           input_text=running_input_chunks_list,
           prng_key=subkey,
@@ -263,8 +263,8 @@ class ToolExecutor:
         )
 
       # Ensure that each sample contains exactly one output.
-      assert not sampling_outputs or len(sampling_outputs[0]) == 1
-      cur_output_chunks_list = [so[0].output_chunks for so in sampling_outputs]
+      assert not sampling_outputs or len(sampling_outputs[0]) == 1  # pyrefly: ignore[bad-argument-type]
+      cur_output_chunks_list = [so[0].output_chunks for so in sampling_outputs]  # pyrefly: ignore[bad-index]
 
       # For inactive samples, tool execution is skipped using empty string.
       output_for_tool_manager = [
@@ -330,7 +330,7 @@ class ToolExecutor:
         if not tool_text or num_turn >= max_turns - 1 or sequence_is_full:
           is_active_list[i] = False
 
-        combined_chunks = cur_output_chunks + tool_chunks
+        combined_chunks = cur_output_chunks + tool_chunks  # pyrefly: ignore[unsupported-operation]
         if is_active_list[i]:
           combined_chunks += sampling_lib.input_as_chunks(
               assistant_start_marker
@@ -367,7 +367,7 @@ class ToolExecutor:
       )
       logging.info("#Answer mask: %s", str(sum(answer_mask)))
       all_sampling_outputs.append(
-          SamplingOutputToolUse(
+          SamplingOutputToolUse(  # pyrefly: ignore[missing-argument]
               input_chunks=input_chunks,
               input_token_ids=input_token_ids,
               output_chunks=output_chunks,

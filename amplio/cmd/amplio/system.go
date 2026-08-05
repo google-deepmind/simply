@@ -22,10 +22,11 @@ import (
 	"amplio/internal/config"
 	"amplio/internal/db"
 	"amplio/internal/db/sqlite"
+	"amplio/internal/embed"
 	"amplio/internal/eventstream"
 	"amplio/internal/lessons"
 	"amplio/internal/llm"
-	subprocessprovider "amplio/internal/llm/subprocess"
+	bridgeprovider "amplio/internal/llm/bridge"
 	"amplio/internal/observer"
 	"amplio/internal/runtime"
 	"amplio/internal/skills"
@@ -44,6 +45,7 @@ type system struct {
 	obs         *observer.Observer
 	fin         *critic.Finalizer
 	skillIndex  *skills.Index
+	embedder    embed.Embedder
 	lessonIndex *lessons.Index
 	systemHQ    llm.Provider // shared HQ provider (finalizer/observer); reused by serve for the follow-up suggester
 	// cleanup tears down everything setupSystem started, in reverse order:
@@ -102,7 +104,7 @@ func setupSystem(ctx context.Context, cfg config.Config, opts systemOpts) (*syst
 
 	// Recall (skills + lessons) is built before the finalizer/observer so a
 	// freshly-launched or recovered run gets recall immediately.
-	skillIndex, lessonIndex := setupRecall(ctx, mgr, store, cfg)
+	skillIndex, lessonIndex, embedder := setupRecall(ctx, mgr, store, cfg)
 
 	// Report finalizer: shared by the observer (auto trigger on main-agent
 	// conclude) and the operator endpoint. Runs on the shared system-tier HQ
@@ -123,8 +125,8 @@ func setupSystem(ctx context.Context, cfg config.Config, opts systemOpts) (*syst
 	mgr.SetTitleGenerator(makeTitleGenerator(store, systemFast))
 
 	cleanup := func(ctx context.Context) {
-		obs.Stop(ctx)                 // drain final summaries before exit
-		subprocessprovider.Shutdown() // reap any bridge subprocesses
+		obs.Stop(ctx)             // drain final summaries before exit
+		bridgeprovider.Shutdown() // reap any bridge subprocesses
 		_ = store.Close()
 	}
 
@@ -135,6 +137,7 @@ func setupSystem(ctx context.Context, cfg config.Config, opts systemOpts) (*syst
 		obs:         obs,
 		fin:         fin,
 		skillIndex:  skillIndex,
+		embedder:    embedder,
 		lessonIndex: lessonIndex,
 		systemHQ:    systemHQ,
 		cleanup:     cleanup,

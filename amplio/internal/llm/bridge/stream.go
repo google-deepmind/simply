@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package subprocess
+package bridge
 
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -42,7 +43,7 @@ func (s *subStream) Next() bool {
 		}
 		var wl wireLine
 		if err := json.Unmarshal(line, &wl); err != nil {
-			s.err = fmt.Errorf("subprocess: bad protocol line: %w", err)
+			s.err = &Error{Code: CodeProtocol, Message: fmt.Sprintf("bridge: bad protocol line: %s", err)}
 			return false
 		}
 		switch wl.Type {
@@ -55,13 +56,13 @@ func (s *subStream) Next() bool {
 			}
 			return false
 		case "error":
-			s.err = fmt.Errorf("bridge error: %s", wl.Error)
+			s.err = &Error{Code: cmp.Or(wl.Code, CodeProvider), Message: "bridge error: " + wl.Error}
 			return false
 		}
 		// unknown line types are skipped
 	}
 	if err := s.sc.Err(); err != nil {
-		s.err = fmt.Errorf("subprocess: read stream: %w", err)
+		s.err = fmt.Errorf("bridge: read stream: %w", err)
 	}
 	return false
 }

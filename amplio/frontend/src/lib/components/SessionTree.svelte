@@ -26,7 +26,34 @@
 	// session_id (a human nickname). Rows are links to each session's trajectory
 	// so they're bookmarkable / middle-clickable; the parent/child tree is shown
 	// by indentation. No overflow menu — a session row is a pure link.
-	let { runId, sessions }: { runId: string; sessions: SessionDTO[] } = $props();
+	//
+	// Two densities, same markup:
+	//   - "card"     (default): the Overview's list — each row a bordered card with
+	//                the task snippet, workspace chip and step·time meta.
+	//   - "selector": picker duty inside the log viewer — no card chrome, tighter
+	//                rows, meta dropped to `title=`, and the current row lit. Only
+	//                the identity of the session matters there, so ~40% shorter.
+	//
+	// hrefFor lets the caller re-target the rows (the viewer points them at
+	// itself, preserving the current mode); the default is the trajectory view.
+	let {
+		runId,
+		sessions,
+		variant = 'card',
+		selectedId = '',
+		hrefFor
+	}: {
+		runId: string;
+		sessions: SessionDTO[];
+		variant?: 'card' | 'selector';
+		selectedId?: string;
+		hrefFor?: (s: SessionDTO) => string;
+	} = $props();
+
+	const compact = $derived(variant === 'selector');
+	const linkFor = $derived(
+		hrefFor ?? ((s: SessionDTO) => `/runs/${runId}/sessions/${s.session_id}`)
+	);
 
 	const roots = $derived(sessions.filter((s) => !s.parent_id));
 	function childrenOf(id: string) {
@@ -51,7 +78,15 @@
 {#snippet node(s: SessionDTO)}
 	{@const AnimalIcon = iconForName(s.session_id)}
 	<div class="node">
-		<a class="sess card" href="/runs/{runId}/sessions/{s.session_id}">
+		<a
+			class="sess"
+			class:card={!compact}
+			class:compact
+			class:selected={s.session_id === selectedId}
+			aria-current={s.session_id === selectedId ? 'true' : undefined}
+			href={linkFor(s)}
+			title={compact ? `${s.agent_type} · step ${s.current_step} · ${s.task ?? ''}` : undefined}
+		>
 			<span class="titleblock">
 				<span class="identity" class:animal={AnimalIcon} title={s.agent_type}>
 					{#if AnimalIcon}
@@ -63,13 +98,13 @@
 					{/if}
 				</span>
 				<span class="name mono">{s.session_id}</span>
-				{#if s.task}<span class="task" title={s.task}>{s.task}</span>{/if}
+				{#if s.task && !compact}<span class="task" title={s.task}>{s.task}</span>{/if}
 			</span>
-			{#if ownsWorkspace(s)}
+			{#if ownsWorkspace(s) && !compact}
 				<!-- LinkIcon (chain) instead of FolderIcon: the chip only shows
 				     when this sub-agent's workspace DIVERGES from its parent's,
 				     and the dominant cause is `WorkspaceMode = "link"` (linked
-				     CitC worktree on a shared repo). The chain conveys that
+				     linked worktree on a shared repo). The chain conveys that
 				     parent–child relationship; folder would just say "a
 				     directory" without the linkage cue. -->
 				<span class="chip" title={s.workspace}>
@@ -78,9 +113,11 @@
 				</span>
 			{/if}
 			<StatusBadge status={s.status} />
-			<span class="meta dim" title={new Date(s.status_changed_at).toLocaleString()}>
-				step {s.current_step} · {timeAgo(s.status_changed_at)}
-			</span>
+			{#if !compact}
+				<span class="meta dim" title={new Date(s.status_changed_at).toLocaleString()}>
+					step {s.current_step} · {timeAgo(s.status_changed_at)}
+				</span>
+			{/if}
 		</a>
 		{#each childrenOf(s.session_id) as c (c.session_id)}
 			<div class="child">{@render node(c)}</div>
@@ -108,6 +145,25 @@
 		border-color: var(--accent-dim);
 	}
 	.sess:hover .name {
+		color: var(--accent);
+	}
+	/* Selector density: the row is a picker entry, not a card. No border, no fill,
+	   tighter padding. Selection is a soft accent WASH plus an accent name —
+	   deliberately NOT the accent left-bar used by the phase index next to it:
+	   one marker style per screen, or the eye stops reading it as a marker. */
+	.sess.compact {
+		padding: 0.2rem 0.5rem;
+		margin-bottom: 0.1rem;
+		gap: 0.5rem;
+		border-radius: var(--radius-sm);
+	}
+	.sess.compact:hover {
+		background: var(--bg-elev2);
+	}
+	.sess.compact.selected {
+		background: color-mix(in srgb, var(--accent) 12%, transparent);
+	}
+	.sess.compact.selected .name {
 		color: var(--accent);
 	}
 	/* identity icon + name + task fade; consumes the space left of the chips. */

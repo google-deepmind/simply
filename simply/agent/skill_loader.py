@@ -70,8 +70,8 @@ def _load_skill_files(skills_dir: epath.Path) -> list[SkillInfo]:
       content = post.content
       skills.append(
           SkillInfo(
-              name=name,
-              description=description,
+              name=name,  # pyrefly: ignore[bad-argument-type]
+              description=description,  # pyrefly: ignore[bad-argument-type]
               content=content,
               folder_name=entry.name,
           )

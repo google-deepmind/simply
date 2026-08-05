@@ -70,7 +70,7 @@
 </script>
 
 <div class="shell">
-	<RunNav {runId} />
+	<RunNav {runId} sessions={store.detail?.sessions ?? []} />
 	<div class="main">
 		<RunHeader {store} />
 		{#if store.error}<p class="err">{store.error}</p>{/if}

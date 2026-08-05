@@ -15,8 +15,7 @@
 -->
 
 <script lang="ts">
-	// OSS no-op stand-in for the corp Svelte components (CiderIcon,
-	// NameWorkspaceModal, GcertChip). Exported under all three names from
+	// OSS no-op stand-in for the corp Svelte components. Exported under all three names from
 	// ./index.ts with `as any` casts; importers gate rendering on INTERNAL or
 	// field presence so this never actually executes in OSS. Renders nothing.
 </script>

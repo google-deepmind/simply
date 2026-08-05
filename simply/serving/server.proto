@@ -16,11 +16,7 @@ edition = "2024";
 
 package simply;
 
-// copybara:strip_begin
-import 'third_party/py/simply/serving/struct.proto';
-// copybara:strip_end_and_replace_begin
-// import 'simply/serving/struct.proto';
-// copybara:replace_end
+import 'simply/serving/struct.proto';
 
 // The generic service for Simply.
 service SimplyService {

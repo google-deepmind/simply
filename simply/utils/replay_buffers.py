@@ -32,13 +32,13 @@ class ReplayBuffer(Sequence[common.PyTree]):
     self._cursor = 0
     self._rng = np.random.default_rng(seed)
 
-  def __getitem__(
+  def __getitem__(  # pyrefly: ignore[bad-override]
       self, index: int | Sequence[int] | np.ndarray
   ) -> common.PyTree:
     if np.isscalar(index):
-      return self._data[index]
+      return self._data[index]  # pyrefly: ignore[bad-index]
 
-    batch = [self._data[i] for i in index]
+    batch = [self._data[i] for i in index]  # pyrefly: ignore[not-iterable]
     return jax.tree.map(lambda *x: np.stack(x), *batch)
 
   def __len__(self) -> int:
@@ -149,7 +149,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
     self._sum_tree[indices] = weights
     self._min_tree[indices] = weights
 
-  def sample(
+  def sample(  # pyrefly: ignore[bad-override]
       self, batch_size: int, replace: bool = False
   ) -> tuple[common.PyTree, np.ndarray, np.ndarray]:
     indices, weights = self._sample_indices(batch_size, replace=replace)

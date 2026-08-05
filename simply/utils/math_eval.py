@@ -95,8 +95,8 @@ def remove_boxed(s: str) -> str | None:
 
 def extract_boxed_answer(solution: str) -> str | None:
   r"""Extract the answer from inside a LaTeX \\boxed{} command."""
-  solution = last_boxed_only_string(solution)
-  solution = remove_boxed(solution)
+  solution = last_boxed_only_string(solution)  # pyrefly: ignore[bad-assignment]
+  solution = remove_boxed(solution)  # pyrefly: ignore[bad-assignment]
   return solution
 
 
@@ -344,8 +344,8 @@ def _is_frac(expr: str) -> bool:
 def _str_is_int(x: str) -> bool:
   try:
     x = _strip_properly_formatted_commas(x)
-    x = float(x)
-    return abs(x - int(round(x))) <= 1e-7
+    x = float(x)  # pyrefly: ignore[bad-assignment]
+    return abs(x - int(round(x))) <= 1e-7  # pyrefly: ignore[bad-argument-type, unsupported-operation]
   except:  # pylint: disable=bare-except
     return False
 
@@ -383,7 +383,7 @@ def _strip_properly_formatted_commas(expr: str):
 def _normalize(expr: str) -> str:
   """Normalize answer expressions."""
   if expr is None:
-    return None
+    return None  # pyrefly: ignore[bad-return]
 
   # Remove enclosing `\text{}`.
   m = re.search(r'^\\text\{(?P<text>.+?)\}$', expr)

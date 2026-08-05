@@ -286,8 +286,8 @@ class TrajectoryCritique:
       summary = f'(Critique generation failed: {e})'
 
     self.segment_critiques.append(SegmentCritique(
-        start_step=self._pending_start_step,
-        end_step=self._pending_end_step,
+        start_step=self._pending_start_step,  # pyrefly: ignore[bad-argument-type]
+        end_step=self._pending_end_step,  # pyrefly: ignore[bad-argument-type]
         summary=summary,
     ))
 

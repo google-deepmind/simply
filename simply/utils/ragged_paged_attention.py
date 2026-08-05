@@ -29,6 +29,7 @@ import jax.sharding as js
 import numpy as np
 from simply.kernels import ragged_paged_attention as rpa_kernel
 from simply.utils import common
+from simply.utils import quant
 from simply.utils import sampling_lib
 from simply.utils import sharding
 
@@ -53,13 +54,13 @@ def autotune_block_sizes(
   # Increasing this value would shift the attention module from memory bandwidth
   # bound to compute bound, but in the meanwhile, it would cause more padding
   # overhead, given decoding does one-by-one token generation. 32 is a good
-  # emperical trade-off so far.
+  # empirical trade-off so far.
   num_queries_per_block = min(32, max_num_issue_tokens)
   num_combined_kv_heads = rpa_kernel.align_to(
       num_kv_heads * 2, rpa_kernel.get_dtype_packing(dtype)
   )
 
-  # This is an emperical estimation of the DMA issuing/waiting overhead
+  # This is an empirical estimation of the DMA issuing/waiting overhead
   # (non-data-transport cost). It indicates the multiplication of the overhead
   # latency and max HBM->VMEM bandwidth.
   # We assume at each new TPU generation, the overhead latency would be reduced
@@ -118,13 +119,14 @@ class DecodeStateConfig:
   n_kv_heads: int
   per_head_dim: int
   batch_size: int
-  dtype: str
+  dtype: jax.typing.DTypeLike
   max_seq_len: int
   window_size: int | None = None  # self excluded
   head_partition: str | Sequence[str] | None = None
   seq_partition: str | Sequence[str] | None = None
-  num_kv_pages_per_block: int | None = None
-  num_queries_per_block: int | None = None
+  # Per-tensor dequant scales for a low-precision (fp8) cache.
+  k_scale: float | None = None
+  v_scale: float | None = None
 
   @property
   def padded_per_head_dim(self) -> int:
@@ -166,8 +168,8 @@ class DecodeStateConfig:
         window_size=self.window_size,
         head_partition=self.head_partition,
         seq_partition=self.seq_partition,
-        num_kv_pages_per_block=self.num_kv_pages_per_block,
-        num_queries_per_block=self.num_queries_per_block,
+        k_scale=self.k_scale,
+        v_scale=self.v_scale,
     )
 
 
@@ -194,10 +196,10 @@ class DecodeState:
   seq_partition: str | Sequence[str] | None = dataclasses.field(
       default=None, metadata=dict(static=True)
   )
-  num_kv_pages_per_block: int | None = dataclasses.field(
+  k_scale: float | None = dataclasses.field(
       default=None, metadata=dict(static=True)
   )
-  num_queries_per_block: int | None = dataclasses.field(
+  v_scale: float | None = dataclasses.field(
       default=None, metadata=dict(static=True)
   )
 
@@ -299,6 +301,27 @@ class DecodeState:
   @property
   def page_size(self) -> int:
     return self.pages.shape[1]
+
+  @property
+  def chunk_size(self) -> int:
+    """Inject / extract granularity in tokens (`num_shards * page_size`)."""
+    return self.num_shards * self.page_size
+
+  @property
+  def min_num_chunks_for_window(self) -> int:
+    """Smallest #chunks that fully cover this layer's sliding window.
+
+    For a windowed layer this is `ceil(window_size / chunk_size)` --
+    that many consecutive chunks (when freshly injected) saturate the
+    layer's resident window, so any older chunks injected behind them
+    are evicted by `release_for_window` before they can feed into
+    attention. For a global layer (`window_size is None`) this is `0`
+    -- a global layer's window is effectively infinite, so no
+    re-injection of older chunks is needed to displace stale tail KV.
+    """
+    if self.window_size is None:
+      return 0
+    return rpa_kernel.cdiv(self.window_size, self.chunk_size)
 
   @property
   def num_kv_heads(self) -> int:
@@ -506,6 +529,42 @@ class DecodeState:
         num_available_pages=updated_num_available_pages,
     )
 
+  def slot_global_page_indices(
+      self,
+      slot_id: jax.typing.ArrayLike,
+      num_pages: int,
+      start_page: jax.typing.ArrayLike = 0,
+  ) -> jax.Array:
+    """Returns `num_pages` *global* page IDs for a slot, starting at `start_page`.
+
+    `num_pages` must be static (used as `jnp.arange`'s size).
+    `start_page` may be either a static int or a dynamic scalar
+    `jax.Array` — the latter is useful when injecting at a runtime
+    offset (e.g. `kv_lens // page_size`).
+    The result has shape `[num_pages]` and is suitable for indexing into
+    `self.pages`.
+
+    Token position `p` of slot `S` lives on shard `(p // page_size) %
+    num_shards` at the slot's shard-local column `(p // page_size) //
+    num_shards` (see :meth:`insert`). Inverting: page `i` of slot `S`
+    (i.e. covering tokens `[i * page_size, (i + 1) * page_size)`) is at
+    `page_indices[S, i // num_shards] + (i % num_shards) *
+    total_num_pages_per_shard`.
+
+    Args:
+      slot_id: scalar i32 — the batch slot to read page IDs for.
+      num_pages: static number of pages to return (the result length).
+      start_page: static int or dynamic scalar i32 — the first page index.
+
+    Returns:
+      An `[num_pages]` i32 array of global page IDs into `self.pages`.
+    """
+    iota = jnp.arange(num_pages, dtype=jnp.int32) + start_page
+    shard_ids = iota % self.num_shards
+    local_cols = iota // self.num_shards
+    local_indices = self.page_indices[slot_id, local_cols]
+    return local_indices + shard_ids * self.total_num_pages_per_shard
+
   @jax.named_call
   def insert(self, k: jax.Array, v: jax.Array, q_lens: jax.Array) -> Self:
     """Inserts new kv into kv_pages at [kv_lens - q_lens, kv_lens).
@@ -560,6 +619,205 @@ class DecodeState:
     )
     return dataclasses.replace(self, pages=updated_pages)
 
+  @jax.named_call
+  def inject_chunk(
+      self,
+      slot_id: jax.typing.ArrayLike,
+      pages_payload: jax.Array,
+  ) -> Self:
+    """Writes `num_shards * page_size` tokens of pre-formed KV for `slot_id`.
+
+    The payload is token-major: shape `(num_shards * page_size,
+    full_heads, kv_packing, head_dim)`. The leading dim is sharded
+    along the seq axis, so each seq-shard sees its own `page_size`
+    tokens (== one page) of KV.
+
+    Implementation:
+      1. `allocate(q_lens)` reserves `num_shards` pages for
+         `slot_id` (one per shard; advances `kv_lens` and updates
+         `page_indices`).
+      2. A `shard_map` performs one `.at[].set()` (== DUS) per
+         shard, writing that shard's page into its local `pages`
+         buffer at the shard-local column the precondition below pins
+         down. DUS has zero HLO temp scratch (vs. ~2x pages_bytes for
+         the equivalent batched scatter), keeping the inject program's
+         HBM footprint negligible.
+
+    Pre-condition: `kv_lens[slot_id]` (pre-call) is a multiple of
+    `num_shards * page_size` so every shard's freshly-allocated
+    column lines up.
+
+    Args:
+      slot_id: scalar i32 — the batch slot to inject into.
+      pages_payload: `[num_shards * page_size, full_heads, kv_packing,
+        head_dim]` — the pre-paged KV bytes to insert, in token-major
+        order. Sharded `(seq, head, None, None)` so each shard
+        contributes only the `page_size` tokens (one page) it owns.
+
+    Returns:
+      Updated decode state.
+    """
+    page_shape = self.pages.shape[1:]  # (page_size, full_heads, kvp, hd)
+    expected_shape = (self.num_shards * self.page_size,) + page_shape[1:]
+    if pages_payload.shape != expected_shape:
+      raise ValueError(
+          f'pages_payload shape {pages_payload.shape} must equal '
+          f'(num_shards * page_size, full_heads, kv_packing, head_dim) = '
+          f'{expected_shape}.'
+      )
+    chunk_size = self.num_shards * self.page_size
+    bs = self.kv_lens.shape[0]
+    # Recycle any pages that have fallen outside the sliding window
+    # *before* allocating this chunk, mirroring the decode path
+    # (`self.release_for_window().allocate(q.lens)` in
+    # `update_decode_state_and_compute_attn`). Doing it here keeps
+    # `inject_chunk` self-contained: a cached prefix longer than the
+    # window can be injected chunk-by-chunk without the page pool ever
+    # overflowing, and callers don't have to remember to release. It
+    # also compacts `page_indices`, so `kv_lens`, `base_col`, and
+    # `allocate` below all operate on the same (post-release) layout.
+    # No-op when `window_size is None` (all-global model).
+    released = self.release_for_window()
+    # Round `kv_lens` up to the next chunk boundary and append one chunk:
+    # the chunk just injected ends at `(kv_lens // chunk_size + 1) *
+    # chunk_size`. (When `kv_lens` is already chunk-aligned — the
+    # precondition — this is exactly `kv_lens + chunk_size`.)
+    after_len = (released.kv_lens[slot_id] // chunk_size + 1) * chunk_size
+    num_inject_tokens = after_len - released.kv_lens[slot_id]
+    q_lens = (
+        jnp.zeros(bs, dtype=jnp.int32).at[slot_id].set(num_inject_tokens)
+    )
+    new_state = released.allocate(q_lens)
+    # Exploit the precondition that the post-release `kv_lens[slot_id]`
+    # is a multiple of `num_shards * page_size`: `allocate` therefore
+    # wrote into exactly one local column on each shard — the SAME
+    # column index on every shard, namely `base_col`. Each shard's
+    # DUS target is the shard-local page id at that column, read
+    # directly from the (post-release, compacted) `page_indices` with
+    # no global-id math.
+    base_col = released.kv_lens[slot_id] // chunk_size
+    pages_spec = js.PartitionSpec(
+        self.seq_partition, None, self.head_partition, None, None
+    )
+    # The payload's leading dim (num_shards * page_size) is sharded
+    # along seq; each shard sees page_size tokens. No explicit page dim
+    # in the user-facing shape; we acquire it after entering the shard
+    # by reshape.
+    payload_spec = js.PartitionSpec(
+        self.seq_partition, self.head_partition, None, None
+    )
+
+    @jax.shard_map(
+        mesh=js.get_abstract_mesh(),
+        in_specs=(
+            pages_spec,           # pages (full sharded layout)
+            payload_spec,         # pages_payload (page_size tokens per shard)
+            js.PartitionSpec(),   # page_indices (replicated)
+            js.PartitionSpec(),   # base_col (replicated scalar)
+        ),
+        out_specs=pages_spec,
+        check_vma=False,
+    )
+    def _scatter_local(local_pages, local_payload, page_indices, base_col):
+      # `local_payload` has shape (page_size, full_heads, kvp, hd) —
+      # exactly one page's worth, matching `local_pages`' per-page
+      # shape (which is `local_pages.shape[1:]`).
+      # `.at[].set()` with a single dynamic index lowers to DUS —
+      # zero HLO temp scratch.
+      local_pid = page_indices[slot_id, base_col]
+      return local_pages.at[local_pid].set(local_payload)
+
+    new_pages = _scatter_local(
+        new_state.pages, pages_payload, new_state.page_indices, base_col
+    )
+    return dataclasses.replace(new_state, pages=new_pages)
+
+  @jax.named_call
+  def extract_chunk(
+      self,
+      slot_id: jax.typing.ArrayLike,
+      chunk_idx: jax.typing.ArrayLike,
+      position: jax.typing.ArrayLike,
+  ) -> 'SnapshotChunkLeaf':
+    """Reads the `chunk_idx`-th *logical* chunk for `slot_id`.
+
+    The on-device read counterpart of :meth:`inject_chunk`; symmetric
+    with it, this takes a *logical* (absolute) chunk index and maps it to
+    the physical `page_indices` column internally, accounting for any
+    sliding-window compaction.
+
+    `release_for_window` evicts the oldest chunks and compacts
+    `page_indices` left, reducing `kv_lens` to the windowed length. The
+    currently-resident chunks occupy physical columns `[0, kv_lens //
+    chunk_size)` and correspond to the *last* `kv_lens` logical tokens.
+    Given `position` (the logical length, which this windowed state no
+    longer carries), the number of evicted chunks is
+    `(position - kv_lens) // chunk_size`, so:
+
+        base_col = chunk_idx - (position - kv_lens) // chunk_size
+
+    For an all-global layer `kv_lens == position`, so `base_col ==
+    chunk_idx`. A request for an evicted chunk has `base_col < 0`; the
+    returned entry has `available=False` in that case and the payload
+    bytes are unspecified (the shard_map reads physical column
+    `base_col` anyway, which is past the start of `page_indices` and
+    yields stale page ids). Callers must check `available` before
+    relying on the bytes, or call :meth:`SnapshotChunkLeaf.offload` which
+    drops the bytes when `available=False`.
+
+    Implementation: a `shard_map` performs one `page_indices` lookup
+    + one `dynamic_slice` (= DUS-read) per shard, returning the page
+    that shard owns in this chunk. The leading dim of the result
+    (`num_shards * page_size`) is sharded along seq, so each shard
+    contributes only its own `page_size` tokens.
+
+    Args:
+      slot_id: scalar i32 — the batch slot to read from.
+      chunk_idx: scalar i32 — the *logical* (absolute) chunk index.
+      position: scalar i32 — the slot's logical length (number of tokens
+        seen so far), used to recover the evicted-chunk offset.
+
+    Returns:
+      A :class:`SnapshotChunkLeaf` with `payload` shape
+      `[num_shards * page_size, full_heads, kv_packing, head_dim]`
+      sharded `(seq, head, None, None)` — same shape and sharding as
+      the `pages_payload` argument of :meth:`inject_chunk` — and
+      `available` a scalar `bool` array that is `True` iff the
+      requested chunk is still resident in this layer's window
+      (`base_col >= 0`).
+    """
+    evicted_chunks = (
+        jnp.asarray(position, dtype=jnp.int32) - self.kv_lens[slot_id]
+    ) // self.chunk_size
+    base_col = jnp.asarray(chunk_idx, dtype=jnp.int32) - evicted_chunks
+    available = base_col >= 0
+    pages_spec = js.PartitionSpec(
+        self.seq_partition, None, self.head_partition, None, None
+    )
+    out_spec = js.PartitionSpec(
+        self.seq_partition, self.head_partition, None, None
+    )
+
+    @jax.shard_map(
+        mesh=js.get_abstract_mesh(),
+        in_specs=(
+            pages_spec,           # pages (full sharded layout)
+            js.PartitionSpec(),   # page_indices (replicated)
+            js.PartitionSpec(),   # base_col (replicated scalar)
+        ),
+        out_specs=out_spec,
+        check_vma=False,
+    )
+    def _gather_local(local_pages, page_indices, base_col):
+      # `local_pages[local_pid]` is the shard's single page for this
+      # chunk, shape (page_size, full_heads, kvp, hd) — exactly the
+      # local view of the (num_shards * page_size, fh, kvp, hd) output.
+      local_pid = page_indices[slot_id, base_col]
+      return local_pages[local_pid]
+
+    payload = _gather_local(self.pages, self.page_indices, base_col)
+    return SnapshotChunkLeaf(payload=payload, available=available)
+
   @property
   def page_manage_key(self) -> Hashable:
     return (self.total_num_pages, self.page_size, self.window_size)
@@ -574,8 +832,28 @@ class DecodeState:
       mask_value: float | None = None,
       update_kv_cache: bool = True,
       page_manage_cache: MutableMapping[Hashable, Self] | None = None,
+      num_kv_pages_per_block: int | None = None,
+      num_queries_per_block: int | None = None,
   ) -> tuple[Self, jax.Array]:
-    """Updates decode state."""
+    """Updates decode state.
+
+    Args:
+      q: ragged query buffer.
+      k: key buffer.
+      v: value buffer.
+      soft_cap: attention logit soft cap.
+      mask_value: causal-mask fill value.
+      update_kv_cache: if True, write the new K/V into the paged cache.
+      page_manage_cache: optional page-management cache shared across layers.
+      num_kv_pages_per_block: OPTIONAL RPA-kernel KV-block size (in pages). This
+        is a per-call kernel TILING hint, NOT cache state. ``None`` => autotune.
+      num_queries_per_block: OPTIONAL RPA-kernel query block size
+        (``bq_sz``/``bq_csz``) for the MIXED case. This is a per-call kernel
+        TILING hint, NOT cache state. ``None`` => autotune. PREFILL passes the
+        model's configured value (``config.rpa_block_q``); the DECODE stage
+        passes ``1`` (one query token per slot). Changes only the query-block
+        tiling, not the attention math.
+    """
     if update_kv_cache:
       if (
           page_manage_cache is None
@@ -600,7 +878,11 @@ class DecodeState:
         sliding_window=self.window_size + 1 if self.window_size else None,
         update_kv_cache=update_kv_cache,
         soft_cap=soft_cap,
+        k_scale=self.k_scale,
+        v_scale=self.v_scale,
     )
+    k = quant.cast_to_low_precision_float(k, self.dtype, self.k_scale)
+    v = quant.cast_to_low_precision_float(v, self.dtype, self.v_scale)
     if mask_value is not None:
       rpa_kwargs['mask_value'] = mask_value
 
@@ -625,11 +907,8 @@ class DecodeState:
     per_head_dim = q.data.shape[-1]
 
     distribution = jnp.array([0, 0, q.batch_size], dtype=jnp.int32)
-
     seq_partition_size = sharding.get_partition_size(self.seq_partition)
     logging.info('seq_partition_size: %d', seq_partition_size)
-    num_kv_pages_per_block = self.num_kv_pages_per_block
-    num_queries_per_block = self.num_queries_per_block
     if num_kv_pages_per_block is None or num_queries_per_block is None:
       head_partition_size = sharding.get_partition_size(self.head_partition)
       if q.capacity % seq_partition_size != 0:
@@ -639,7 +918,7 @@ class DecodeState:
       num_kv_heads_per_shard = self.num_kv_heads // head_partition_size
       num_q_heads_per_shard = q.data.shape[1] // head_partition_size
       max_num_issue_tokens_per_shard = q.capacity // seq_partition_size
-      num_kv_pages_per_block, num_queries_per_block = autotune_block_sizes(
+      autotuned_bkv, autotuned_bq = autotune_block_sizes(
           num_kv_heads=num_kv_heads_per_shard,
           num_q_heads=num_q_heads_per_shard,
           page_size=self.page_size,
@@ -650,11 +929,26 @@ class DecodeState:
           max_num_issue_tokens=max_num_issue_tokens_per_shard,
           num_shards=seq_partition_size,
       )
-      logging.info(
-          'Autotuned num_kv_pages_per_block: %d, num_queries_per_block: %d',
-          num_kv_pages_per_block,
-          num_queries_per_block,
-      )
+      if num_kv_pages_per_block is None:
+        num_kv_pages_per_block = autotuned_bkv
+        logging.info(
+            'num_kv_pages_per_block=%d (autotuned)', num_kv_pages_per_block
+        )
+      else:
+        logging.info(
+            'num_kv_pages_per_block=%d (caller-supplied)',
+            num_kv_pages_per_block,
+        )
+      if num_queries_per_block is None:
+        num_queries_per_block = autotuned_bq
+        logging.info(
+            'num_queries_per_block=%d (autotuned)', num_queries_per_block
+        )
+      else:
+        logging.info(
+            'num_queries_per_block=%d (caller-supplied)',
+            num_queries_per_block,
+        )
 
     m_block_sizes = (
         num_queries_per_block,
@@ -673,14 +967,8 @@ class DecodeState:
     if seq_partition_size > 1:
       # --- Sharded page path: distribute KV cache pages across shards ---
 
-      rpa_sharded_kwargs = dict(
-          sliding_window=self.window_size + 1 if self.window_size else None,
-          soft_cap=soft_cap,
-          save_residuals=True,
-          update_kv_cache=update_kv_cache,
-      )
-      if mask_value is not None:
-        rpa_sharded_kwargs['mask_value'] = mask_value
+      rpa_sharded_kwargs = rpa_kwargs.copy()
+      rpa_sharded_kwargs['save_residuals'] = True
 
       _row_ids = q.row_ids
 
@@ -855,6 +1143,91 @@ class DecodeState:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class SnapshotChunkLeaf:
+  """One chunk's KV payload for one DecodeState leaf, with availability flag.
+
+  Returned by :meth:`DecodeState.extract_chunk` (one per leaf) and
+  :meth:`SamplingState.extract_chunk` (a pytree, one leaf per
+  DecodeState leaf). The :meth:`offload` / :meth:`onload` pair converts
+  between this carrier form and the bare payload representation the
+  host-RAM prefix cache stores.
+
+  Fields
+    payload: the chunk's KV bytes — a `jax.Array` of shape
+      `[num_shards * page_size, full_heads, kv_packing, head_dim]`
+      sharded `(seq, head, None, None)`. Always concrete-on-device
+      when produced by `extract_chunk` (even when `available=False`,
+      the bytes are garbage but the shape/sharding are real, which is
+      what `offload` uses to build the abstract form).
+    available: a scalar `bool` array. `True` iff the requested chunk
+      is still resident in this layer's sliding window
+      (`base_col >= 0` in :meth:`DecodeState.extract_chunk`).
+      Aliased to `False` for chunks evicted by `release_for_window`.
+  """
+
+  payload: jax.Array
+  available: jax.Array
+
+  def offload(self) -> jax.Array | jax.ShapeDtypeStruct:
+    """Returns the offloaded payload only (no `available` bit).
+
+    * `available=True`  — moves `payload` HBM->host via
+      `jax.device_put` to the same sharding but with `memory_kind`
+      switched to host memory (`pinned_host`, falling back to
+      `unpinned_host` on platforms without pinned host memory). The
+      shard layout is preserved exactly, so every host copies only
+      its own addressable shard — host-local, no collective op.
+    * `available=False` — returns a `jax.ShapeDtypeStruct` describing
+      `payload`'s shape / dtype / sharding (the bytes would be
+      garbage — stale post-eviction HBM — so we don't pay to copy or
+      store them). :meth:`onload` materialises an uninitialised
+      buffer of this shape on the inject path.
+
+    Host-side branching on `available` forces a device->host transfer
+    of the (scalar) bool, so this must NOT be called inside a
+    jit-trace.
+    """
+    if not bool(self.available):
+      return jax.ShapeDtypeStruct(
+          self.payload.shape,
+          self.payload.dtype,
+          sharding=self.payload.sharding,
+      )
+    src_sharding = self.payload.sharding
+    try:
+      host_sharding = src_sharding.with_memory_kind('pinned_host')
+    except ValueError:
+      host_sharding = src_sharding.with_memory_kind('unpinned_host')
+    return jax.device_put(self.payload, host_sharding)
+
+  @staticmethod
+  def onload(payload: jax.Array | jax.ShapeDtypeStruct) -> jax.Array:
+    """Returns the on-device payload (inverse of :meth:`offload`).
+
+    Args:
+      payload: The payload to onload. Can be either:
+        * A host-resident `jax.Array`: moves it host->HBM via `jax.device_put`
+          to the same sharding with `memory_kind` switched to `device`.
+        * A `jax.ShapeDtypeStruct` (offload-time `available=False`):
+          materializes a fresh `jax.lax.empty` buffer of the described
+          shape/dtype, placed on the described sharding. The bytes are
+          uninitialized; safe ONLY when the caller's lookup rule guarantees a
+          real tail of `min_num_chunks_for_window` complete chunks follows, so
+          `release_for_window` evicts these pages before they can feed into
+          attention.
+    """
+    if isinstance(payload, jax.ShapeDtypeStruct):
+      return jax.device_put(
+          jax.lax.empty(payload.shape, dtype=payload.dtype),
+          payload.sharding,
+      )
+    return jax.device_put(
+        payload, payload.sharding.with_memory_kind('device')
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class _StepState:
   step: jax.Array  # i32
   state: 'SamplingState'
@@ -904,7 +1277,7 @@ class SamplingState:
     batch_size = common.reduce_same(attrs['batch_size'])
     max_seq_len = common.reduce_same(attrs['max_seq_len'])
     return cls(
-        prng_key=prng_key,
+        prng_key=prng_key,  # pyrefly: ignore[bad-argument-type]
         decode_state=decode_state,
         tokens=jax.lax.empty((batch_size, max_seq_len), dtype=jnp.int32),
         token_logprobs=jax.lax.empty(
@@ -917,7 +1290,7 @@ class SamplingState:
         max_decode_steps=jax.lax.empty((batch_size,), dtype=jnp.int32),
         input_lens=jnp.zeros(batch_size, dtype=jnp.int32),
         rank=jnp.zeros(batch_size, dtype=jnp.int32),
-        eos_ids=eos_ids,
+        eos_ids=eos_ids,  # pyrefly: ignore[bad-argument-type]
         max_total_num_tokens=max_total_num_tokens,
     )
 
@@ -930,42 +1303,90 @@ class SamplingState:
     return self.tokens.shape[1]
 
   @functools.cached_property
+  def num_shards(self) -> int:
+    """Seq-partition shard count, shared across all DecodeState leaves."""
+    return common.reduce_same(
+        DecodeState.attrs_from_tree(self.decode_state, ['num_shards'])[
+            'num_shards'
+        ]
+    )
+
+  @functools.cached_property
+  def page_size(self) -> int:
+    """KV page size in tokens, shared across all DecodeState leaves."""
+    return common.reduce_same(
+        DecodeState.attrs_from_tree(self.decode_state, ['page_size'])[
+            'page_size'
+        ]
+    )
+
+  @functools.cached_property
+  def chunk_size(self) -> int:
+    """Inject / extract granularity in tokens (`num_shards * page_size`).
+
+    Shared across all DecodeState leaves: each leaf reduces the same
+    `num_shards` and `page_size` via :func:`common.reduce_same`, so
+    this product is well-defined for the whole sampling state.
+    """
+    return self.num_shards * self.page_size
+
+  @functools.cached_property
+  def min_num_chunks_for_window(self) -> int:
+    """Largest `DecodeState.min_num_chunks_for_window` across all leaves.
+
+    Reduces with `max` (not `reduce_same`): different layers may have
+    different `window_size`s in a mixed model (e.g. global + windowed),
+    and what matters for the prefix-cache's lookup rule is the
+    *deepest* windowed tail any layer needs to be fully covered. A
+    layer with no sliding window contributes `0` to the max.
+    Returns `0` if every layer is global (no windowed coverage
+    requirement).
+    """
+    per_leaf = DecodeState.attrs_from_tree(
+        self.decode_state, ['min_num_chunks_for_window']
+    )['min_num_chunks_for_window']
+    return max(per_leaf) if per_leaf else 0
+
+  @functools.cached_property
   def is_pad_seq(self) -> jax.Array:
     """This sequence is a padding sequence, in [batch, 1]."""
     return self.input_lens == 0
 
-  @functools.cached_property
-  def desired_issue_lens(self) -> jax.Array:
+  def desired_issue_lens(self, prefill: bool = False) -> jax.Array:
+    """Desired per-slot issue lens for the next pass."""
     attrs = DecodeState.attrs_from_tree(
         self.decode_state, ['max_available_kv_lens']
     )
     max_available_kv_lens = jnp.min(
         jnp.array(attrs['max_available_kv_lens']), axis=0
     )
+    if prefill:
+      remaining = jnp.maximum(self.input_lens - 1 - self.position, 0)
+    else:
+      remaining = jnp.maximum(
+          self.input_lens
+          - jnp.astype(self.max_decode_steps <= 0, jnp.int32)
+          - self.position,
+          1,
+      )
     return jnp.where(
-        self.has_ended,
-        0,
-        jnp.minimum(
-            max_available_kv_lens,
-            jnp.maximum(
-                self.input_lens
-                - jnp.astype(self.max_decode_steps <= 0, jnp.int32)
-                - self.position,
-                1,
-            ),
-        ),
+        self.has_ended, 0, jnp.minimum(max_available_kv_lens, remaining)
     )
+
+  @functools.cached_property
+  def is_prefilling(self) -> jax.Array:
+    return (~self.has_ended) & (self.position < self.input_lens - 1)
+
+  @functools.cached_property
+  def any_prefilling(self) -> jax.Array:
+    return jnp.any(self.is_prefilling)
 
   @functools.cached_property
   def rank_indices(self) -> jax.Array:
     inner_rank = jnp.where(
         self.is_pad_seq,
         2 * self.batch_size,
-        jnp.where(
-            self.desired_issue_lens == 1,
-            self.rank,
-            self.batch_size + self.rank,
-        ),
+        jnp.where(self.is_prefilling, self.batch_size + self.rank, self.rank),
     )
     return jnp.argsort(inner_rank)
 
@@ -1023,12 +1444,23 @@ class SamplingState:
   def get(
       self, mask: jax.typing.ArrayLike
   ) -> Sequence[Mapping[str, np.typing.ArrayLike]]:
-    """Returns the tokens, logprobs, and scores for the given mask."""
+    """Returns the tokens, logprobs, scores, and truncation flag per slot.
+
+    `truncated` is True iff this slot stopped without sampling an EOS token
+    (i.e. `has_ended` fired via `lens >= max_seq_len` or
+    `lens - input_lens >= max_decode_steps` rather than `reached_eos`).
+    Derived per-slot from `~self.reached_eos`, which is shape `[batch]`.
+
+    Args:
+      mask: Boolean per-slot mask selecting which slots to materialise. Shape
+        `[batch]`; typically `completed_mask` from the batcher.
+    """
     indices = np.flatnonzero(mask)
     lens = np.where(
         np.asarray(self.is_pad_seq), 0, np.asarray(self.position) + 1
     )
     input_lens = np.asarray(self.input_lens)
+    reached_eos = np.asarray(self.reached_eos)
     results = []
     for index in indices:
       results.append(
@@ -1038,6 +1470,7 @@ class SamplingState:
               tokens=np.asarray(self.tokens[index])[: lens[index]],
               logprobs=np.asarray(self.token_logprobs[index])[: lens[index]],
               scores=np.asarray(self.token_scores[index])[: lens[index]],
+              truncated=not bool(reached_eos[index]),
           )
       )
     return results
@@ -1057,18 +1490,70 @@ class SamplingState:
         sampling_state, rank=sampling_state.rank_inv_indices
     )
 
+  def extract_chunk(self, slot_id: int, chunk_idx: int) -> common.PyTree:
+    """Extracts the `chunk_idx`-th *logical* chunk of KV for `slot_id`.
+
+    Companion read for :meth:`DecodeState.inject_chunk` / the
+    page-batcher inject path. The chunk size is fixed at
+    `num_shards * page_size` tokens — the natural inject granularity.
+
+    `chunk_idx` is a *logical* (absolute) chunk index from the sequence
+    start. Each DecodeState leaf maps it to its own physical
+    `page_indices` column (accounting for sliding-window eviction) inside
+    :meth:`DecodeState.extract_chunk`, using `self.position[slot_id]` (the
+    logical length) which the windowed `DecodeState` no longer carries.
+    A leaf reports `available=False` for chunks evicted out of its
+    sliding window; callers MUST treat the corresponding payload bytes
+    as unspecified (or call :meth:`SnapshotChunkLeaf.offload` which drops
+    them).
+
+    The caller is expected to only request chunks whose KV has been
+    computed (`chunk_idx < position // chunk_size`); requesting a
+    chunk past that frontier returns uninitialised bytes regardless of
+    `available`.
+
+    Args:
+      slot_id: scalar i32 — the batch slot.
+      chunk_idx: scalar i32 — the *logical* chunk index.
+
+    Returns:
+      A pytree with the same structure as `self.decode_state`, with
+      each DecodeState leaf replaced by the leaf's
+      :meth:`DecodeState.extract_chunk` result (a
+      :class:`SnapshotChunkLeaf`). No top-level reduction is performed;
+      callers can AND-reduce the per-leaf `available`s host-side to
+      decide whether to cache the chunk (see
+      :meth:`SnapshotChunkLeaf.offload`). The corresponding input tokens
+      are not returned: callers already hold them host-side and use
+      them as the cache key.
+
+    Raises:
+      TypeError: if any leaf in `decode_state` is not a `DecodeState`.
+    """
+    position = self.position[slot_id]
+    is_leaf = lambda x: isinstance(x, DecodeState)
+
+    def _extract(leaf):
+      if not isinstance(leaf, DecodeState):
+        raise TypeError(
+            f'decode_state leaves must be DecodeState; got {type(leaf)}'
+        )
+      return leaf.extract_chunk(slot_id, chunk_idx, position)
+
+    return jax.tree_util.tree_map(_extract, self.decode_state, is_leaf=is_leaf)
+
   @functools.cached_property
   def num_used_tokens(self) -> jax.Array:
     """Returns the number of used tokens."""
     return jnp.sum(self.position, where=~self.is_pad_seq, initial=0)
 
-  @jax.jit(static_argnames=('capacity',))
+  @jax.jit(static_argnames=('capacity', 'prefill'))
   @jax.named_call
-  def issue_lens(self, capacity: int) -> jax.Array:
-    """Returns the issue lens."""
-    sorted_desired_issue_lens = self.desired_issue_lens[self.rank_indices]
+  def issue_lens(self, capacity: int, prefill: bool = False) -> jax.Array:
+    """Clamps the `prefill`-selected desired issue lens to `capacity`."""
+    desired_issue_lens = self.desired_issue_lens(prefill)
+    sorted_desired_issue_lens = desired_issue_lens[self.rank_indices]
 
-    # 1. Input length constraint.
     cum_sorted_issue_lens = jnp.minimum(
         jnp.cumulative_sum(sorted_desired_issue_lens, include_initial=True),
         capacity,
@@ -1097,10 +1582,12 @@ class SamplingState:
     return sorted_issue_lens[self.rank_inv_indices]
 
   @jax.named_call
-  def ragged_issue_tokens(self, capacity: int) -> common.RaggedArray:
+  def ragged_issue_tokens(
+      self, capacity: int, prefill: bool = False
+  ) -> common.RaggedArray:
     """Returns the ragged issue tokens."""
     # follows priority, and do not issue when oversubscriped.
-    issue_lens = self.issue_lens(capacity)
+    issue_lens = self.issue_lens(capacity, prefill=prefill)
     ragged_buffer = common.RaggedArray(
         data=jax.lax.empty((capacity,), dtype=self.tokens.dtype),
         lens=issue_lens,
@@ -1199,11 +1686,17 @@ class SamplingState:
       scoring_temperature: float = 1.0,
       scoring_top_k: int = -1,
       scoring_top_p: float = 1.0,
+      prefill: bool = False,
+      skip_logits: bool = False,
   ) -> Self:
     """Executes a mixed step (prefill+decode)."""
+    if skip_logits and not prefill:
+      raise ValueError('skip_logits is only valid for prefill')
     # User should guarantee self.is_continuable is True.
     # logits: [batch_size, 1, vocab_size]
-    ragged_issue_tokens = self.ragged_issue_tokens(max_num_issue_tokens)
+    ragged_issue_tokens = self.ragged_issue_tokens(
+        max_num_issue_tokens, prefill=prefill
+    )
 
     # segment_ids == 0 means padding.
     segment_ids = jnp.where(
@@ -1218,8 +1711,8 @@ class SamplingState:
     )
     if extra_inputs is None:
       extra_inputs = {}
-    extra_inputs['lens'] = ragged_issue_tokens.lens
-    extra_inputs['page_manage_cache'] = {}
+    extra_inputs['lens'] = ragged_issue_tokens.lens  # pyrefly: ignore[unsupported-operation]
+    extra_inputs['page_manage_cache'] = {}  # pyrefly: ignore[unsupported-operation]
 
     logits, extra_output = forward_fn(
         params,
@@ -1230,35 +1723,41 @@ class SamplingState:
         decode_state=self.decode_state,
     )
 
-    prng_key, key = jax.random.split(self.prng_key, 2)
-    # output_tokens: [batch_size, 1], output_logprobs: [batch_size, 1]
-    output_tokens, output_logprobs = sampling_lib.sample_from_logits(
-        key, logits, temperature=temperature, top_k=top_k, top_p=top_p
-    )
-
     next_tokens = self.tokens[
         ragged_issue_tokens.row_ids, segment_positions + 1
     ]
-    output_tokens = jnp.where(
-        segment_positions + 1 >= self.input_lens[ragged_issue_tokens.row_ids],
-        output_tokens,
-        next_tokens,
-    )
-    output_scores = sampling_lib.compute_log_likelihood(
-        logits,
-        output_tokens,
-        temperature=scoring_temperature,
-        top_k=scoring_top_k,
-        top_p=scoring_top_p,
-    )
+    if skip_logits:
+      prng_key = self.prng_key
+      output_tokens = next_tokens  # [capacity]
+      output_logprobs = jnp.zeros_like(next_tokens, dtype=jnp.float32)
+      output_scores = jnp.zeros_like(next_tokens, dtype=jnp.float32)
+    else:
+      # Split the prng only on a sampling (decode/mixed) pass.
+      prng_key, key = jax.random.split(self.prng_key, 2)
+      # output_tokens: [1, capacity], output_logprobs: [1, capacity]
+      output_tokens, output_logprobs = sampling_lib.sample_from_logits(
+          key, logits, temperature=temperature, top_k=top_k, top_p=top_p
+      )
+      output_tokens = jnp.where(
+          segment_positions + 1 >= self.input_lens[ragged_issue_tokens.row_ids],
+          output_tokens,
+          next_tokens,
+      )
+      output_scores = sampling_lib.compute_log_likelihood(
+          logits,
+          output_tokens,
+          temperature=scoring_temperature,
+          top_k=scoring_top_k,
+          top_p=scoring_top_p,
+      )
+      output_tokens = einops.rearrange(output_tokens, '1 l -> l')
+      output_logprobs = einops.rearrange(output_logprobs, '1 l -> l')
+      output_scores = einops.rearrange(output_scores, '1 l -> l')
 
     sampling_state = self.update_with_ragged_output(
-        RaggedArray(
-            einops.rearrange(output_tokens, '1 l -> l'),
-            ragged_issue_tokens.lens,
-        ),
-        token_logprobs=einops.rearrange(output_logprobs, '1 l -> l'),
-        token_scores=einops.rearrange(output_scores, '1 l -> l'),
+        RaggedArray(output_tokens, ragged_issue_tokens.lens),
+        token_logprobs=output_logprobs,
+        token_scores=output_scores,
     )
 
     return dataclasses.replace(

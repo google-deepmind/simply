@@ -80,7 +80,7 @@ class Categorical(Distribution):
   def sample(
       self, key: jax.typing.ArrayLike, shape: Shape | None = None
   ) -> Array:
-    return jax.random.categorical(key, self.logits, shape=shape)
+    return jax.random.categorical(key, self.logits, shape=shape)  # pyrefly: ignore[bad-argument-type]
 
   def prob(self, value: Array) -> Array:
     return jnp.exp(self.log_prob(value))
@@ -103,7 +103,7 @@ class MaskedCategorical(Categorical):
 
   @functools.cached_property
   def masked_logits(self) -> Array:
-    return masked.masked(self.logits, self.mask, padding_value=self.neg_inf)
+    return masked.masked(self.logits, self.mask, padding_value=self.neg_inf)  # pyrefly: ignore[bad-argument-type]
 
   @functools.cached_property
   def masked_log_probs(self) -> Array:
@@ -112,7 +112,7 @@ class MaskedCategorical(Categorical):
   def sample(
       self, key: jax.typing.ArrayLike, shape: Shape | None = None
   ) -> Array:
-    return jax.random.categorical(key, self.masked_logits, shape=shape)
+    return jax.random.categorical(key, self.masked_logits, shape=shape)  # pyrefly: ignore[bad-argument-type]
 
   def prob(self, value: Array) -> Array:
     return jnp.exp(self.log_prob(value))

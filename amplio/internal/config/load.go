@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -28,19 +29,41 @@ import (
 // <data-dir>/config.toml. Go is the single source of truth: DefaultConfig holds
 // the fallback values and the TOML file overrides only the keys it sets.
 type Config struct {
-	Listen        string       `toml:"listen"`          // HTTP bind address for `serve`
-	DB            string       `toml:"db"`              // sqlite path; defaults to <data-dir>/amplio.db
-	Token         string       `toml:"token"`           // web auth token; random per `serve` when empty
-	SystemLLMHQ   string       `toml:"system_llm_hq"`   // observer phase summaries / reports (server-level)
-	SystemLLMFast string       `toml:"system_llm_fast"` // observer step summaries (server-level)
-	EmbedModel    string       `toml:"embed_model"`     // Vertex embedding model (skills + lessons recall)
-	Run           RunDefaults  `toml:"run"`             // defaults applied to new runs
-	Skills        SkillsConfig `toml:"skills"`          // skill corpus sources
+	Listen        string      `toml:"listen"`          // HTTP bind address for `serve`
+	DB            string      `toml:"db"`              // sqlite path; defaults to <data-dir>/amplio.db
+	Token         string      `toml:"token"`           // web auth token; random per `serve` when empty
+	SystemLLMHQ   string      `toml:"system_llm_hq"`   // observer phase summaries / reports (server-level)
+	SystemLLMFast string      `toml:"system_llm_fast"` // observer step summaries (server-level)
+	EmbedModel    string      `toml:"embed_model"`     // Vertex embedding model (skills + lessons recall)
+	Run           RunDefaults `toml:"run"`             // defaults applied to new runs
+	// Bridge names LLM bridge endpoints, so a spec can say WHICH link
+	// (bridge{endpoint=corp}:model) instead of repeating where it is and which
+	// variable holds its token. Read at startup like everything else here:
+	// moving a bridge means editing this and restarting, which is the right
+	// trade for something that changes rarely.
+	Bridge map[string]BridgeEndpoint `toml:"bridge"`
+	// LendLLM is the bind address for the LLM lending listener, e.g.
+	// "127.0.0.1:26760". Empty (the default) disables lending entirely.
+	//
+	// A SEPARATE listener, not a route on the main one.
+	LendLLM string `toml:"lend_llm"`
+	// LendLLMTokenEnv names the variable holding the bearer token the lending
+	// listener requires. Its own secret.
+	LendLLMTokenEnv string       `toml:"lend_llm_token_env"`
+	Skills          SkillsConfig `toml:"skills"` // skill corpus sources
 	// AmplioBinPaths are directories prepended to $PATH at startup so amplio's
 	// shipped 1p CLI tools (e.g. web_search) resolve by bare name for both our
 	// probes and the agent's bash subprocesses. Omitted → the built-in default;
 	// explicit empty list → none.
 	AmplioBinPaths []string `toml:"amplio_bin_paths"`
+}
+
+// BridgeEndpoint is one [bridge.<name>] section: how to reach a bridge. What to
+// ASK IT FOR stays in the spec — this table is only ever about the link.
+type BridgeEndpoint struct {
+	URL         string `toml:"url"`          // https://host:port, http://…, or unix:///path
+	TokenEnv    string `toml:"token_env"`    // variable holding the bearer token
+	IdleTimeout string `toml:"idle_timeout"` // default for this link; a spec may override
 }
 
 // SkillsConfig is the [skills] section: where to scan for SKILL.md files.
@@ -143,13 +166,22 @@ func Load(dataDir string) (Config, error) {
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		// No file: defaults only.
+		// Defaults only — legitimate when everything comes from flags or the
+		// environment, but say so: a missing file and a missing KEY otherwise
+		// produce the same "missing required config" error, and the usual cause
+		// is a data dir that isn't the one being edited (an unexpanded ~ in
+		// --data-dir makes a literal "~" directory).
+		slog.Warn("no config file; using defaults", "path", path)
 	case err != nil:
 		return Config{}, fmt.Errorf("read config %s: %w", path, err)
 	default:
 		if err := toml.Unmarshal(data, &cfg); err != nil {
 			return Config{}, fmt.Errorf("parse config %s: %w", path, err)
 		}
+	}
+	cfg.DB = expandTilde(cfg.DB)
+	for i, d := range cfg.Skills.Dirs {
+		cfg.Skills.Dirs[i] = expandTilde(d)
 	}
 	if cfg.DB == "" {
 		cfg.DB = filepath.Join(dataDir, "amplio.db")
@@ -196,6 +228,9 @@ func Resolve(dataDir string, o Overrides) (Config, error) {
 	} else if env, ok := os.LookupEnv(EnvSkillDirs); ok {
 		cfg.Skills.Dirs = filepath.SplitList(env)
 	}
+	for i, d := range cfg.Skills.Dirs {
+		cfg.Skills.Dirs[i] = expandTilde(d) // also covers the flag and env forms
+	}
 
 	// Required: the system tiers drive the process-global observer/finalizer and
 	// reactive compaction; without them the run-hosting modes can't function.
@@ -208,7 +243,6 @@ func Resolve(dataDir string, o Overrides) (Config, error) {
 	return cfg, nil
 }
 
-// firstNonEmpty returns the first non-empty string, or "" if all are empty.
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {

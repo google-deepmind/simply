@@ -15,10 +15,14 @@
 package bash
 
 import (
+	"amplio/internal/config"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -176,5 +180,67 @@ func TestBash_BoundedRead(t *testing.T) {
 	// marker), not 100 KB.
 	if len(result.Content) > 4000 {
 		t.Errorf("result not bounded: %d bytes", len(result.Content))
+	}
+}
+
+// A tool that prompts must fail fast, not hang. Stdin is /dev/null, but the
+// conventional way to prompt when stdin is redirected is to open /dev/tty — and
+// before the child was given its own session it inherited the terminal running
+// `amplio serve`, so prompts appeared in the operator's window and blocked
+// forever ("Valid responses: y, yes, n, no", repeatedly, for days).
+func TestBash_NoControllingTerminal(t *testing.T) {
+	// Bounded by the test itself, not by execute's timeout: if /dev/tty is
+	// reachable the child blocks on it, and a bash reading the terminal from a
+	// background process group gets SIGTTIN and STOPS rather than dying — so the
+	// call can outlive its own timeout and hang the whole suite. Fail instead.
+	done := make(chan string, 1)
+	go func() {
+		done <- execute(context.Background(), `read -p "Continue? [y/n] " x < /dev/tty; echo "read-exit=$?"`,
+			t.TempDir(), nil, 5*time.Second, 4096)
+	}()
+	select {
+	case out := <-done:
+		if strings.Contains(out, "timed out") {
+			t.Errorf("the prompt blocked until the command timeout; /dev/tty is still reachable:\n%s", out)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("prompt never returned: the child still has a controlling terminal")
+	}
+}
+
+// A timeout must reap the whole process group. Killing only the shell leaves its
+// children running: that is how one hung command becomes a permanent orphan.
+func TestBash_TimeoutKillsChildren(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "alive")
+	// The backgrounded child outlives the shell and would keep touching the file.
+	execute(context.Background(),
+		`( while true; do touch `+marker+`; sleep 0.2; done ) & sleep 30`,
+		t.TempDir(), nil, 1*time.Second, 4096)
+	time.Sleep(300 * time.Millisecond)
+	_ = os.Remove(marker)
+	time.Sleep(700 * time.Millisecond) // long enough for two more touches
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("a child survived the timeout: the process group was not killed")
+	}
+}
+
+// The environment an agent's subprocess sees encodes who is told about what:
+// a narrow notifier on PATH for everyone, the CLI behind a variable the system
+// prompt never mentions.
+func TestAgentEnv_EntryPoints(t *testing.T) {
+	env := agentEnv("run-1", "sess-1")
+	get := func(k string) string {
+		for _, kv := range env {
+			if strings.HasPrefix(kv, k+"=") {
+				return strings.TrimPrefix(kv, k+"=")
+			}
+		}
+		return ""
+	}
+	exe, _ := os.Executable()
+	// Kept, deprecated: scripts and agents already written against it must keep
+	// working, which is what lets `amplio-notify` have a single clean interface.
+	if got := get(config.EnvNotify); got != exe {
+		t.Errorf("%s = %q, want the binary %q (still needed by in-flight scripts)", config.EnvNotify, got, exe)
 	}
 }

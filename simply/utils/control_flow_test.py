@@ -63,7 +63,7 @@ class ControlFlowTest(absltest.TestCase):
     )
     prng_key = jax.random.PRNGKey(0)
     params = f.init(prng_key)
-    output, extra = f.apply(params, x=0.0, y=jnp.array([10, 20]), z=5)
+    output, extra = f.apply(params, x=0.0, y=jnp.array([10, 20]), z=5)  # pyrefly: ignore[bad-argument-type, not-iterable]
     self.assertEqual(output, 30)
     self.assertEqual(
         jax.tree.map(lambda x: x.tolist(), extra), {'v': [15.0, 35.0]}

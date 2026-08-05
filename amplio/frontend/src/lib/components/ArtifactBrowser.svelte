@@ -58,7 +58,19 @@
 		// to embed its Artifacts close-toggle directly in the breadcrumb row, so the
 		// same button occupies the same spot whether it's showing "Status" or the
 		// browser).
-		toolbarEnd
+		toolbarEnd,
+		// Called whenever the previewed file changes ("" = selection cleared), with
+		// HOW it changed. The full-page route uses this to keep ?file= in sync so the
+		// Back button works; `via` lets it choose push vs replace, which is the
+		// difference between usable history and 30 entries of arrow-key scanning:
+		//   click    a file row or search result   → deliberate, push
+		//   link     a relative link in a preview  → deliberate, push
+		//   keyboard arrow-stepping the list       → scanning, replace
+		//   browse   changed directory, no file    → not a document, replace
+		//   restore  driven BY the URL / the host  → already reflected, replace
+		// The component itself stays URL-agnostic — the chat side panel passes no
+		// handler and must never touch the address bar.
+		onSelect
 	}: {
 		runId: string;
 		initialFile?: string;
@@ -67,7 +79,11 @@
 		onExpand?: (file: string) => void;
 		expandBase?: string;
 		toolbarEnd?: import('svelte').Snippet;
+		onSelect?: (file: string, via: 'click' | 'keyboard' | 'link' | 'browse' | 'restore') => void;
 	} = $props();
+
+	// How a selection change came about; drives the host's history policy.
+	type NavVia = 'click' | 'keyboard' | 'link' | 'browse' | 'restore';
 
 	let path = $state(''); // subpath under the artifact root ("" = root)
 	let root = $state(''); // absolute artifact dir (for copy-path)
@@ -82,7 +98,7 @@
 		selectedFile = selected;
 	});
 
-	let previewKind = $state<'none' | 'image' | 'text' | 'markdown' | 'binary'>('none');
+	let previewKind = $state<'none' | 'image' | 'text' | 'markdown' | 'binary' | 'missing'>('none');
 	let previewText = $state('');
 	let copied = $state('');
 
@@ -182,8 +198,14 @@
 	}
 
 	// Preview a file by its FULL subpath (dir-independent, so deep-linking works).
-	async function previewPath(full: string, size: number | null) {
+	// `via` is passed straight through to onSelect (see the prop docs).
+	async function previewPath(full: string, size: number | null, via: NavVia = 'click') {
 		selected = full;
+		// Treat every selection as "the initial file is now this", so a host echoing
+		// it back through the initialFile prop (the route writing ?file= after our
+		// own onSelect) is recognised as already-applied and doesn't re-fetch.
+		lastInitial = full;
+		onSelect?.(full, via);
 		previewText = '';
 		copied = '';
 		const name = full.slice(full.lastIndexOf('/') + 1);
@@ -200,6 +222,13 @@
 			const res = await fetch(artifactRawUrl(runId, full), { cache: 'no-store' });
 			const text = await res.text();
 			if (selected !== full) return; // a newer selection won the race
+			// A 404/500 body is the API's JSON error, not file content — rendering it
+			// as the "file" is worse than saying nothing. Reachable now that markdown
+			// links can point at a stale path (agents rename and delete files).
+			if (!res.ok) {
+				previewKind = 'missing';
+				return;
+			}
 			previewText = text;
 			previewKind = MD_EXT.includes(ext(name)) ? 'markdown' : 'text';
 		} catch {
@@ -223,35 +252,41 @@
 	function openEntry(e: ArtifactEntry) {
 		if (e.is_dir) {
 			path = join(path, e.name);
-			selected = '';
-			previewKind = 'none';
+			clearSelection('browse');
 			return;
 		}
-		previewPath(join(path, e.name), e.size);
+		previewPath(join(path, e.name), e.size, 'click');
 	}
 
 	function goCrumb(i: number) {
 		path = crumbs.slice(0, i + 1).join('/');
+		clearSelection('browse');
+	}
+
+	// Drop the preview (browsing a directory selects no file). Reported like any
+	// other selection change so the route can drop ?file= from the URL.
+	function clearSelection(via: NavVia) {
 		selected = '';
+		lastInitial = '';
 		previewKind = 'none';
+		onSelect?.('', via);
 	}
 
 	// Deep-select a file by full subpath: browse to its parent dir and preview it.
-	// Shared by the initialFile effect (mount-time seed) and the exported openFile
-	// (imperative re-open from the host, e.g. a repeat artifact-pill click).
-	function deepSelect(f: string) {
+	// Shared by the initialFile effect (mount-time seed), the exported openFile
+	// (imperative re-open from the host, e.g. a repeat artifact-pill click) and
+	// relative links inside a markdown preview.
+	function deepSelect(f: string, via: NavVia = 'click') {
 		if (!f) return;
 		const slash = f.lastIndexOf('/');
 		path = slash < 0 ? '' : f.slice(0, slash);
-		void previewPath(f, null);
+		void previewPath(f, null, via);
 	}
 
 	// Click a search result: deep-select the file (browse to its dir + preview).
-	// Keeps the search open so the user can pick another match; lastInitial is
-	// synced so a later identical initialFile prop won't re-trigger a deep-select.
-	function openSearchResult(f: string) {
-		lastInitial = f;
-		deepSelect(f);
+	// Keeps the search open so the user can pick another match.
+	function openSearchResult(f: string, via: NavVia = 'click') {
+		deepSelect(f, via);
 	}
 
 	// The navigable FILE subpaths in the current list mode (dirs excluded), in the
@@ -276,7 +311,9 @@
 			next = Math.max(0, Math.min(navFiles.length - 1, cur + delta));
 		}
 		if (next === cur) return false;
-		openSearchResult(navFiles[next]); // deep-selects + previews (works in both modes)
+		// 'keyboard': stepping the list is scanning, not navigating — the route
+		// replaces the history entry instead of stacking one per file.
+		openSearchResult(navFiles[next], 'keyboard'); // deep-selects + previews (both modes)
 		return true;
 	}
 
@@ -316,24 +353,63 @@
 	// fires on a genuinely NEW prop value (not a re-open of the same file).
 	let lastInitial = $state('');
 
+	// Relative links inside a previewed markdown file (`[notes](sub/notes.md)`)
+	// open IN the viewer instead of navigating away to the raw bytes. The rendered
+	// HTML reaches the DOM through {@html}, so per-link Svelte handlers aren't
+	// possible: renderMarkdown tags each resolved link with data-artifact-path (see
+	// rewriteRelativeUrls) and ONE delegated listener on the preview body covers
+	// them all.
+	//
+	// Modified clicks (⌘/ctrl/shift/alt, middle button) fall through to the
+	// browser so "open in a new tab" keeps working — the href points at the
+	// artifacts route, so that tab lands in the viewer too.
+	function artifactLinks(node: HTMLElement) {
+		const onClick = (e: MouseEvent) => {
+			if (e.defaultPrevented || e.button !== 0) return;
+			if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+			const a = (e.target as HTMLElement | null)?.closest?.('a[data-artifact-path]');
+			if (!a) return;
+			e.preventDefault();
+			const target = a.getAttribute('data-artifact-path') ?? '';
+			if (!target) {
+				path = '';
+				clearSelection('browse');
+			} else if (target.endsWith('/')) {
+				// Directory link: browse into it; there's nothing to preview.
+				path = target.slice(0, -1);
+				clearSelection('browse');
+			} else {
+				deepSelect(target, 'link'); // switches the listing to its dir + previews it
+			}
+		};
+		node.addEventListener('click', onClick);
+		return { destroy: () => node.removeEventListener('click', onClick) };
+	}
+
 	// Imperative open, callable by the host via bind:this. Unlike the initialFile
 	// prop (which only reacts to a CHANGED value), this always (re)selects — so a
 	// host can re-open the SAME file even when the browser has since navigated to a
 	// different one (the repeat-pill-click case). Exported = part of the component
 	// API when the parent binds a ref.
 	export function openFile(f: string) {
-		lastInitial = f;
-		deepSelect(f);
+		// 'restore': the host asked for this file, so it already knows — no new
+		// history entry (the chat panel passes no onSelect at all).
+		deepSelect(f, 'restore');
 	}
 
 	// Imperative open at the artifact ROOT (no file selected). Used by the chat
 	// view's root chip (a bare $AMPLIO_ARTIFACT_DIR folder mention). lastInitial is
 	// cleared so a later initialFile='' prop can't be mistaken for a new deep-select.
 	export function openRoot() {
-		lastInitial = '';
 		path = '';
-		selected = '';
-		previewKind = 'none';
+		clearSelection('restore');
+	}
+
+	// Drop the preview but STAY in the current directory. The full-page route calls
+	// this when history moves back to a URL with no ?file= — openRoot() would also
+	// yank the listing to the artifact root, which isn't what Back meant.
+	export function clearPreview() {
+		clearSelection('restore');
 	}
 
 	// Deep-select initialFile on mount / when it changes to a new value (a fresh
@@ -348,10 +424,9 @@
 	$effect(() => {
 		const f = initialFile;
 		untrack(() => {
-			if (f && f !== lastInitial) {
-				lastInitial = f;
-				deepSelect(f);
-			}
+			// 'restore': this selection came FROM the URL / the host, so reporting it
+			// back must not stack a history entry (the route no-ops on a match).
+			if (f && f !== lastInitial) deepSelect(f, 'restore');
 		});
 	});
 
@@ -611,10 +686,11 @@
 				{:else if previewKind === 'markdown'}
 					<!-- Authored .md files soft-wrap at ~80 cols; render with standard
 					     paragraph reflow (breaks:false) so source wraps aren't hard <br>s.
-					     resolveArtifacts rewrites the file's RELATIVE img/link URLs to the
-					     artifact-raw endpoint (so embedded images/plots and inter-file
-					     links resolve against the artifact dir, not the page URL). -->
-					<div class="md">
+					     resolveArtifacts resolves the file's RELATIVE URLs against the
+					     artifact dir (not the page URL): images point at the raw endpoint,
+					     while inter-file links are tagged for use:artifactLinks, which
+					     opens them right here in the preview. -->
+					<div class="md" use:artifactLinks>
 						{@html renderMarkdown(previewText, {
 							breaks: false,
 							resolveArtifacts: { runId, baseDir: selectedDir }
@@ -625,6 +701,10 @@
 					     Ayu token colors as markdown code fences); unknown types render as
 					     escaped plain text. -->
 					<pre class="pre hljs">{@html highlightFile(previewText, selected).html}</pre>
+				{:else if previewKind === 'missing'}
+					<p class="dim small">
+						Not found — <code>{selected}</code> may have been moved, renamed or deleted.
+					</p>
 				{:else}
 					<p class="dim small">No inline preview — use Open raw to download.</p>
 				{/if}

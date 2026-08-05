@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,37 +52,56 @@ func unreachErr(m string) error { return &codedError{notifyExitUnreach, m} }
 func refusedErr(m string) error { return &codedError{notifyExitRefused, m} }
 
 func notifyCmd() *cobra.Command {
-	var from string
+	var from, session string
 	cmd := &cobra.Command{
-		Use:   "notify [session_id] <message | ->",
+		Use:   "notify [--session=ID] <message | ->",
 		Short: "Send a message from a background script to a running agent session",
 		Long: "Deliver an environment notification to a running amplio agent session. " +
 			"Intended for background scripts an agent spawns via the bash tool. The " +
-			"target session defaults to $AMPLIO_SESSION_ID (the spawning agent); pass a " +
-			"session id to target another. Use '-' as the message to read from stdin.",
-		Args:         cobra.RangeArgs(1, 2),
+			"target session defaults to $AMPLIO_SESSION_ID (the spawning agent); use " +
+			"--session=ID to target another. Use '-' as the message to read from stdin.\n\n" +
+			"Avoid uninformative heartbeats and unbounded notification loops: the " +
+			"server caps environment notifications per session step, and beyond it " +
+			"refuses with exit code 3 and 'env_notice_capped' on stderr — match that " +
+			"to stop a loop.",
+		// Exactly one positional: the message. The target used to be an optional
+		// FIRST positional, which meant the meaning of an argument depended on how
+		// many there were — so `notify done building` (someone forgot the quotes)
+		// silently addressed a session named "done". A stray argument is now an
+		// error, and the target is named.
+		Args: func(_ *cobra.Command, args []string) error {
+			switch {
+			case len(args) == 1:
+				return nil
+			case len(args) > 1:
+				return fmt.Errorf("notify takes one message (got %d arguments); "+
+					"quote the message, and use --session=<id> to target another session", len(args))
+			default:
+				return errors.New("notify needs a message (or '-' to read it from stdin)")
+			}
+		},
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return executeNotify(cmd.Context(), args, from)
+			return executeNotify(cmd.Context(), args[0], session, from)
 		},
 	}
 	cmd.Flags().StringVar(&from, "from", "", "source label for the message (default: environment)")
+	cmd.Flags().StringVar(&session, "session", "",
+		"target session id (default: $AMPLIO_SESSION_ID, the spawning agent)")
 	return cmd
 }
 
-func executeNotify(ctx context.Context, args []string, from string) error {
+func executeNotify(ctx context.Context, msgArg, session, from string) error {
 	runID := os.Getenv(config.EnvRunID)
 	if runID == "" {
 		return usageErr("$AMPLIO_RUN_ID not set — notify must be run from a script spawned by an agent's bash tool")
 	}
-	var sid, msgArg string
-	if len(args) == 2 {
-		sid, msgArg = args[0], args[1]
-	} else {
-		sid, msgArg = os.Getenv(config.EnvSessionID), args[0]
+	sid := session
+	if sid == "" {
+		sid = os.Getenv(config.EnvSessionID)
 	}
 	if sid == "" {
-		return usageErr("no target session: pass one as the first argument, or set $AMPLIO_SESSION_ID")
+		return usageErr("no target session: pass --session=<id>, or set $AMPLIO_SESSION_ID")
 	}
 	msg, err := readNotifyMessage(msgArg)
 	if err != nil {

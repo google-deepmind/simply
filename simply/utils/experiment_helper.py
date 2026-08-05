@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shlex
 from typing import Any, Mapping
 
 from etils import epath
@@ -47,6 +48,18 @@ def is_primary_task() -> bool:
   return True
 
 
+def set_env_based_flags():
+  """Wires environment based flags."""
+  if not is_primary_task():
+    return
+  dump_dir = os.environ.get('XLA_DUMP_TO')
+  if not dump_dir:
+    return
+  xla_flags = shlex.split(os.environ.get('XLA_FLAGS', ''))
+  xla_flags += [f'--xla_dump_to={dump_dir}', '--xla_dump_hlo_as_proto=true']
+  os.environ['XLA_FLAGS'] = ' '.join(xla_flags)
+
+
 def convert_to_scalar(x: Any) -> Any:
   """Convert x to a single Python scalar."""
   try:
@@ -59,7 +72,24 @@ def convert_to_scalar(x: Any) -> Any:
     return None
 
 
-def set_notes(notes: str, should_set: bool | None = None) -> None:
+def set_work_notes(
+    notes: str,
+    should_set: bool | None = None,
+) -> None:
+  print(f'WORK UNIT NOTES: {notes}')
+
+
+def set_notes(
+    notes: str,
+    should_set: bool | None = None,
+) -> None:
+  """Sets the notes for the experiment.
+
+  Args:
+    notes: The notes to set.
+    should_set: Whether to set the notes. If None, it will be set if the current
+      process is the primary one.
+  """
   print(f'NOTES: {notes}')
 
 
@@ -79,13 +109,19 @@ class ExperimentHelper:
   num_train_steps: int = 0
   log_additional_info: bool = False
   should_save_ckpt: bool = True
+  # Optional override for checkpoint directory. When set, checkpoints are
+  # written here while metrics/tb_log remain under experiment_dir.
+  ckpt_dir_override: str = ''
+  is_primary: bool = dataclasses.field(default_factory=is_primary_process)
 
   @property
   def should_save_data(self) -> bool:
-    return is_primary_process() and bool(self.experiment_dir)
+    return self.is_primary and bool(self.experiment_dir)
 
   @property
   def ckpt_dir(self) -> str:
+    if self.ckpt_dir_override:
+      return self.ckpt_dir_override
     return (epath.Path(self.experiment_dir) / 'checkpoints').as_posix()
 
   @property
@@ -113,7 +149,7 @@ class ExperimentHelper:
     policies = [ocp.checkpoint_managers.LatestN(self.ckpt_max_to_keep)]
     if self.ckpt_keep_period:
       policies.append(
-          ocp.checkpoint_managers.EveryNSteps(
+          ocp.checkpoint_managers.EveryNSteps(  # pyrefly: ignore[bad-argument-type]
               interval_steps=self.ckpt_keep_period,
           )
       )
@@ -161,8 +197,11 @@ class ExperimentHelper:
   def metrics_aggregator(self) -> 'MetricsAggregator':
     return MetricsAggregator(average_last_n_steps=self.metric_log_interval)
 
+  def set_work_notes(self, notes: str) -> None:
+    set_work_notes(notes, should_set=self.is_primary)
+
   def set_notes(self, notes: str) -> None:
-    set_notes(notes)
+    set_notes(notes, should_set=self.is_primary)
 
   def write_record(self, record: Mapping[str, Any]):
     logging_record = True
@@ -184,6 +223,7 @@ class ExperimentHelper:
       model_full_jsons = ''
     experiment_config_jsons = json.dumps(pytree.dump(config), indent=2)
     sharding_config_jsons = json.dumps(pytree.dump(sharding_config), indent=2)
+
     self.write_texts(
         step=0,
         texts={
@@ -239,7 +279,19 @@ class ExperimentHelper:
           logging.warning('Skipping non-scalar metric: %s = %s', k, v)
       scalars = filtered_scalars
     if metric_writer := self.metric_writer:
-      metric_writer.write_scalars(step, scalars)
+      metric_writer.write_scalars(step, scalars)  # pyrefly: ignore[bad-argument-type]
+
+  def write_images(self, step, images):
+    """Writes image metrics.
+
+    Args:
+      step: The current step.
+      images: A mapping from tag to (H,W) or (H,W,C) array. Does not support a
+        batch dim.
+    """
+    if metric_writer := self.metric_writer:
+      images = pytree.to_flat_dict(images, sep='/')
+      metric_writer.write_images(step, images)
 
   def write_texts(self, step, texts):
     """Writes text metrics.
@@ -260,16 +312,16 @@ class ExperimentHelper:
     """Save state information."""
     state = common.get_raw_arrays(state)
     params_shape = jax.tree_util.tree_map(
-        lambda x: str(x.shape), state['params']
+        lambda x: str(x.shape), state['params']  # pyrefly: ignore[bad-index, unsupported-operation]
     )
     logging.info('params shape: %s', params_shape)
     params_sharding = jax.tree_util.tree_map(
-        lambda x: str(x.sharding), state['params']
+        lambda x: str(x.sharding), state['params']  # pyrefly: ignore[bad-index, unsupported-operation]
     )
     logging.info('params sharding: %s', params_sharding)
     num_params = sum(
         jax.tree.leaves(
-            jax.tree_util.tree_map(lambda x: np.prod(x.shape), state['params'])
+            jax.tree_util.tree_map(lambda x: np.prod(x.shape), state['params'])  # pyrefly: ignore[bad-index, unsupported-operation]
         )
     )
     logging.info('num_params: %s M', num_params / 1e6)
@@ -349,5 +401,33 @@ class MetricsAggregator(object):
   def get_aggregated_metrics(self) -> Mapping[str, np.ndarray]:
     agg_metrics = {}
     for k, vlist in self.metrics.items():
-      agg_metrics[k] = np.mean(vlist)
+      agg_metrics[k] = np.mean(vlist)  # pyrefly: ignore[no-matching-overload]
     return agg_metrics
+
+
+def start_profile(config, experiment_dir='') -> Any:
+  """Starts programmatic profiling based on config."""
+
+  if experiment_dir:
+    profile_dir = str(epath.Path(experiment_dir) / 'xprof')
+  else:
+    profile_dir = (config.profile_path
+                   or os.environ.get('TEST_UNDECLARED_OUTPUTS_DIR'))
+  if profile_dir:
+    logging.info('Starting trace before step %d at %s', config.profile_steps[0],
+                 profile_dir)
+    try:
+      jax.profiler.start_trace(profile_dir)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.error('Failed to start JAX trace: %s', e)
+  return None
+
+
+def stop_profile(config, profile_sess=None, experiment_dir='') -> None:
+  """Stops programmatic profiling based on config."""
+
+  logging.info('Stopping trace after step %d', config.profile_steps[1])
+  try:
+    jax.profiler.stop_trace()
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logging.error('Failed to stop JAX trace or register artifact: %s', e)

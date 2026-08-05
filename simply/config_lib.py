@@ -18,8 +18,9 @@ import dataclasses
 import functools
 import math
 import os
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, Callable, ClassVar, Literal, Self
 
+import deprecated
 import jax
 from simply import data_lib
 from simply.utils import common
@@ -163,7 +164,7 @@ class BaseSharding(ShardingConfig):
   mesh_axis_names: PartitionAnnotation = ('replica', 'data', 'model')
 
   def to_decoding_sharding(self) -> Self:
-    activation_partition = (*self.activation_partition[:-1], None)
+    activation_partition = (*self.activation_partition[:-1], None)  # pyrefly: ignore[unsupported-operation]
     return dataclasses.replace(
         self,
         activation_partition=activation_partition,
@@ -267,6 +268,16 @@ class BaseExperimentConfig(ExperimentConfig):
   # tuned for different config for best performance, 512 and 1024 are
   # good starting points.
   flash_attention_block_size: int = 512
+  flash_residual_checkpoint_name: str | None = None
+  flash_block_q: int | None = None
+  flash_block_kv: int | None = None
+  flash_block_kv_compute: int | None = None
+  flash_block_q_dkv: int | None = None
+  flash_block_kv_dkv: int | None = None
+  flash_block_kv_dkv_compute: int | None = None
+  flash_block_q_dq: int | None = None
+  flash_block_kv_dq: int | None = None
+  flash_use_fused_bwd_kernel: bool = False
   window_size: int = 0
   use_window_chunk: bool = False
   qkv_use_bias: bool = False
@@ -312,6 +323,23 @@ class BaseExperimentConfig(ExperimentConfig):
   global_total_num_pages: int = 0
   local_total_num_pages: int = 0
   page_size: int = 0
+  rpa_block_q: int | None = None
+  # Weight-only quantization for FFN (MoE expert) weights at decode. Fused spec
+  # `<dtype>[:<block_size>]`:
+  #   - dtype: '' (bf16, disabled), 'int8' (W8A16), or 'int4' (W4A16).
+  #   - block_size (optional): block-wise quantization group size along the
+  #     contraction (k) axis -- how many contiguous k elements share one scale.
+  #     Omitted = per-channel (one scale over the whole k axis, the default);
+  #     a finer (smaller) block_size recovers accuracy lost at narrow widths
+  #     (e.g. int4). Must divide each expert weight's k.
+  # When set to a quantized dtype, ffn_0/ffn_1 expert weights are stored as the
+  # integer dtype in HBM and the grouped matmul runs via gmm_v2 (W8A16/W4A16),
+  # cutting the dominant expert-weight HBM traffic in the bandwidth-bound decode
+  # regime and freeing HBM to grow batch size or KV cache. Read in the serving
+  # stack (page_batcher.py). Examples: 'int8', 'int4:128'.
+  ffn_weight_quant: str = ''
+  # Low-precision (fp8) KV cache dtype ('fp8'/'fp8_e4m3'/'fp8_e5m2')
+  kv_cache_quant: str = ''
 
   # Data config
   batch_size: int = 64 * 16
@@ -319,7 +347,6 @@ class BaseExperimentConfig(ExperimentConfig):
   # Set to DatasetConfig, MixtureConfig, or string
   # (DatasetConfigRegistry lookup).
   dataset: Any | None = None
-  validation_dataset: Any | None = None
   shard_data_method: Literal['NO_SHARDING', 'BY_JAX_PROCESS'] = 'NO_SHARDING'
   # RL requires unstacked batch to iterate over examples.
   batch_mode: str = data_lib.BATCH_STACKED
@@ -329,6 +356,48 @@ class BaseExperimentConfig(ExperimentConfig):
   validation_num_eval_steps: int = -1
   # How often to run evaluation on validation set.
   validation_eval_interval: int = 1000
+  # In-loop validation datasets evaluated at `validation_eval_interval`
+  # cadence (and at the very last step). Each entry is a
+  # `data_lib.DatasetConfig` whose `source.name` is used as the metric
+  # prefix (`<source.name>/loss`, `<source.name>/accuracy`,
+  # `<source.name>/tokens`, ...) so per-dataset numbers are independently
+  # plottable. All entries share the same JIT-bound eval loss function
+  # so they inherit the NaN-safe reduction in `compute_loss`.
+  #
+  # Entries whose `source` exposes a `make_eval_fn(loss_fn, state)`
+  # method are iterated directly by the dispatcher (fast path,
+  # duck-typed via `hasattr`). The dispatcher bypasses
+  # `create_iter_dataset`'s standard packing / sharding / prefetch
+  # pipeline so the source can preserve its own byte stream — required
+  # for streaming loaders whose chunking is part of the loss semantics
+  # (e.g. CMS sliding-stride perplexity eval, where
+  # `PACKING_PAD_OR_TRUNCATE` would re-chunk and break bit-identity
+  # with the offline reference). Other entries are routed through the
+  # standard `create_iter_dataset` pipeline (forced to
+  # `PACKING_PAD_OR_TRUNCATE` per the validation convention).
+  #
+  # Typed as `tuple[Any, ...]` because `DatasetConfig` is not yet
+  # forward-declared here and pulling it in would re-shape the import
+  # order (each entry is duck-typed at dispatch time).
+  #
+  # This field replaces the legacy singular `validation_dataset` field.
+  # To migrate existing configs, wrap a single entry in a 1-tuple:
+  # `validation_datasets=(my_dataset_config,)`.
+  validation_datasets: tuple[Any, ...] = ()
+
+  @property
+  @deprecated.deprecated(reason='Use `validation_datasets` instead.')
+  def validation_dataset(self) -> Any | None:
+    """Back-compat shim for the legacy singular field."""
+    if not self.validation_datasets:
+      return None
+    if len(self.validation_datasets) == 1:
+      return self.validation_datasets[0]
+    raise ValueError(
+        '`validation_dataset` is undefined when `validation_datasets` has'
+        f' {len(self.validation_datasets)} entries (>1); read'
+        ' `validation_datasets` directly.'
+    )
   # Batch size for evaluation on validation set,
   # set to -1 to use the same as `batch_size`.
   validation_eval_batch_size: int = -1
@@ -387,6 +456,12 @@ class BaseExperimentConfig(ExperimentConfig):
   init_ckpt_format: str = ''
   reset_steps: bool = False
 
+  # (registered name of) filter function for trainable params.
+  # Maps a param path (block_0/ffn_0/kernel, block_1/attn_0/query, ...)
+  # and a value (arraylike) to a boolean indicating whether the param is
+  # trainable. All params trainable by default.
+  trainable_params_filter: str | Callable[[str, Any], bool] | None = None
+
   # Add masks to only calculate loss on assistant responses.
   add_chat_loss_mask: bool = False
   mask_start_token: str = ''
@@ -425,6 +500,10 @@ class BaseExperimentConfig(ExperimentConfig):
   decoding_mesh_shape: Mapping[str, int] | None = None
   dcn_mesh_shape: Mapping[str, int] | None = None
   sharding_config: SimplyConfig = gspmd_sharding()
+
+  # Programmatic profiler capture configs.
+  profile_steps: tuple[int, int] | None = (2, 6)  # end not inclusive
+  profile_path: str = ''
 
 
 @ExperimentConfigRegistry.register
@@ -574,9 +653,13 @@ def flops6e20_tfm2b_c4_l2048():
           source=data_lib.TFDSSource(name='c4:3.1.0', split='train'),
           lm_format_name='Pretrain',
       ),
-      validation_dataset=data_lib.DatasetConfig(
-          source=data_lib.TFDSSource(name='c4:3.1.0', split='validation'),
-          lm_format_name='Pretrain',
+      validation_datasets=(
+          data_lib.DatasetConfig(
+              source=data_lib.TFDSSource(
+                  name='c4:3.1.0', split='validation'
+              ),
+              lm_format_name='Pretrain',
+          ),
       ),
       batch_size=1024,
       clip_grad_norm=1.0,
@@ -1039,9 +1122,13 @@ def gemma2_2b_gsm8k_0shot_rl():
       evaluation=evaluation_lib.ZeroShotBoxedInQuestionEvaluation(),
       validation_num_eval_steps=8,
       validation_eval_interval=100,
-      validation_dataset=data_lib.DatasetConfig(
-          source='simply:gsm8k_test', packing=data_lib.PACKING_NONE,
-          lm_format_name=None),
+      validation_datasets=(
+          data_lib.DatasetConfig(
+              source='simply:gsm8k_test',
+              packing=data_lib.PACKING_NONE,
+              lm_format_name=None,
+          ),
+      ),
       validation_eval_batch_size=-1,
       validation_eval_epochs=1,
       lm_format_name='Pretrain',
@@ -1208,9 +1295,13 @@ def gemma2_2b_it_dsr40k_math500_0shot_no_ref_rl():
           source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
           lm_format_name=None),
       use_validation_set=True,
-      validation_dataset=data_lib.DatasetConfig(
-          source='simply:math500_test', packing=data_lib.PACKING_NONE,
-          lm_format_name=None),
+      validation_datasets=(
+          data_lib.DatasetConfig(
+              source='simply:math500_test',
+              packing=data_lib.PACKING_NONE,
+              lm_format_name=None,
+          ),
+      ),
       validation_eval_batch_size=-1,
       validation_eval_epochs=1,
       validation_eval_interval=50,
@@ -1436,9 +1527,13 @@ def deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl():
       use_flash_attention=True,
       flash_attention_block_size=512,
       validation_eval_interval=50,
-      validation_dataset=data_lib.DatasetConfig(
-          source='simply:aime24', packing=data_lib.PACKING_NONE,
-          lm_format_name=None),
+      validation_datasets=(
+          data_lib.DatasetConfig(
+              source='simply:aime24',
+              packing=data_lib.PACKING_NONE,
+              lm_format_name=None,
+          ),
+      ),
       validation_eval_batch_size=64,
       validation_eval_epochs=5,
       validation_evaluation=None,
@@ -1833,12 +1928,14 @@ def qwen3_4b_gsm8k_sft():
           data_key='conversation',
           trainable_roles=('assistant',),
       ),
-      validation_dataset=data_lib.DatasetConfig(
-          source='simply:gsm8k_sft_test',
-          lm_format_name='QwQChat',
-          packing='first_fit',
-          data_key='conversation',
-          trainable_roles=('assistant',),
+      validation_datasets=(
+          data_lib.DatasetConfig(
+              source='simply:gsm8k_sft_test',
+              lm_format_name='QwQChat',
+              packing='first_fit',
+              data_key='conversation',
+              trainable_roles=('assistant',),
+          ),
       ),
       seq_len=2048,
       batch_size=32,

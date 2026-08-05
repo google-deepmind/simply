@@ -147,9 +147,15 @@ func (e *UserEvent) ToText() string  { return banner("user", nil, e.Content) }
 
 type AssistantEvent struct {
 	ColumnFields
-	Content       string         `json:"content,omitempty"`
-	ToolCalls     []ToolCall     `json:"tool_calls,omitempty"`
-	Thoughts      string         `json:"thoughts,omitempty"`
+	Content   string     `json:"content,omitempty"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Thoughts  string     `json:"thoughts,omitempty"`
+	// StopReason is the provider's native finish/stop reason for this turn
+	// (Anthropic: end_turn/max_tokens/tool_use/…; Gemini: STOP/MAX_TOKENS/…;
+	// subprocess: bridge-defined). NOT normalized across providers — persisted
+	// verbatim for inspection/debugging (e.g. diagnosing an accidental empty
+	// no-tool conclusion). Omitted for events written before this field existed.
+	StopReason    string         `json:"stop_reason,omitempty"`
 	ProviderExtra map[string]any `json:"provider_extra,omitempty"`
 	Usage         *Usage         `json:"usage,omitempty"`
 }
@@ -218,8 +224,10 @@ func (e *CompactionEvent) ToText() string {
 
 // MessageEvent sender types. SenderType classifies the sender for rendering/
 // attribution. Both agent messages (send_message) and environment notifications
-// ($AMPLIO_NOTIFY) are Input-class in db.Classify — either revives a dormant
-// recipient — so SenderType no longer gates revival; it only labels the source.
+// ($AMPLIO_NOTIFY) are Input-class in db.Classify. SenderType additionally gates
+// ONE thing at the wake path (runtime.NewCommitNotifier): an environment
+// notification does not revive a deliberately finished session. See
+// docs/session_lifecycle.md.
 const (
 	SenderTypeAgent       = "agent"
 	SenderTypeEnvironment = "environment"

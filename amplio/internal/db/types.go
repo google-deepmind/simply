@@ -69,10 +69,13 @@ const (
 //
 //   - UserEvent (operator/user input) → Input.
 //   - MessageEvent (agent send_message OR environment $AMPLIO_NOTIFY) → Input.
-//     Both revive a dormant/concluded session: a background-job notification is
-//     meant to wake the agent even if it forgot to await_event. A runaway
-//     notifier is recoverable — the revived agent sees the sender's pid (the
-//     notify CLI stamps it) and can kill the offending script.
+//     Both are Input at the event level. NOTE: the wake path
+//     (runtime.NewCommitNotifier) additionally refuses to revive a *finished*
+//     session (concluded/crashed/cancelled) from an *environment* notification
+//     — the environment can't resurrect a deliberately-finished/stopped agent
+//     (see docs/session_lifecycle.md). Agent send_messages still revive them.
+//     Classify stays a pure function of the event; that state-dependent gate
+//     (and its own status set) lives at the wake path, not here.
 //   - ChildResultEvent verdict concluded → Input; crashed/cancelled → Notice
 //     (a failing child must not hammer a dormant parent back to life).
 //   - RecoverEvent (produced only by Recover) → Input.
@@ -82,9 +85,10 @@ func Classify(evt event.Event) EventClass {
 	case *event.UserEvent:
 		return ClassInput
 	case *event.MessageEvent:
-		// Both agent (send_message) and environment ($AMPLIO_NOTIFY) messages
-		// revive a dormant recipient. SenderType still distinguishes them for
-		// rendering/attribution; it no longer gates revival.
+		// Input at the event level for both agent (send_message) and environment
+		// ($AMPLIO_NOTIFY) messages. The env-notification-vs-TERMINAL-session
+		// exception is enforced at the wake path (runtime.NewCommitNotifier), which
+		// has the target's status; Classify stays pure on the event.
 		return ClassInput
 	case *event.ChildResultEvent:
 		if e.Verdict == SessionConcluded {
@@ -236,10 +240,16 @@ type LessonRecord struct {
 // --- Filter / option types ---
 
 type ListRunsOpts struct {
-	// Offset skips this many rows from the front of the ordering (0 = first page).
-	// Pairs with Limit for offset pagination. Runs are ordered newest-first — see
-	// ListRuns.
-	Offset int
+	// Before + BeforeRunID are the KEYSET pagination cursor: ListRuns returns rows
+	// strictly older than (Before, BeforeRunID) in the newest-first ordering
+	// (created_at DESC, run_id DESC). A zero Before means the first page. run_id (a
+	// unique random id) is the tiebreaker so runs sharing a millisecond created_at
+	// can't be skipped or duplicated at a page boundary — the failure mode of the
+	// prior OFFSET pagination under concurrent run creation. run_id is never
+	// time-ordered (it's a random hash), so created_at remains the sort key; run_id
+	// only disambiguates ties.
+	Before      time.Time
+	BeforeRunID string
 	// Limit caps the page size. 0 (unset) uses a default page; a NEGATIVE limit
 	// means UNBOUNDED — return every matching run, used by full-table sweeps
 	// (recovery, report backfill) that must see all runs, not a page.

@@ -19,6 +19,7 @@ from absl.testing import absltest
 from etils import epath
 import jax
 import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
 from simply import config_lib
 from simply import model_lib
@@ -259,6 +260,92 @@ class CheckpointLibTest(absltest.TestCase):
         },
     )
 
+
+class V2FormatQuantizedRestoreTest(absltest.TestCase):
+  """Restores a training checkpoint into a params-only, FFN-quantized target.
+
+  A training checkpoint carries optimizer state (`m` / `v` / `steps`) next to
+  `params` and stores the routed-expert weights as plain full-precision arrays,
+  while a serving target asks for `params` only and for `{quant_array, scale}`
+  in place of each expert weight. Neither of the two quantized leaves has a
+  same-named source, so they used to come back as `jax.ShapeDtypeStruct`, which
+  is not a valid JAX type and crashes the first forward pass.
+  """
+
+  def test_load_training_checkpoint_into_quantized_target(self):
+    num_experts, k, n, n_blocks = 4, 8, 6, 2
+    param_keys = (
+        'embed_linear/w',
+        'transformer/block_0/attention/attention/q_proj/w',
+        'transformer/block_0/routed_ffw/router/w',
+    )
+    ffn_keys = (
+        'transformer/block_0/routed_ffw/ffn_0/w',
+        'transformer/block_0/routed_ffw/ffn_1/w',
+    )
+
+    # What training writes: params + optimizer state, expert weights plain.
+    rng = np.random.RandomState(0)
+    flat_stored = {'steps': jnp.asarray(20, dtype=jnp.int32)}
+    for key in param_keys + ffn_keys:
+      shape = (num_experts, k, n) if key in ffn_keys else (3, 4)
+      value = jnp.asarray(rng.randn(*shape).astype(np.float32))
+      flat_stored[f'params/{key}'] = value
+      flat_stored[f'm/{key}'] = jnp.zeros_like(value)
+      flat_stored[f'v/{key}'] = jnp.ones_like(value)
+    ckpt_dir = self.create_tempdir().full_path
+    with ocp.CheckpointManager(ckpt_dir) as mngr:
+      ckpt_lib.save_checkpoint(
+          mngr,
+          ocp.tree.from_flat_dict(flat_stored, sep='/'),
+          20,
+          ckpt_format=ckpt_lib.V2Format(),
+      )
+      mngr.wait_until_finished()
+
+    # What serving asks for: no optimizer state, expert weights int4-quantized.
+    replicated = jax.sharding.NamedSharding(
+        sharding_lib.create_mesh(), jax.sharding.PartitionSpec()
+    )
+    flat_target = {
+        f'params/{key}': jax.ShapeDtypeStruct(
+            (3, 4), jnp.float32, sharding=replicated
+        )
+        for key in param_keys
+    }
+    for key in ffn_keys:
+      flat_target[f'params/{key}/quant_array'] = jax.ShapeDtypeStruct(
+          (num_experts, k, n), jnp.int4, sharding=replicated
+      )
+      flat_target[f'params/{key}/scale'] = jax.ShapeDtypeStruct(
+          (num_experts, n_blocks, n), jnp.float32, sharding=replicated
+      )
+
+    # No explicit format: the loader reads `V2Format` off the ckpt metadata.
+    restored = ckpt_lib.load_checkpoint_from_dir(
+        ckpt_dir, ocp.tree.from_flat_dict(flat_target, sep='/')
+    )
+
+    flat = ocp.tree.to_flat_dict(common.get_raw_arrays(restored), sep='/')
+    self.assertCountEqual(flat_target, flat)
+    for key, value in flat.items():
+      self.assertIsInstance(value, jax.Array, msg=f'left abstract: {key}')
+    for key in param_keys:
+      np.testing.assert_allclose(
+          np.asarray(flat[f'params/{key}'], dtype=np.float32),
+          np.asarray(flat_stored[f'params/{key}'], dtype=np.float32),
+          rtol=1e-6,
+      )
+    for key in ffn_keys:
+      quant = np.asarray(flat[f'params/{key}/quant_array'].astype(jnp.float32))
+      scale = np.asarray(flat[f'params/{key}/scale'])
+      dequant = (
+          quant.reshape(num_experts, n_blocks, k // n_blocks, n)
+          * scale[:, :, None, :]
+      ).reshape(num_experts, k, n)
+      original = np.asarray(flat_stored[f'params/{key}'], dtype=np.float32)
+      rel_error = np.abs(dequant - original).max() / np.abs(original).max()
+      self.assertLess(rel_error, 0.25, msg=f'int4 restore blew up at {key}')
 
 if __name__ == '__main__':
   absltest.main()

@@ -4,3 +4,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 wandb/
+
+# Generated gRPC stubs (see setup/gen_protos.py)
+simply/serving/*_pb2.py
+simply/serving/*_pb2_grpc.py

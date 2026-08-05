@@ -128,12 +128,12 @@ def parse_predefined_knowledge(
   post = frontmatter.loads(knowledge)
   name = post.get('name', knowledge_file_path.stem)
   content = post.content
-  kwargs = {'uri': 'kb://' + name, 'content': content, 'update_step': 0}
+  kwargs = {'uri': 'kb://' + name, 'content': content, 'update_step': 0}  # pyrefly: ignore[unsupported-operation]
   kwargs['summary'] = post.get('summary', '')
   kwargs['display'] = memory_lib.DisplayMode(
       post.get('display', memory_lib.DisplayMode.SUMMARY.value)
   )
-  return memory_lib.MemoryFile(**kwargs)
+  return memory_lib.MemoryFile(**kwargs)  # pyrefly: ignore[missing-argument]
 
 
 def run_agent_loop(

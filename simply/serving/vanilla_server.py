@@ -169,7 +169,7 @@ class Batcher:
     )
 
   def update_params(self, params: PyTree):
-    self.model_state['params'] = params
+    self.model_state['params'] = params  # pyrefly: ignore[unsupported-operation]
 
   @functools.cached_property
   def lm_interface(self) -> model_lib.LMInterface:
@@ -201,7 +201,7 @@ class Batcher:
 
   def loop(self, stop_event: threading.Event):
     """The batcher loop."""
-    sharding.set_mesh(self.config.mesh_shape)
+    sharding.set_mesh(self.config.mesh_shape)  # pyrefly: ignore[bad-argument-type]
     seed = int(time.time() * 1000)
     seed = multihost_utils.broadcast_one_to_all(seed)
     prng_key = jax.random.key(seed=seed)
@@ -239,7 +239,7 @@ class Batcher:
       prng_key, subkey = jax.random.split(prng_key)
       sampling_outputs = self.lm_interface.generate(
           batched_inputs,
-          params=self.model_state['params'],
+          params=self.model_state['params'],  # pyrefly: ignore[bad-index, unsupported-operation]
           prng_key=subkey,
           scoring_inputs=False,
           batch_size=_BATCH_SIZE.value,
@@ -253,7 +253,7 @@ class Batcher:
             future.set_result,
             SimplyServiceResponse(
                 code=grpc.StatusCode.OK,
-                result=dict(output_text=so[0].output_text),
+                result=dict(output_text=so[0].output_text),  # pyrefly: ignore[bad-index]
             ),
         )
 
@@ -285,7 +285,7 @@ class SimplyService(server_pb2_grpc.SimplyService):
 
     return threading.Thread(target=_batcher_loop)
 
-  async def Run(
+  async def Run(  # pyrefly: ignore[bad-override]
       self, request: struct_pb2.Value, context: grpc.aio.ServicerContext
   ) -> struct_pb2.Value:
     if not self.batcher_thread.is_alive():

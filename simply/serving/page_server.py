@@ -93,7 +93,7 @@ class SimplyService(server_pb2_grpc.SimplyService):
   def batcher_thread(self) -> threading.Thread:
     return self.batcher.thread(self.stop_event, self.error_message_queue)
 
-  async def Run(
+  async def Run(  # pyrefly: ignore[bad-override]
       self, request: struct_pb2.Value, context: grpc.aio.ServicerContext
   ) -> struct_pb2.Value:
     if not self.batcher_thread.is_alive():
@@ -220,6 +220,8 @@ async def main(argv: Sequence[str]) -> None:
           top_p=common_flags.TOP_P.value,
           intermediate_steps=common_flags.INTERMEDIATE_STEPS.value,
           response_asap=common_flags.RESPONSE_ASAP.value,
+          enable_prefix_caching=common_flags.ENABLE_PREFIX_CACHING.value,
+          max_num_issue_tokens=common_flags.MAX_NUM_ISSUE_TOKENS.value,
       ),
   )
 

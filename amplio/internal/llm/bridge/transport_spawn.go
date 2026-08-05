@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package subprocess
+package bridge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -66,6 +68,54 @@ type manager struct {
 
 var defaultManager = &manager{procs: make(map[string]*proc)}
 
+// spawnTransport is the transport for a bridge THIS process owns: it spawns the
+// binary on demand, talks to it over a private unix socket, and restarts it once
+// if the connection fails — which is the normal way a crashed bridge presents,
+// since the socket goes away with the process.
+type spawnTransport struct {
+	key       string // reuse key: binary + canonical args
+	binary    string
+	specQuery string // canonical args, forwarded to the bridge as AMPLIO_BRIDGE_SPEC
+}
+
+func (t *spawnTransport) describe() string { return t.binary }
+
+func (t *spawnTransport) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	client, err := defaultManager.client(t.key, t.binary, t.specQuery)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := postTo(ctx, client, "http://unix"+path, body)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err // caller cancelled; don't churn the subprocess
+		}
+		client, rerr := defaultManager.restartClient(t.key, client)
+		if rerr != nil {
+			return nil, fmt.Errorf("subprocess: bridge restart failed: %w (original: %v)", rerr, err)
+		}
+		resp, err = postTo(ctx, client, "http://unix"+path, body)
+		if err != nil {
+			return nil, fmt.Errorf("subprocess: request failed after restart: %w", err)
+		}
+	}
+	return resp, nil
+}
+
+// postTo issues one protocol request. Shared by every transport: only the client
+// and the URL differ.
+func postTo(ctx context.Context, client *http.Client, url string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(protocolVersionHeader, protocolVersion)
+	// Ownership of the response body transfers to the caller (closed in Call's
+	// defer or subStream.Close).
+	return client.Do(req) //nolint:bodyclose
+}
+
 // Shutdown kills every running bridge and removes its socket dir. Call on
 // graceful amplio exit; Pdeathsig backstops the crash case.
 func Shutdown() { defaultManager.shutdown() }
@@ -88,6 +138,11 @@ type proc struct {
 	key       string
 	binary    string
 	specQuery string
+
+	// stderrTail keeps the bridge's last few stderr lines so a startup failure or
+	// an unexpected exit can SHOW them: everything logPipe writes goes to Debug,
+	// which the default level drops.
+	stderrTail *ringBuffer
 
 	mu        sync.Mutex // serializes start/stop/restart and guards the fields below
 	cmd       *exec.Cmd
@@ -168,7 +223,7 @@ func (m *manager) procFor(key, binary, specQuery string) *proc {
 	if p := m.procs[key]; p != nil {
 		return p
 	}
-	p := &proc{key: key, binary: binary, specQuery: specQuery}
+	p := &proc{key: key, binary: binary, specQuery: specQuery, stderrTail: newRingBuffer(stderrTailLines)}
 	m.procs[key] = p
 	return p
 }
@@ -211,8 +266,8 @@ func (p *proc) startLocked() (err error) {
 		_ = os.RemoveAll(tmpDir)
 		return fmt.Errorf("subprocess: start %q: %w", p.binary, err)
 	}
-	go logPipe(p.binary, "stdout", stdout)
-	go logPipe(p.binary, "stderr", stderr)
+	go logPipe(p.binary, "stdout", stdout, nil)
+	go logPipe(p.binary, "stderr", stderr, p.stderrTail)
 
 	// died is closed by the wait goroutine when the process exits. waitHealthy
 	// selects on it so an early-exit (e.g. ImportError before binding the
@@ -227,7 +282,7 @@ func (p *proc) startLocked() (err error) {
 		p.markDead(cmd)
 	}()
 
-	if err := waitHealthy(client, cmd, died); err != nil {
+	if err := waitHealthy(client, cmd, died, p.stderrTail); err != nil {
 		_ = cmd.Process.Kill() // no-op if the process already exited
 		_ = os.RemoveAll(tmpDir)
 		return fmt.Errorf("subprocess: bridge %q never became healthy: %w", p.binary, err)
@@ -263,7 +318,11 @@ func (p *proc) markDead(cmd *exec.Cmd) {
 	defer p.mu.Unlock()
 	if p.cmd == cmd {
 		p.alive = false
-		slog.Warn("bridge subprocess exited", "binary", p.binary, "pid", cmd.Process.Pid)
+		attrs := []any{"binary", p.binary, "pid", cmd.Process.Pid}
+		if tail := p.stderrTail.String(); tail != "" {
+			attrs = append(attrs, "stderr_tail", tail)
+		}
+		slog.Warn("bridge subprocess exited", attrs...)
 	}
 }
 
@@ -288,7 +347,7 @@ func unixClient(socket string) *http.Client {
 // diagnostic that points at the bridge's exit code (stderr is already in the
 // amplio log via logPipe), so a broken bridge fails fast instead of burning the
 // full timeout against a socket that will never appear.
-func waitHealthy(client *http.Client, cmd *exec.Cmd, died <-chan struct{}) error {
+func waitHealthy(client *http.Client, cmd *exec.Cmd, died <-chan struct{}, tail *ringBuffer) error {
 	deadline := time.Now().Add(healthTimeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -307,9 +366,8 @@ func waitHealthy(client *http.Client, cmd *exec.Cmd, died <-chan struct{}) error
 		}
 		select {
 		case <-died:
-			return fmt.Errorf(
-				"bridge exited during startup with code %d (see stderr above for diagnostics)",
-				cmd.ProcessState.ExitCode())
+			return fmt.Errorf("bridge exited during startup with code %d%s",
+				cmd.ProcessState.ExitCode(), withStderr(tail))
 		case <-time.After(healthPoll):
 		}
 	}
@@ -319,17 +377,69 @@ func waitHealthy(client *http.Client, cmd *exec.Cmd, died <-chan struct{}) error
 	return lastErr
 }
 
+// stderrTailLines is how much of a bridge's stderr to keep for the failure
+// paths. Enough for a Python traceback, short enough that the log line stays
+// readable when nothing is wrong with it.
+const stderrTailLines = 50
+
+// withStderr appends captured stderr to an error message, or explains that
+// there wasn't any — which is itself diagnostic (a bridge that dies silently is
+// usually the wrong binary or a missing exec bit, not a crash).
+func withStderr(tail *ringBuffer) string {
+	if tail == nil {
+		return ""
+	}
+	if s := tail.String(); s != "" {
+		return "; bridge stderr:\n" + s
+	}
+	return " (the bridge printed nothing to stderr)"
+}
+
 // logPipe forwards a bridge's stdout/stderr to the amplio log at Debug level
 // so bridge diagnostics are AVAILABLE (--log-level=debug surfaces every line)
-// without polluting the default Info stream. Bridges are talkative — Beyond
-// and Gemini bridges typically log per-RPC HTTP traces, model loading, and
-// retries, often dozens of lines per agent step — and almost all of it is
+// without polluting the default Info stream. Bridges are talkative — they
+// typically log per-RPC HTTP traces, model loading, and retries, often dozens
+// of lines per agent step — and almost all of it is
 // useful only when something's going wrong. Operators who care can flip
 // AMPLIO_LOG_LEVEL=debug for the symptomatic session.
-func logPipe(binary, stream string, r io.Reader) {
+//
+// tail, when non-nil, also keeps the last few lines for the failure paths: at
+// the default log level everything here is dropped, so a bridge that dies during
+// startup used to fail with "see stderr above for diagnostics" pointing at
+// output nobody printed.
+func logPipe(binary, stream string, r io.Reader, tail *ringBuffer) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		slog.Debug("bridge", "binary", filepath.Base(binary), "stream", stream, "line", sc.Text())
+		line := sc.Text()
+		slog.Debug("bridge", "binary", filepath.Base(binary), "stream", stream, "line", line)
+		if tail != nil {
+			tail.add(line)
+		}
 	}
+}
+
+// ringBuffer keeps the most recent n lines. Small on purpose: it exists to make
+// a startup failure diagnosable, not to be a log.
+type ringBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	n     int
+}
+
+func newRingBuffer(n int) *ringBuffer { return &ringBuffer{n: n} }
+
+func (r *ringBuffer) add(line string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, line)
+	if len(r.lines) > r.n {
+		r.lines = r.lines[len(r.lines)-r.n:]
+	}
+}
+
+func (r *ringBuffer) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.lines, "\n")
 }

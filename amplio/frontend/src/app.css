@@ -154,7 +154,7 @@ textarea {
 .md {
 	line-height: 1.6;
 	/* Force character-level breaking of long unbreakable runs (file paths, URLs,
-	   CitC aliases) that appear as PLAIN prose — not just in `code` spans. Without
+	   workspace aliases) that appear as PLAIN prose — not just in `code` spans. Without
 	   this, a bare `third_party/.../a_very_long_file_name.md` in a paragraph, a
 	   raw link, or a heading overflows its box (worst in a narrow grid column or
 	   the side panel). `overflow-wrap: anywhere` only breaks mid-word when no
@@ -195,7 +195,7 @@ textarea {
 	border: 1px solid var(--border);
 	border-radius: var(--radius-xs);
 	padding: 0.05rem 0.3rem;
-	/* Inline code is often a long unbreakable token (file path, CitC alias,
+	/* Inline code is often a long unbreakable token (file path, workspace alias,
 	   URL). Without this, a span like `third_party/.../file.md` would
 	   overflow its containing block (a narrow grid column most painfully).
 	   anywhere lets the browser fall back to mid-token wrapping when no

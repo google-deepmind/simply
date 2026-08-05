@@ -27,6 +27,10 @@ class DistributionsTest(absltest.TestCase):
   def setUp(self):
     super().setUp()
 
+    # Seeded: the sampling subtests compare Monte-Carlo frequencies against the
+    # exact probabilities with a fixed tolerance, which is only meaningful for
+    # a fixed set of logits.
+    np.random.seed(0)
     self.prng_key = jax.random.PRNGKey(0)
     self.rtol = 1e-5
 
@@ -49,7 +53,9 @@ class DistributionsTest(absltest.TestCase):
       self.assertEqual(samples.shape, (2,))
 
     with self.subTest("BatchedSample"):
-      n = 10000
+      # 1e5 samples keeps the Monte-Carlo standard error (~1.6e-3 at p=0.5)
+      # well inside the 1e-2 tolerance below.
+      n = 100000
       samples = m.sample(self.prng_key, shape=(n, 2))
       self.assertEqual(samples.shape, (n, 2))
       sample_probs = np.vstack(
@@ -117,10 +123,10 @@ class DistributionsTest(absltest.TestCase):
     mask[:, -1] = True
     m = distributions.MaskedCategorical(logits, mask)
     masked_probs = jax.nn.softmax(
-        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1
+        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1  # pyrefly: ignore[bad-argument-type]
     )
     masked_log_probs = jax.nn.log_softmax(
-        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1
+        masked.masked(logits, mask=mask, padding_value=m.neg_inf), axis=-1  # pyrefly: ignore[bad-argument-type]
     )
 
     with self.subTest("DType"):
@@ -138,7 +144,9 @@ class DistributionsTest(absltest.TestCase):
       self.assertEqual(samples.shape, (2,))
 
     with self.subTest("BatchedSample"):
-      n = 10000
+      # 1e5 samples keeps the Monte-Carlo standard error (~1.6e-3 at p=0.5)
+      # well inside the 1e-2 tolerance below.
+      n = 100000
       samples = m.sample(self.prng_key, shape=(n, 2))
       self.assertEqual(samples.shape, (n, 2))
       sample_probs = np.vstack(

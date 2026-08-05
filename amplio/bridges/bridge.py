@@ -48,7 +48,7 @@ def echo_backend(spec):
   long" wording), so you can exercise the whole compaction path on a short
   conversation without a real long-context model. Example spec:
 
-    subprocess:/path/to/bridge.py?model=echo-model&backend=echo&context_window=2000
+    subprocess{bin=/path/to/bridge.py}:echo-model?backend=echo&context_window=2000
   """
   # context_window: 0/absent = unlimited (plain echo); >0 = overflow past N chars.
   context_window = int(spec.get("context_window", ["0"])[0])

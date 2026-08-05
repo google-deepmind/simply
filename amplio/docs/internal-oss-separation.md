@@ -61,7 +61,8 @@ func init() { DoThing = realDoThing }
 func realDoThing(x int) (string, error) { /* real impl */ }
 ```
 
-Use for: `citc.Info`, `citc.LookupAlias`, etc. — where callers want a plain
+Use for: environment-specific lookups (workspace metadata, host probes) —
+where callers want a plain
 package-level function reference.
 
 ### Pattern B — mutually-exclusive build tags

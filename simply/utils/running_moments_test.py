@@ -43,15 +43,15 @@ class RunningMomentsTest(parameterized.TestCase):
         ref_var = np.var(x[: i + 1])
         ref_std = np.std(x[: i + 1])
       else:
-        weights = np.flip(w[: i + 1])
+        weights = np.flip(w[: i + 1])  # pyrefly: ignore[unsupported-operation]
         ref_mean = np.average(x[: i + 1], weights=weights)
         ref_var = np.average(np.square(x[: i + 1] - ref_mean), weights=weights)
         ref_std = np.sqrt(ref_var)
 
       self.assertEqual(moments.count, i + 1)
-      self.assertAlmostEqual(moments.mean, ref_mean, places=5)
-      self.assertAlmostEqual(moments.var, ref_var, places=5)
-      self.assertAlmostEqual(moments.std, ref_std, places=5)
+      self.assertAlmostEqual(moments.mean, ref_mean, places=5)  # pyrefly: ignore[no-matching-overload]
+      self.assertAlmostEqual(moments.var, ref_var, places=5)  # pyrefly: ignore[no-matching-overload]
+      self.assertAlmostEqual(moments.std, ref_std, places=5)  # pyrefly: ignore[no-matching-overload]
 
 
 if __name__ == "__main__":

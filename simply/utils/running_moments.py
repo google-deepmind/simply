@@ -31,7 +31,7 @@ class RunningMoments(NamedTuple):
   m2: Scalar = np.float32(0)
 
   @property
-  def count(self) -> Scalar:
+  def count(self) -> Scalar:  # pyrefly: ignore[bad-override]
     return self.m0
 
   @property
@@ -66,7 +66,7 @@ def update(running_moments: RunningMoments, x: Scalar) -> RunningMoments:
   ) -> tuple[Scalar, Scalar, Scalar]:
     # Welford algorithm.
     # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
-    delta = x - running_moments.mean
+    delta = x - running_moments.mean  # pyrefly: ignore[unsupported-operation]
     m0 += 1
     m1 += delta / m0
     m2 += (delta * (x - m1) - m2) / m0
@@ -75,7 +75,7 @@ def update(running_moments: RunningMoments, x: Scalar) -> RunningMoments:
   def ema_fn(
       m0: Scalar, m1: Scalar, m2: Scalar, x: Scalar
   ) -> tuple[Scalar, Scalar, Scalar]:
-    delta = x - running_moments.mean
+    delta = x - running_moments.mean  # pyrefly: ignore[unsupported-operation]
     m0 += 1
     m1 = beta * m1 + (1 - beta) * x
     m2 = beta * m2 + (1 - beta) * delta * (x - m1 / (1 - beta**m0))

@@ -14,7 +14,7 @@
 r"""Converts HuggingFace safetensors to orbax.
 
 Example:
-python -m simply.tools.hf_to_orbax  \
+python -m simply.tools.hf_to_orbax \
     --input_path=${HF_DIR}/Qwen3-0.6B/ \
     --output_path=${HF_DIR}/Qwen3-0.6B/ORBAX/ \
     --format=Qwen2Format
@@ -66,8 +66,8 @@ def load_tensors_from_path(path: epath.PathLike) -> Mapping[str, jax.Array]:
 
 async def load_hf_checkpoint(path: str):
   """Loads a HuggingFace checkpoint as a PyTree."""
-  path = epath.Path(path)
-  tensor_paths = path.glob('model*.safetensors')
+  path = epath.Path(path)  # pyrefly: ignore[bad-assignment]
+  tensor_paths = path.glob('model*.safetensors')  # pyrefly: ignore[missing-attribute]
   if not tensor_paths:
     raise ValueError(f'No safetensors found in {path}')
   output_futures = []

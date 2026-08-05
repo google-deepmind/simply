@@ -30,8 +30,11 @@ type Embedder interface {
 	// Embed returns one vector per input text, aligned 1:1. All vectors share
 	// the embedder's native dimensionality.
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
-	// ModelID is a stable, cache-key-safe identifier (no slashes/spaces) so that
-	// switching models naturally invalidates cached vectors.
+	// ModelID identifies the embedding space a stored vector belongs to, so that
+	// switching models (or endpoints) naturally invalidates cached vectors. It is
+	// persisted as a DB column value, never a path, so any characters a model
+	// name legitimately contains (':' on ollama, '/' on gateway-hosted models)
+	// are fine — it only has to be stable and distinct.
 	ModelID() string
 }
 

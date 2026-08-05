@@ -21,6 +21,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -50,7 +51,7 @@ func TestExecuteNotify(t *testing.T) {
 	t.Setenv(config.EnvSessionID, "swift-fox")
 
 	// 1 positional → self (uses $AMPLIO_SESSION_ID); --from sets sender.
-	if err := executeNotify(context.Background(), []string{"hello there"}, "watcher"); err != nil {
+	if err := executeNotify(context.Background(), "hello there", "", "watcher"); err != nil {
 		t.Fatalf("executeNotify: %v", err)
 	}
 	if gotPath != "/api/runs/run-xyz/sessions/swift-fox/notify" {
@@ -67,12 +68,15 @@ func TestExecuteNotify(t *testing.T) {
 		t.Errorf("body = %v", gotBody)
 	}
 
-	// 2 positionals → explicit session id overrides the env default.
-	if err := executeNotify(context.Background(), []string{"brave-owl", "ping"}, ""); err != nil {
-		t.Fatalf("executeNotify (2-arg): %v", err)
+	// --session overrides the env default. It used to be an optional first
+	// positional, which made the meaning of an argument depend on how many there
+	// were — so an unquoted message silently addressed a session named after its
+	// first word.
+	if err := executeNotify(context.Background(), "ping", "brave-owl", ""); err != nil {
+		t.Fatalf("executeNotify (--session): %v", err)
 	}
 	if gotPath != "/api/runs/run-xyz/sessions/brave-owl/notify" {
-		t.Errorf("2-arg path = %q", gotPath)
+		t.Errorf("--session path = %q", gotPath)
 	}
 }
 
@@ -87,14 +91,14 @@ func TestExecuteNotifyExitCodes(t *testing.T) {
 
 	// Missing $AMPLIO_RUN_ID → usage error (exit 1).
 	t.Setenv(config.EnvRunID, "")
-	if got := codeOf(executeNotify(context.Background(), []string{"x"}, "")); got != notifyExitUsage {
+	if got := codeOf(executeNotify(context.Background(), "x", "", "")); got != notifyExitUsage {
 		t.Errorf("missing run id: exit %d, want %d", got, notifyExitUsage)
 	}
 
 	// No target session (no arg, no env) → usage.
 	t.Setenv(config.EnvRunID, "r")
 	t.Setenv(config.EnvSessionID, "")
-	if got := codeOf(executeNotify(context.Background(), []string{"x"}, "")); got != notifyExitUsage {
+	if got := codeOf(executeNotify(context.Background(), "x", "", "")); got != notifyExitUsage {
 		t.Errorf("no session: exit %d, want %d", got, notifyExitUsage)
 	}
 
@@ -102,7 +106,47 @@ func TestExecuteNotifyExitCodes(t *testing.T) {
 	config.SetDataDir(t.TempDir())
 	t.Cleanup(func() { config.SetDataDir("") })
 	t.Setenv(config.EnvSessionID, "sid")
-	if got := codeOf(executeNotify(context.Background(), []string{"x"}, "")); got != notifyExitUnreach {
+	if got := codeOf(executeNotify(context.Background(), "x", "", "")); got != notifyExitUnreach {
 		t.Errorf("no server: exit %d, want %d", got, notifyExitUnreach)
+	}
+}
+
+// The shim is a second, NARROWER interface — not a replacement. $AMPLIO_NOTIFY
+// still points at the binary, so anything already written against it keeps
+// working; this name simply cannot reach the rest of the CLI.
+func TestDispatchShim(t *testing.T) {
+	orig := os.Args
+	t.Cleanup(func() { os.Args = orig })
+
+	// Not the shim name: main's normal command tree handles it.
+	os.Args = []string{"/usr/local/bin/amplio", "notify", "hi"}
+	if handled, _ := dispatchShim(); handled {
+		t.Error("dispatchShim claimed a plain `amplio` invocation")
+	}
+
+	t.Setenv(config.EnvRunID, "run-xyz")
+	t.Setenv(config.EnvSessionID, "sess-1")
+	t.Setenv(config.EnvDataDir, t.TempDir())
+
+	// A message is just a message — including one that is the word "notify",
+	// which an optional-leading-word compatibility hack would have swallowed.
+	for _, msg := range []string{"a message", "notify"} {
+		os.Args = []string{"/data/bin/amplio-notify", msg}
+		handled, err := dispatchShim()
+		if !handled {
+			t.Fatal("shim did not handle an amplio-notify invocation")
+		}
+		// No server configured, so it must fail at the SEND step: that proves the
+		// message parsed and only delivery failed.
+		var ce *codedError
+		if !errors.As(err, &ce) || ce.code != notifyExitUnreach {
+			t.Fatalf("msg %q: err = %v; want the unreachable-server code (%d)", msg, err, notifyExitUnreach)
+		}
+	}
+
+	// The rest of the CLI is unreachable through this name.
+	os.Args = []string{"/data/bin/amplio-notify", "client", "submit", "--task=x"}
+	if _, err := dispatchShim(); err == nil {
+		t.Error("`client submit` went through the notify shim")
 	}
 }

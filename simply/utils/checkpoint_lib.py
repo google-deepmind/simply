@@ -33,6 +33,7 @@ from orbax.checkpoint import checkpoint_manager as ocp_constants
 from simply.utils import common
 from simply.utils import module
 from simply.utils import pytree
+from simply.utils import quant as quant_lib
 from simply.utils import registry
 from simply.utils import sharding as sharding_lib
 
@@ -40,6 +41,55 @@ PyTree = common.PyTree
 
 CHECKPOINT_FORMAT_KEY = '__checkpoint_format__'
 DATA_ITEM_NAME = 'data'
+
+
+def reshard_or_quantize_expert_weight(
+    target_key: str,
+    v: jax.Array,
+    flatten_target_abstract_state: dict[str, PyTree],
+    calibrate: bool,
+) -> PyTree:
+  """Reshards (and, if the target is quantized, int-quantizes) an expert weight.
+
+  Args:
+    target_key: Flattened target key of the expert weight (e.g.
+      `.../routed_ffw/ffn_0/w`).
+    v: The per-layer full-precision expert weight `[E, k, n]` (bf16 or f32).
+    flatten_target_abstract_state: Flattened restore target abstract state; its
+      leaf at `target_key` (plain array, or `{quant_array, scale}` dict) decides
+      whether to reshard-only or quantize-and-reshard.
+    calibrate: Forwarded to `quant.quantize_moe_weight(calibrate=...)`:
+      MSE-optimal clip calibration instead of plain absmax RTN.
+
+  Returns:
+    Either a resharded full-precision array, or a `{'quant_array', 'scale'}`
+    dict of resharded quantized arrays, matching the target leaf at
+    `target_key`.
+  """
+  quant_key = f'{target_key}/quant_array'
+  if quant_key in flatten_target_abstract_state:
+    quant_abstract = flatten_target_abstract_state[quant_key]
+    scale_abstract = flatten_target_abstract_state[f'{target_key}/scale']
+    n_blocks = scale_abstract.shape[1]
+    # block_size=0 means per-channel (n_blocks==1); else k // n_blocks.
+    k = v.shape[1]
+    block_size = 0 if n_blocks == 1 else k // n_blocks
+    quant, scale = quant_lib.quantize_moe_weight(
+        v,
+        block_size=block_size,
+        quant_dtype=quant_abstract.dtype,
+        calibrate=calibrate,
+    )
+    quant = sharding_lib.with_sharding_constraint(
+        quant, quant_abstract.sharding
+    )
+    scale = sharding_lib.with_sharding_constraint(
+        scale, scale_abstract.sharding
+    )
+    return {'quant_array': quant, 'scale': scale}
+  return sharding_lib.with_sharding_constraint(
+      v, flatten_target_abstract_state[target_key].sharding
+  )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,6 +171,63 @@ class LegacyFormat(CheckpointFormat):
 @dataclasses.dataclass(frozen=True)
 class V2Format(CheckpointFormat):
   """Current format that modulizes a lot of model components."""
+
+  ffn_weight_calibrate: bool = True
+
+  def transforms(
+      self, stored_state: PyTree, target_abstract_state: PyTree = None
+  ) -> PyTree:
+    if target_abstract_state is None:
+      # No target to drive the selection/quantization: pass everything through.
+      return stored_state
+    flatten_target_abstract_state = ocp.tree.to_flat_dict(
+        target_abstract_state, sep='/'
+    )
+    flatten_stored_state = ocp.tree.to_flat_dict(stored_state, sep='/')
+
+    transformed_state: dict[str, PyTree] = {}
+    n_passthrough = n_quantized = n_dropped = 0
+    for k, v in flatten_stored_state.items():
+      if k in flatten_target_abstract_state:
+        transformed_state[k] = v
+        n_passthrough += 1
+      elif f'{k}/quant_array' in flatten_target_abstract_state:
+        quantized = reshard_or_quantize_expert_weight(
+            k,
+            v,
+            flatten_target_abstract_state,
+            calibrate=self.ffn_weight_calibrate,
+        )
+        transformed_state[f'{k}/quant_array'] = quantized['quant_array']
+        transformed_state[f'{k}/scale'] = quantized['scale']
+        n_quantized += 1
+      else:
+        # Optimizer state (`m` / `v` / `steps`) and any other source leaf the
+        # target does not ask for.
+        n_dropped += 1
+    logging.info(
+        'V2Format: %d leaves passed through, %d expert weights quantized'
+        ' in-restore, %d source leaves dropped (opt state etc.).',
+        n_passthrough,
+        n_quantized,
+        n_dropped,
+    )
+
+    missing = sorted(
+        k for k in flatten_target_abstract_state if k not in transformed_state
+    )
+    if missing:
+      # Not fatal here (the caller substitutes the abstract leaf and warns),
+      # but an abstract leaf is what crashes the first forward pass, so make it
+      # loud and enumerable in the job log.
+      logging.error(
+          'V2Format: %d target leaves have no source in the checkpoint and'
+          ' will stay ABSTRACT (this will crash the first forward pass).'
+          ' First 20: %s',
+          len(missing),
+          missing[:20],
+      )
+    return ocp.tree.from_flat_dict(transformed_state, sep='/')
 
 
 DefaultFormat = V2Format
@@ -224,7 +331,7 @@ class Gemma3pFormat(CheckpointFormat):
         transformed_state['steps'] = v
       else:
         logging.warning('stored_state[%s] is ignored by %s', k, self.__class__)
-    transformed_state = LegacyFormat.transforms(self, transformed_state)
+    transformed_state = LegacyFormat.transforms(self, transformed_state)  # pyrefly: ignore[bad-argument-type]
     return ocp.tree.from_flat_dict(transformed_state, sep='/')
 
 
@@ -297,7 +404,7 @@ class Qwen2Format(CheckpointFormat):
     return sharding_lib.with_sharding_constraint(
         jnp.reshape(
             sharding_lib.with_sharding_constraint(
-                v, (*new_partition[: axis + 1], *new_partition[axis + 2 :])
+                v, (*new_partition[: axis + 1], *new_partition[axis + 2 :])  # pyrefly: ignore[unsupported-operation]
             ),
             new_shape,
         ),
@@ -389,7 +496,7 @@ class Qwen2Format(CheckpointFormat):
         transformed_state[f'params/block_{m.group(1)}/pre_ln_1/scale'] = v
       else:
         logging.warning('stored_state[%s] is ignored by %s', k, self.__class__)
-    transformed_state = LegacyFormat.transforms(self, transformed_state)
+    transformed_state = LegacyFormat.transforms(self, transformed_state)  # pyrefly: ignore[bad-argument-type]
     return ocp.tree.from_flat_dict(transformed_state, sep='/')
 
 
@@ -442,22 +549,22 @@ def last_checkpoint_step(ckpt_dir: epath.PathLike) -> int:
 
 def get_checkpoint_path(ckpt_dir: str, ckpt_step: int = -1) -> str:
   """Returns the checkpoint path for the given ckpt_dir and ckpt_step."""
-  ckpt_dir = epath.Path(ckpt_dir)
-  if not ckpt_dir.is_dir():
+  ckpt_dir = epath.Path(ckpt_dir)  # pyrefly: ignore[bad-assignment]
+  if not ckpt_dir.is_dir():  # pyrefly: ignore[missing-attribute]
     raise ValueError(f'Checkpoint directory {ckpt_dir} does not exist.')
-  if (ckpt_dir / '_CHECKPOINT_METADATA').exists() or (
-      ckpt_dir / '_METADATA'
+  if (ckpt_dir / '_CHECKPOINT_METADATA').exists() or (  # pyrefly: ignore[unsupported-operation]
+      ckpt_dir / '_METADATA'  # pyrefly: ignore[unsupported-operation]
   ).exists():
     if ckpt_step >= 0:
       raise ValueError(
           'Checkpoint step must be -1 for checkpoints with'
           ' _CHECKPOINT_METADATA or _METADATA.'
       )
-    return ckpt_dir.as_posix()
+    return ckpt_dir.as_posix()  # pyrefly: ignore[missing-attribute]
   ckpt_step = last_checkpoint_step(ckpt_dir)
   if ckpt_step < 0:
     raise ValueError(f'No checkpoint found in {ckpt_dir}.')
-  return (ckpt_dir / str(ckpt_step)).as_posix()
+  return (ckpt_dir / str(ckpt_step)).as_posix()  # pyrefly: ignore[unsupported-operation]
 
 
 def load_checkpoint_from_dir(
@@ -490,7 +597,7 @@ def resolve_checkpoint_handler_from_json(
       )
     return handler_cls()
   if pytree.tree_is_mapping(handler_in_json):
-    return ocp.CompositeCheckpointHandler(**{
+    return ocp.CompositeCheckpointHandler(**{  # pyrefly: ignore[bad-argument-type]
         k: resolve_checkpoint_handler_from_json(v, restore_concurrent_gb)
         for k, v in handler_in_json.items()
     })
@@ -571,7 +678,7 @@ def construct_restore_item(
     structs.append(
         jax.ShapeDtypeStruct(
             shape=leaf.shape,
-            dtype=_restore_leaf_dtype(leaf.dtype),
+            dtype=_restore_leaf_dtype(leaf.dtype),  # pyrefly: ignore[bad-argument-type]
             sharding=js.NamedSharding(
                 mesh, sharding_lib.partition_spec(partition)
             ),
@@ -589,8 +696,11 @@ def load_checkpoint_from_path(
   target_abstract_state = common.get_raw_arrays(abstract_state)
 
   logging.info('Loading checkpoint from %s', ckpt_path)
+  # Generous restore concurrency so very large sharded checkpoints fit: a
+  # single MoE/embedding shard can be large in bf16. This limit is a per-host
+  # concurrency knob (not raw HBM), so over-provisioning is safe.
   handler = resolve_checkpoint_handler_from_path(
-      ckpt_path, restore_concurrent_gb=200
+      ckpt_path, restore_concurrent_gb=300
   )
   start_time = time.time()
   with ocp.Checkpointer(handler) as checkpointer:
@@ -671,7 +781,7 @@ def load_checkpoint_from_path(
         transform_state_fn, restore_item
     )
     for unused_argpath in unused_argpaths:
-      pytree.set_tree_value(restore_item, unused_argpath, ocp.PLACEHOLDER)
+      pytree.set_tree_value(restore_item, unused_argpath, ocp.PLACEHOLDER)  # pyrefly: ignore[bad-argument-type]
 
     pytree_restore = ocp.args.PyTreeRestore(
         restore_item,
@@ -703,7 +813,7 @@ def load_data_state_from_dir(ckpt_dir: str, ckpt_step: int = -1) -> PyTree:
   """Loads data from a checkpoint at ckpt_step."""
   with ocp.Checkpointer(
       ocp.CompositeCheckpointHandler(
-          **{DATA_ITEM_NAME: ocp.JsonCheckpointHandler()}
+          **{DATA_ITEM_NAME: ocp.JsonCheckpointHandler()}  # pyrefly: ignore[bad-argument-type]
       )
   ) as checkpointer:
     restored = checkpointer.restore(
@@ -724,13 +834,13 @@ def save_checkpoint(
   """Saves a checkpoint at ckpt_step in ckpt_format."""
   extra_args = {}
   if data is not None:
-    extra_args['data'] = ocp.args.JsonSave(data)
+    extra_args['data'] = ocp.args.JsonSave(data)  # pyrefly: ignore[bad-argument-type]
   return checkpoint_manager.save(
       ckpt_step,
       args=ocp.args.Composite(
           state=ocp.args.PyTreeSave(common.get_raw_arrays(state)),
           metadata=ocp.args.JsonSave(
-              pytree.dump({CHECKPOINT_FORMAT_KEY: ckpt_format})
+              pytree.dump({CHECKPOINT_FORMAT_KEY: ckpt_format})  # pyrefly: ignore[bad-argument-type]
           ),
           **extra_args,
       ),

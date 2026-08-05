@@ -18,13 +18,14 @@ import collections
 import dataclasses
 import functools
 import operator
-from typing import Any, cast, ClassVar, final, Mapping
+from typing import Any, ClassVar, Mapping, cast, final
 
 from absl import logging
 import einops
 import jax
 import jax.numpy as jnp
 from simply.utils import common
+from simply.utils import pytree
 from simply.utils import registry
 from simply.utils import sharding
 
@@ -49,6 +50,10 @@ class OptimizerRegistry(registry.RootRegistry):
 class Optimizer(abc.ABC):
   """Base class for optimizers."""
 
+  # When True, intercept NaN/Inf grads inside `apply_with_nan_skip` and skip
+  # the bad update.
+  skip_updates_grad_nans: bool = False
+
   @final
   def __post_init__(self):
     if not dataclasses.is_dataclass(self):
@@ -70,13 +75,65 @@ class Optimizer(abc.ABC):
   def apply(self, state: PyTree, grad: PyTree) -> tuple[PyTree, PyTree]:
     """Applies the update rule to the optimizer state and the gradient."""
 
+  def apply_with_nan_skip(
+      self, state: PyTree, grad: PyTree
+  ) -> tuple[PyTree, PyTree]:
+    """``apply`` wrapped with a NaN/Inf-grad skipper."""
+    if not self.skip_updates_grad_nans:
+      return self.apply(state, grad)
+
+    # Lazily initialize the skip counter (subclass init may not know
+    # about it).
+    if 'nan_skips' not in state:  # pyrefly: ignore[not-iterable]
+      state['nan_skips'] = sharding.with_sharding_constraint(  # pyrefly: ignore[unsupported-operation]
+          jnp.array(0, dtype=jnp.int32), None
+      )
+    nan_skips_counter = state['nan_skips']  # pyrefly: ignore[bad-index, unsupported-operation]
+
+    # Both NaN and Inf are treated as bad leaves.
+    # Inf is treated the same as NaN because an Inf gradient will
+    # inevitably propagate to NaN in m, v, or the update division a
+    # few steps later.
+    bad_leaves = jax.tree_util.tree_leaves(
+        jax.tree_util.tree_map(
+            lambda g: jnp.any(jnp.logical_not(jnp.isfinite(g))), grad
+        )
+    )
+    bad_grad = jnp.any(jnp.stack(bad_leaves))
+
+    def _good_branch(operand):
+      branch_state, branch_grad = operand
+      update, new_state = self.apply(branch_state, branch_grad)
+      # Carry nan_skips through unchanged on the good branch. Both
+      # branches must return dicts with identical key sets / dtypes /
+      # shapes for ``lax.cond`` to typecheck.
+      new_state = dict(new_state)  # pyrefly: ignore[no-matching-overload]
+      new_state['nan_skips'] = nan_skips_counter
+      return update, new_state
+
+    def _skip_branch(operand):
+      branch_state, grad = operand
+      # No call to ``self.apply`` — peak HBM stays at one copy of
+      # state. Return zero update + pre-state (steps included; the
+      # training loop bumps it externally either way) + bumped
+      # nan_skips.
+      skipped_state = dict(branch_state)
+      skipped_state['nan_skips'] = nan_skips_counter + jnp.int32(1)
+      zero_update = pytree.filtered_map(jnp.zeros_like, grad)
+      return zero_update, skipped_state
+
+    return jax.lax.cond(
+        bad_grad, _skip_branch, _good_branch, (state, grad)
+    )
+
   def apply_updates(self, state, updates) -> PyTree:
     """Applies the update to the parameters."""
-    assert jax.tree.map(lambda x: x.shape, state['params']) == jax.tree.map(
-        lambda x: x.shape, updates
-    )
-    new_params = jax.tree_util.tree_map(
-        lambda x, u: x - u, state['params'], updates
+    def _map(u, p):
+      assert u.shape == p.shape, f'{u.shape=} != {p.shape=}'
+      return p - u
+
+    new_params = pytree.filtered_map(
+        _map, updates, state['params'], default=state['params']
     )
     new_params = common.transfer_metadata(state['params'], new_params)
     state['params'] = new_params
@@ -110,19 +167,21 @@ class Adam(Optimizer):
   beta1: float = 0.9
   beta2: float = 0.999
   epsilon: float = 1e-6
+  state_dtype: jax.typing.DTypeLike = 'float32'
 
   def init(self, params):
     state = {}
     state['params'] = params
+    dtype = jnp.dtype(self.state_dtype)
     state['m'] = jax.tree_util.tree_map(
         lambda x: sharding.with_sharding_constraint(
-            jnp.zeros_like(x), sharding.get_array_sharding(x)
+            jnp.zeros_like(x, dtype=dtype), sharding.get_array_sharding(x)
         ),
         params,
     )
     state['v'] = jax.tree_util.tree_map(
         lambda x: sharding.with_sharding_constraint(
-            jnp.zeros_like(x), sharding.get_array_sharding(x)
+            jnp.zeros_like(x, dtype=dtype), sharding.get_array_sharding(x)
         ),
         params,
     )
@@ -130,10 +189,14 @@ class Adam(Optimizer):
     return state
 
   def apply(self, state, grad):
+    dtype = jnp.dtype(self.state_dtype)
     state['m'] = jax.tree_util.tree_map(
-        lambda m, g: m * self.beta1 + g * (1 - self.beta1), state['m'], grad)
+        lambda m, g: jnp.asarray(
+            m * self.beta1 + g * (1 - self.beta1), dtype=dtype),
+        state['m'], grad)
     state['v'] = jax.tree_util.tree_map(
-        lambda v, g: v * self.beta2 + jnp.square(g) * (1 - self.beta2),
+        lambda v, g: jnp.asarray(
+            v * self.beta2 + jnp.square(g) * (1 - self.beta2), dtype=dtype),
         state['v'], grad)
     update = jax.tree_util.tree_map(
         lambda x, y: (x / (1 - self.beta1 ** (state['steps'] + 1))) /
@@ -495,7 +558,7 @@ class LinearWarmupCosineDecay(Schedule):
         decay_steps -= schedule.decay_start
       elif schedule.warmup_steps is not None:
         decay_steps -= schedule.warmup_steps
-      schedule = dataclasses.replace(schedule, decay_steps=decay_steps)
+      schedule = dataclasses.replace(schedule, decay_steps=decay_steps)  # pyrefly: ignore[bad-argument-type]
     else:
       raise ValueError(
           'Cannot specify both steps_after_decay and decay_steps.'

@@ -102,13 +102,15 @@ def transfer_metadata(base_tree: PyTree, target_tree: PyTree):
         array = target.array
       elif isinstance(target, Array):
         array = target
+      elif isinstance(target, jax.ShapeDtypeStruct):
+        array = target
       elif target is None:
         if base is not None:
           raise ValueError(f'Target is None, but base is not None: {base=}')
         array = target
       else:
         raise ValueError(f'Unsupported target type: {type(target)}')
-      return AnnotatedArray.create(array, **base.metadata)
+      return AnnotatedArray.create(array, **base.metadata)  # pyrefly: ignore[bad-argument-type]
     else:
       return target
   return jax.tree.map(_transfer_metadata, base_tree, target_tree,
@@ -217,7 +219,7 @@ def named_partial_fn(
 ) -> Callable[..., Any]:
   """Returns a partial function with the given name."""
   fn = functools.partial(fn, **kwargs)
-  fn.__name__ = name
+  fn.__name__ = name  # pyrefly: ignore[missing-attribute]
   return fn
 
 
@@ -246,8 +248,8 @@ def convert_columns_to_rows(
   keys = list(columns.keys())
   if not keys:
     return []
-  batch_size = len(columns[keys[0]])
-  return [{k: columns[k][i] for k in keys} for i in range(batch_size)]
+  batch_size = len(columns[keys[0]])  # pyrefly: ignore[bad-argument-type]
+  return [{k: columns[k][i] for k in keys} for i in range(batch_size)]  # pyrefly: ignore[bad-index]
 
 
 def find_unused_argpaths(
@@ -312,8 +314,8 @@ def unsorted(
   """Returns a unsorted sequence with the given indices."""
   unsorted_x = [None] * len(sorted_x)
   for i, v in zip(indices, sorted_x, strict=True):
-    unsorted_x[i] = v
-  return unsorted_x
+    unsorted_x[i] = v  # pyrefly: ignore[unsupported-operation]
+  return unsorted_x  # pyrefly: ignore[bad-return]
 
 
 @jax.tree_util.register_dataclass
@@ -433,15 +435,15 @@ class RaggedArray:
   def from_numpy_list(cls, np_list: Sequence[np.typing.ArrayLike]) -> Self:
     data = jnp.concatenate([jnp.asarray(x) for x in np_list], axis=0)
     lens = jnp.array([np.shape(x)[0] for x in np_list])
-    return RaggedArray(data=data, lens=lens)
+    return RaggedArray(data=data, lens=lens)  # pyrefly: ignore[bad-return]
 
   def set_padding_value(self, padding_value: jax.typing.ArrayLike) -> Self:
     if jnp.ndim(padding_value) != 0:
       raise ValueError(f'Padding must be 0d. {jnp.shape(padding_value)=}')
     mask = jnp.arange(self.capacity) < self.total_length
-    mask = jnp.expand_dims(mask, np.arange(1, len(self.data.shape)))
+    mask = jnp.expand_dims(mask, np.arange(1, len(self.data.shape)))  # pyrefly: ignore[bad-argument-type]
     data = jnp.where(mask, self.data, padding_value)
-    return RaggedArray(data=data, lens=self.lens)
+    return RaggedArray(data=data, lens=self.lens)  # pyrefly: ignore[bad-return]
 
   def extend_capacity_to(self, capacity: int) -> Self:
     if capacity < self.capacity:
@@ -451,7 +453,7 @@ class RaggedArray:
       )
     pad_widths = [(0, 0)] * len(self.subshape)
     data = jnp.pad(self.data, [(0, capacity - self.capacity), *pad_widths])
-    return RaggedArray(data=data, lens=self.lens)
+    return RaggedArray(data=data, lens=self.lens)  # pyrefly: ignore[bad-return]
 
   def concat(self, other: Self, capacity: int | None = None) -> Self:
     """Concatenates with another ragged array."""
@@ -484,7 +486,7 @@ class RaggedArray:
     )
     ragged_z = ragged_z.at[self_target_idx].set(self.data, mode='drop')
     ragged_z = ragged_z.at[other_target_idx].set(other.data, mode='drop')
-    return RaggedArray(data=ragged_z, lens=z_lens)
+    return RaggedArray(data=ragged_z, lens=z_lens)  # pyrefly: ignore[bad-return]
 
   def keep_rows(self, row_mask: jax.typing.ArrayLike) -> Self:
     """Keeps the rows that satisfy the row mask."""
@@ -503,13 +505,13 @@ class RaggedArray:
     )
     new_data = self.data[indices]
     new_lens = jnp.where(row_mask, self.lens, 0)
-    return RaggedArray(data=new_data, lens=new_lens)
+    return RaggedArray(data=new_data, lens=new_lens)  # pyrefly: ignore[bad-return]
 
   def keep_last_ncols(self, ncols: int) -> Self:
     """Keeps the last n columns of each row."""
     is_last_n = self.intra_offset >= self.lens[self.row_ids] - ncols
     indices = jnp.flatnonzero(is_last_n, size=self.capacity, fill_value=0)
-    return RaggedArray(
+    return RaggedArray(  # pyrefly: ignore[bad-return]
         data=self.data[indices], lens=jnp.minimum(self.lens, ncols)
     )
 
@@ -533,7 +535,7 @@ def convert_array_with_abstract(
   # Direct device-to-device transfer avoids expensive host roundtrip.
   # Cast under the source mesh context so jnp.astype compiles with the
   # correct device ordering (the caller's mesh context may differ).
-  with js.set_mesh(x.sharding.mesh):
+  with js.set_mesh(x.sharding.mesh):  # pyrefly: ignore[bad-argument-type]
     x = jnp.astype(x, abstract.dtype)
   return jax.device_put(x, abstract.sharding)
 

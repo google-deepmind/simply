@@ -17,16 +17,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { cachedWorkspaceInfo, loadWorkspaceInfo, refreshWorkspaceInfo } from '$lib/workspaceInfo';
-	import { FolderIcon, FolderPlusIcon, GitBranchIcon, CaretDownIcon } from 'phosphor-svelte';
+	import { INTERNAL, ExtraWorkspacePicker, resolveExtraWorkspace, NO_SELECTION } from './internal';
+	import { FolderIcon, CaretDownIcon } from 'phosphor-svelte';
+	import type { Component } from 'svelte';
 
-	// value is the resolved workspace spec sent to the server (abs path,
-	// `new:citc/jj`, `new:citc/fig`, or `citc:<alias>`). ondirty fires on any
-	// user edit so the parent form can stay expanded. interactive (run mode)
-	// drives the default workspace mode when the user hasn't manually picked
-	// one: autonomous → "new" (fresh CitC worktree, the common case for
-	// fire-and-forget tasks), interactive → "path" (the server cwd, since the
-	// operator usually wants to chat in whatever existing workspace they're
-	// in). Switching back and forth with no manual pick toggles the default.
+	// value is the resolved workspace spec sent to the server. ondirty fires on
+	// any user edit so the parent form can stay expanded. interactive (run mode)
+	// picks the default source when the user hasn't chosen one: an interactive
+	// run stays in the server's working directory, an autonomous one prefers a
+	// fresh workspace where the build offers one.
 	let {
 		value = $bindable('.'),
 		summary = $bindable(''),
@@ -39,80 +38,60 @@
 	// abs path immediately with no "working dir" → path flicker.
 	const cached = cachedWorkspaceInfo();
 
-	type Mode = 'path' | 'new' | 'citc';
-	// Default to "new anonymous citc/jj" when citc is available (the most
-	// common new-run intent on corp dev hosts). Cache-miss case falls back to
-	// 'path' and switches in onMount once we've confirmed citc availability,
-	// unless the user has manually picked a mode by then (userPicked). Both
-	// initializers read from the same cached snapshot (NOT from each other)
-	// so they reflect a consistent first-render state.
-	let citcAvailable = $state(cached?.citc_available ?? false);
-	let mode = $state<Mode>(cached?.citc_available ? 'new' : 'path');
 	let path = $state(cached?.server_root ?? ''); // abs cwd; never a bare "."
-	let vcs = $state<'jj' | 'fig'>('jj');
-	let alias = $state('');
 	let recent = $state<string[]>(cached?.recent ?? []);
-	let loaded = $state(cached != null);
+	let loaded = $state(!!cached);
 	let open = $state(false);
+
+	// Extra workspace sources, if this build has any. Two independent gates:
+	// INTERNAL is a build-time constant, so the block below is dropped from
+	// builds without those components; workspace_modes is what the SERVER says
+	// it can actually resolve. Offering a source the server would reject is
+	// worse than not offering it.
+	let modes = $state<string[]>(cached?.workspace_modes ?? []);
+	const extras = $derived(INTERNAL && modes.length > 0);
+
+	// The picker's controls live inside the popover and unmount with it, so the
+	// SELECTION lives here (the host is always mounted) and is resolved on every
+	// render. That keeps the choice correct — and the run-mode default applied —
+	// while the popover is closed, which is most of the time.
+	let extraState = $state<Record<string, unknown>>({});
+	const extraSel = $derived(
+		extras ? resolveExtraWorkspace(extraState, !interactive) : NO_SELECTION,
+	);
+
 	let userPicked = $state(false);
 
-	// Cache miss (user expanded before the prefetch resolved): fetch on mount.
-	// Degrades silently to a plain path input if it fails. If the async load
-	// reveals citc is available AND the user hasn't manually picked a mode yet,
-	// switch the default to 'new' to match the warm-cache experience.
-	onMount(async () => {
-		if (!loaded) {
-			try {
-				const info = await loadWorkspaceInfo();
-				citcAvailable = info.citc_available;
-				recent = info.recent ?? [];
-				if (info.server_root) path = info.server_root;
-				if (citcAvailable && !userPicked && mode === 'path') {
-					mode = 'new';
-				}
-			} catch {
-				/* keep defaults; the picker degrades to free-form path entry */
-			} finally {
-				loaded = true;
-			}
-		}
-		// Fire-and-forget: the cached recents are frozen at page load, so a CitC
-		// workspace created/used since then is missing. Each form expansion mounts
-		// this component, so we refresh in the background and land ONLY the fresh
-		// candidate list — never the user's in-progress mode/path/alias choices. If
-		// it lands while they're picking, more/fresher options simply appear; if it
-		// fails or never returns, the cached list stays usable. Non-blocking.
-		refreshWorkspaceInfo()
+	// Refresh in the background; a cache miss fills the fields on arrival.
+	onMount(() => {
+		loadWorkspaceInfo()
 			.then((info) => {
+				if (!info) return;
+				modes = info.workspace_modes ?? [];
 				recent = info.recent ?? [];
+				if (!userPicked && !path) path = info.server_root ?? '';
+				loaded = true;
 			})
 			.catch(() => {});
 	});
 
-	// Run-mode → workspace-mode auto-switch. Activates only AFTER the initial
-	// load resolves (so cache-miss flicker doesn't fight us) and only when
-	// the user hasn't explicitly picked a workspace mode. Setting any mode
-	// via the popover flips userPicked, freezing this behavior so subsequent
-	// run-mode toggles don't undo the user's choice.
+	// Re-read recents when the popover opens, so a workspace created since page
+	// load shows up. Only the candidate list is refreshed — never the user's
+	// in-progress choices.
 	$effect(() => {
-		if (!loaded) return;
-		if (userPicked) return;
-		mode = interactive ? 'path' : citcAvailable ? 'new' : 'path';
+		if (!open) return;
+		refreshWorkspaceInfo()
+			.then((info) => {
+				if (info) recent = info.recent ?? [];
+			})
+			.catch(() => {});
 	});
 
-	// Derive the spec to submit from the active mode. Empty path → "." so a
-	// submit before load still resolves to the server cwd (== server_root).
+	// Derive the spec to submit. Empty path → "." so a submit before load still
+	// resolves to the server cwd (== server_root).
 	$effect(() => {
-		if (mode === 'new') value = `new:citc/${vcs}`;
-		else if (mode === 'citc') value = alias.trim() ? `citc:${alias.trim()}` : '';
-		else value = path.trim() || '.';
+		value = extraSel.active ? extraSel.spec : path.trim() || '.';
 	});
-
-	const filtered = $derived(
-		alias.trim()
-			? recent.filter((a) => a.toLowerCase().includes(alias.trim().toLowerCase()))
-			: recent
-	);
 
 	function basename(p: string): string {
 		const parts = p.split('/').filter(Boolean);
@@ -120,39 +99,20 @@
 	}
 
 	// Pill label: short and stable; full detail on hover (title). Pushed into
-	// the bindable `summary` prop via $effect so the parent (e.g.
-	// StartRunForm) can use the same short label in its own UI — notably
-	// the Start button shows it during the resolving stage so the user sees
-	// what's being created without inflating the button text.
+	// the bindable `summary` prop via $effect so the parent (e.g. StartRunForm)
+	// can use the same short label in its own UI — notably the Start button
+	// shows it during the resolving stage.
 	$effect(() => {
-		summary =
-			mode === 'new'
-				? `new · ${vcs}`
-				: mode === 'citc'
-					? alias.trim() || 'citc workspace'
-					: loaded
-						? basename(path) || 'working dir'
-						: 'working dir';
+		summary = extraSel.active
+			? extraSel.summary
+			: loaded
+				? basename(path) || 'working dir'
+				: 'working dir';
 	});
-	const title = $derived(
-		mode === 'new'
-			? `New anonymous CitC workspace (${vcs})`
-			: mode === 'citc'
-				? alias.trim()
-					? `citc:${alias.trim()}`
-					: 'Open an existing named CitC workspace'
-				: path || 'server working directory'
-	);
+	const title = $derived(extraSel.active ? extraSel.title : path || 'server working directory');
+	const TriggerIcon = $derived(extraSel.icon ?? FolderIcon);
 
-	// Icon mirrors the active mode so the trigger pill telegraphs which kind
-	// of workspace is selected without having to read the label:
-	//   path → 📁 folder; new → 📁+ folder-plus; citc → 🌿 git-branch.
-	const TriggerIcon = $derived(
-		mode === 'new' ? FolderPlusIcon : mode === 'citc' ? GitBranchIcon : FolderIcon
-	);
-
-	function setMode(m: Mode) {
-		mode = m;
+	function onExtraPick() {
 		userPicked = true;
 		ondirty?.();
 	}
@@ -187,21 +147,17 @@
 
 	{#if open}
 		<div class="menu">
-			{#if citcAvailable}
-				<div class="modes" role="group" aria-label="Workspace source">
-					<button type="button" class:on={mode === 'new'} onclick={() => setMode('new')}
-						>New CitC</button
-					>
-					<button type="button" class:on={mode === 'citc'} onclick={() => setMode('citc')}
-						>Open CitC</button
-					>
-					<button type="button" class:on={mode === 'path'} onclick={() => setMode('path')}
-						>Path</button
-					>
-				</div>
+			{#if extras}
+				<ExtraWorkspacePicker
+					bind:persisted={extraState}
+					{recent}
+					{loaded}
+					prefer={!interactive}
+					onpick={onExtraPick}
+				/>
 			{/if}
 
-			{#if mode === 'path'}
+			{#if !extraSel.active}
 				<input
 					class="field"
 					bind:value={path}
@@ -211,39 +167,6 @@
 					spellcheck="false"
 					autocapitalize="off"
 				/>
-			{:else if mode === 'new'}
-				<div class="newrow">
-					<div class="vcs" role="group" aria-label="VCS">
-						<button type="button" class:on={vcs === 'jj'} onclick={() => { vcs = 'jj'; touch(); }}
-							>jj</button
-						>
-						<button type="button" class:on={vcs === 'fig'} onclick={() => { vcs = 'fig'; touch(); }}
-							>fig</button
-						>
-					</div>
-					<span class="dim small">unnamed workspace</span>
-				</div>
-			{:else if mode === 'citc'}
-				<input
-					class="field"
-					bind:value={alias}
-					oninput={touch}
-					use:focusEl
-					placeholder="workspace alias…"
-					spellcheck="false"
-					autocapitalize="off"
-				/>
-				{#if filtered.length}
-					<ul class="recents">
-						{#each filtered as a (a)}
-							<li>
-								<button type="button" onclick={() => { alias = a; open = false; touch(); }}>{a}</button>
-							</li>
-						{/each}
-					</ul>
-				{:else if loaded}
-					<p class="hint dim small">No recent workspaces.</p>
-				{/if}
 			{/if}
 		</div>
 	{/if}
@@ -290,84 +213,8 @@
 		z-index: 10;
 		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 	}
-	.modes {
-		display: inline-flex;
-		gap: 0.15rem;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-pill);
-		padding: 0.12rem;
-		margin-bottom: 0.5rem;
-	}
-	.modes button {
-		background: none;
-		border: none;
-		border-radius: var(--radius-pill);
-		padding: 0.2rem 0.7rem;
-		font-size: var(--fs-md);
-		color: var(--text-dim);
-		cursor: pointer;
-	}
-	.modes button.on {
-		background: var(--bg-elev2);
-		color: var(--text);
-	}
 	.field {
 		width: 100%;
 		font: inherit;
-	}
-	.newrow {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-	}
-	.vcs {
-		display: inline-flex;
-		gap: 0.15rem;
-		background: var(--bg);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-pill);
-		padding: 0.12rem;
-	}
-	.vcs button {
-		background: none;
-		border: none;
-		border-radius: var(--radius-pill);
-		padding: 0.15rem 0.7rem;
-		font-size: var(--fs-md);
-		color: var(--text-dim);
-		cursor: pointer;
-	}
-	.vcs button.on {
-		background: var(--bg-elev2);
-		color: var(--text);
-	}
-	.hint {
-		margin: 0.4rem 0 0;
-	}
-	.recents {
-		list-style: none;
-		margin: 0.4rem 0 0;
-		padding: 0;
-		max-height: 12rem;
-		overflow-y: auto;
-	}
-	.recents button {
-		display: block;
-		width: 100%;
-		text-align: left;
-		background: none;
-		border: none;
-		border-radius: var(--radius-xs);
-		padding: 0.3rem 0.5rem;
-		font-size: var(--fs-md);
-		color: var(--text);
-		cursor: pointer;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.recents button:hover {
-		background: var(--bg-elev2);
 	}
 </style>

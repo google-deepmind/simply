@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package subprocess
+package bridge
 
 import (
 	"bufio"
@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -58,7 +59,7 @@ func TestMain(m *testing.M) {
 
 func newProvider(t *testing.T, model string) *provider {
 	t.Helper()
-	p, err := New(bridgeBin, 1000, mustArgs("model="+model))
+	p, err := NewSubprocess(model, 1000, mustArgs("bin="+bridgeBin), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -70,8 +71,8 @@ func userReq(content string) llm.Request {
 }
 
 func TestNew_RequiresModel(t *testing.T) {
-	if _, err := New(bridgeBin, 1000, mustArgs("")); err == nil {
-		t.Error("expected error when ?model= is missing")
+	if _, err := NewSubprocess("", 1000, mustArgs("bin="+bridgeBin), nil); err == nil {
+		t.Error("expected error when the model is missing")
 	}
 }
 
@@ -142,11 +143,12 @@ func TestConcurrent_ReuseOneSubprocess(t *testing.T) {
 		t.Errorf("concurrent call: %v", err)
 	}
 	// All requests were served by a single reused subprocess for this spec key.
+	key := p.tr.(*spawnTransport).key
 	defaultManager.mu.Lock()
-	pr := defaultManager.procs[p.key]
+	pr := defaultManager.procs[key]
 	defaultManager.mu.Unlock()
 	if pr == nil || !pr.alive {
-		t.Fatalf("expected one live reused subprocess for key %q", p.key)
+		t.Fatalf("expected one live reused subprocess for key %q", key)
 	}
 }
 
@@ -193,6 +195,12 @@ func TestStartup_EarlyExitFailsFast(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "code 7") {
 		t.Errorf("error %q should surface the bridge exit code", err)
+	}
+	// The bridge's own stderr must be IN the error. Everything logPipe writes
+	// goes to Debug, which the default level drops, so an error that merely
+	// points at "stderr above" points at nothing.
+	if !strings.Contains(err.Error(), "dying without binding") {
+		t.Errorf("error %q should quote the bridge's stderr", err)
 	}
 	// Generous bound: should be well under a second, certainly nowhere near
 	// the 30s healthTimeout. 2s avoids flakes on a loaded test machine.
@@ -354,4 +362,103 @@ func testBridgeGenerate(w http.ResponseWriter, r *http.Request) {
 		"usage":       map[string]int{"prompt_tokens": len(last), "completion_tokens": len(reply), "total_tokens": len(last) + len(reply)},
 		"stop_reason": "end_turn",
 	}})
+}
+
+// TestPostToSendsProtocolHeaders pins what every transport puts on the wire.
+// The version header is what lets two separately built ends fail loudly on a
+// mismatch instead of as a puzzling decode error.
+func TestPostToSendsProtocolHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}))
+	defer srv.Close()
+
+	resp, err := postTo(context.Background(), srv.Client(), srv.URL+"/generate", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("postTo: %v", err)
+	}
+	_ = resp.Body.Close()
+	if v := got.Get("Content-Type"); v != "application/json" {
+		t.Errorf("Content-Type = %q", v)
+	}
+	if v := got.Get(protocolVersionHeader); v != protocolVersion {
+		t.Errorf("%s = %q, want %q", protocolVersionHeader, v, protocolVersion)
+	}
+}
+
+// TestToWireCarriesSessionID: the session id drives cache/routing affinity on
+// the far side (the Claude provider turns it into X-Vertex-Ai-Session-Id).
+// Dropping it silently costs prompt-cache hits, which is invisible in tests and
+// expensive in production — hence a test for one field.
+func TestToWireCarriesSessionID(t *testing.T) {
+	p := &provider{model: "m", maxTokens: 10}
+	w := p.toWire(llm.Request{SessionID: "sess-42"})
+	if w.SessionID != "sess-42" {
+		t.Errorf("wire session_id = %q, want %q", w.SessionID, "sess-42")
+	}
+	if w := (&provider{model: "m"}).toWire(llm.Request{}); w.SessionID != "" {
+		t.Errorf("absent session id should stay absent, got %q", w.SessionID)
+	}
+}
+
+// TestUnknownLineTypesAreIgnored is the forward-compatibility guarantee that
+// lets the protocol grow: a reader from an older build must skip a line kind it
+// has never heard of (a keepalive "ping", say) rather than fail the request.
+func TestUnknownLineTypesAreIgnored(t *testing.T) {
+	stream := `{"type":"ping"}` + "\n" +
+		`{"type":"delta","text":"hel"}` + "\n" +
+		`{"type":"ping"}` + "\n" +
+		`{"type":"delta","text":"lo"}` + "\n" +
+		`{"type":"something-from-the-future","payload":{"a":1}}` + "\n" +
+		`{"type":"final","response":{"content":"hello"}}` + "\n"
+
+	resp, err := readFinal(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("readFinal: %v", err)
+	}
+	if resp.Content != "hello" {
+		t.Errorf("content = %q, want %q", resp.Content, "hello")
+	}
+}
+
+// TestSubprocessSpecShapes: both spellings must reach the same bridge with the
+// same instructions, because the DB holds specs written in the old one and a
+// silent difference between them would be a support nightmare.
+func TestSubprocessSpecShapes(t *testing.T) {
+	current, err := NewSubprocess("some-model", 100,
+		mustArgs("bin=/opt/bridges/corp"), mustArgs("temperature=0.2"))
+	if err != nil {
+		t.Fatalf("current form: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		p    llm.Provider
+	}{{"current", current}} {
+		tr := tc.p.(*provider).tr.(*spawnTransport)
+		if tr.binary != "/opt/bridges/corp" {
+			t.Errorf("%s: binary = %q", tc.name, tr.binary)
+		}
+		if got := tc.p.ModelID(); got != "some-model" {
+			t.Errorf("%s: model = %q", tc.name, got)
+		}
+		// model= is part of the bridge contract, so it is sent whichever way the
+		// operator spelled the spec; bin= is ours and means nothing to a bridge.
+		if !strings.Contains(tr.specQuery, "model=some-model") {
+			t.Errorf("%s: AMPLIO_BRIDGE_SPEC = %q, want model= in it", tc.name, tr.specQuery)
+		}
+		if strings.Contains(tr.specQuery, "bin=") {
+			t.Errorf("%s: AMPLIO_BRIDGE_SPEC = %q, must not leak bin=", tc.name, tr.specQuery)
+		}
+		if !strings.Contains(tr.specQuery, "temperature=0.2") {
+			t.Errorf("%s: model args should ride along: %q", tc.name, tr.specQuery)
+		}
+	}
+	// Neither half may be missing.
+	if _, err := NewSubprocess("", 100, mustArgs(""), nil); err == nil {
+		t.Error("want an error with no bridge path")
+	}
+	if _, err := NewSubprocess("", 100, mustArgs("bin=/opt/bridges/corp"), nil); err == nil {
+		t.Error("want an error with no model")
+	}
 }

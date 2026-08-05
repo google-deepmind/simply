@@ -21,6 +21,7 @@
 # - Caller feed page indices in 2d.
 # - Round-robin style per sequence context sharding.
 # - Added support for megacore.
+# - Upcast loaded KV to higher precision for TPU < v6.
 
 """TPU-Friendly Ragged Paged Attention kernel.
 
@@ -72,10 +73,11 @@ def get_tpu_version() -> int:
   kind = jax.devices()[0].device_kind
   if "TPU" not in kind:
     return -1
-  if kind.endswith(" lite"):
-    kind = kind[: -len(" lite")]
   if kind == "TPU7x":
     return 7
+  for s in (" lite", "e", "p"):
+    if kind.endswith(s):
+      kind = kind[: -len(s)]
   assert kind[:-1] == "TPU v", kind
   return int(kind[-1])
 
@@ -253,7 +255,7 @@ def ref_ragged_paged_attention(
 
   result = jnp.concatenate(outputs, axis=0)
   if not update_kv_cache:
-    kv_cache = None
+    kv_cache = None  # pyrefly: ignore[bad-assignment]
   if not save_residuals:
     logsumexps = None
   return result, kv_cache, logsumexps
@@ -537,10 +539,105 @@ def _ragged_paged_attention_kernel_loop(
   cur_seq_start_bkv_idx = 0
   next_seq_start_bkv_idx = 0
 
+  # BEGIN removable: KV write-back clamp.
+  #
+  # Why it is here: the sliding-window skip below can start above the first BKV
+  # block that holds newly issued KV.  The KV under it is then computed,
+  # window-masked and dropped, so the pass leaves a hole *inside* `kv_lens` in
+  # the paged cache.  Attention itself survives that -- every token in the hole
+  # is out of window for every query that could read it -- but consumers that
+  # read the pages directly do not, notably `DecodeState.extract_chunk` (prefix
+  # caching, disaggregated prefill), which reports a chunk as `available=True`
+  # from `base_col >= 0` and cannot tell that part of a page was never written.
+  # Clamping the skip so the write-back covers every issued token costs ~2% of
+  # attention latency on the least-loaded shard.
+  #
+  # TODO: remove once prefix caching tolerates unwritten holes.  The
+  # edit is mechanical: delete everything between the BEGIN/END markers and
+  # unwrap the four `_keep_new_kv_blocks(...)` call sites below, each of which
+  # keeps its original `_global_pos_to_local_bkv_idx(...)` expression as its
+  # first argument.  Nothing else in the kernel knows about the clamp.
+  #
+  # BUT removing it is only safe TOGETHER WITH adding a V-side sliding-window
+  # mask in `flash_attention_step1_qk_softmax`.  Without the clamp, a pass that
+  # issues more than `sliding_window` tokens leaves unwritten pages that stay
+  # resident in `kv_lens`, and a later pass does load them: eviction and
+  # `DecodeState.release_for_window()` compaction renumber local offsets by
+  # whole PAGES, not whole BKV blocks, so the floored `start_bkv_idx` dips
+  # below the top of the hole.  Every such key is score-masked, but `p @ v`
+  # still evaluates `0 * NaN = NaN` on uninitialised HBM and the NaN reaches
+  # the logits.  The mask has to zero V for keys outside the window, e.g. as a
+  # scalar lower bound on the local index (local -> global is strictly
+  # increasing on a shard):
+  #
+  #   v_lo = compute_local_kv_len(
+  #       jnp.maximum(processed_q_len_int - sliding_window + 1, 0),
+  #       shard_id, num_shards, page_size).astype(int_ty)
+  #   v = jnp.where(v_span_local >= v_lo, v, 0.0)
+  #
+  # verified equivalent to the per-token global-position predicate over
+  # 1,736,000 combinations of (page_size, num_shards, shard_id, sliding_window,
+  # processed_q_len, local index), measured cost ~0%.  The test that catches a
+  # removal without the mask is
+  # `test_multi_pass_prefill_with_recycled_pages_shards4_window9` in
+  # `simply/utils/rpa_shard_window_repro_test.py`: 24/128 NaNs when
+  # neither the clamp nor the mask is present.
+
+  def _num_bq_for(seq_q_len):
+    """Returns `num_bq` of `process()` for a sequence of `seq_q_len` queries."""
+    if static_q_len is None:
+      return cdiv(seq_q_len, bq_sz)
+    return cdiv(static_q_len, min(bq_sz, static_q_len))
+
+  def _keep_new_kv_blocks(
+      start_bkv_idx, *, seq_kv_len, seq_q_len, is_writeback_bq
+  ):
+    """Never let the sliding-window skip jump past *unwritten* new KV.
+
+    The newly issued KV of a pass is written back to the paged cache from the
+    BQ block that also runs the last query (`bq_idx == num_bq - 1`), and only
+    over the BKV blocks that block visits.  With a sliding window narrower than
+    what the pass issues, `start_bkv_idx` can sit above the first not-yet-cached
+    BKV block, so the KV of the tokens below it is computed, masked out and then
+    dropped -- leaving a hole inside `kv_lens` in the paged cache.
+
+    Clamping `start_bkv_idx` down to the first BKV block that holds new KV makes
+    the write-back cover every issued token again.  Gating on `is_writeback_bq`
+    keeps the extra BKV blocks out of the other BQ blocks, which do not write
+    anything back (that gating is what makes this cost ~2% instead of ~20%).
+
+    Args:
+      start_bkv_idx: the sliding window's BKV start block for this BQ block.
+      seq_kv_len: global KV length of the sequence (cache + newly issued).
+      seq_q_len: number of newly issued tokens of the sequence.
+      is_writeback_bq: whether this is the BQ block that writes KV back.
+
+    Returns:
+      `start_bkv_idx`, clamped so that no unwritten new KV is skipped.
+    """
+    if updated_kv_cache_hbm_ref is None:
+      return start_bkv_idx
+    cache_len = compute_local_kv_len(
+        seq_kv_len - seq_q_len, shard_id, num_shards, page_size
+    )
+    total_len = compute_local_kv_len(
+        seq_kv_len, shard_id, num_shards, page_size
+    )
+    return jnp.where(
+        jnp.logical_and(is_writeback_bq, cache_len < total_len),
+        jnp.minimum(start_bkv_idx, cache_len // bkv_sz),
+        start_bkv_idx,
+    )
+
+  # END removable: KV write-back clamp.
+
   if sliding_window is not None:
     # TODO: can skip by page_size instead of bkv_sz.
-    cur_seq_start_bkv_idx = _global_pos_to_local_bkv_idx(
-        jnp.maximum(kv_q_gap - sliding_window, 0)
+    cur_seq_start_bkv_idx = _keep_new_kv_blocks(
+        _global_pos_to_local_bkv_idx(jnp.maximum(kv_q_gap - sliding_window, 0)),
+        seq_kv_len=kv_len,
+        seq_q_len=q_len,
+        is_writeback_bq=(_num_bq_for(q_len) == 1),
     )
     safe_next_seq_idx = jnp.minimum(next_seq_idx, end_seq_idx - 1)
     next_q_start = cu_q_lens_ref[safe_next_seq_idx]
@@ -548,8 +645,13 @@ def _ragged_paged_attention_kernel_loop(
     next_q_len = next_q_end - next_q_start
     next_kv_len = kv_lens_ref[safe_next_seq_idx]
     next_kv_q_gap = next_kv_len - next_q_len
-    next_seq_start_bkv_idx = _global_pos_to_local_bkv_idx(
-        jnp.maximum(next_kv_q_gap - sliding_window, 0)
+    next_seq_start_bkv_idx = _keep_new_kv_blocks(
+        _global_pos_to_local_bkv_idx(
+            jnp.maximum(next_kv_q_gap - sliding_window, 0)
+        ),
+        seq_kv_len=next_kv_len,
+        seq_q_len=next_q_len,
+        is_writeback_bq=(_num_bq_for(next_q_len) == 1),
     )
 
   def debug_print(msg, *args):
@@ -606,6 +708,16 @@ def _ragged_paged_attention_kernel_loop(
         q = jnp.clip(q, min=minval, max=maxval)
       q = q.astype(k.dtype)
 
+    # Low-precision (fp8) KV cache: K is streamed from HBM in fp8 (the bandwidth
+    # win). TPU < v6 rejects fp8 as a matmul RHS
+    # (CompileTimeMosaicUnsupportedRhsType), so there we upcast K to the (bf16)
+    # query dtype for the QK^T MXU matmul; HBM traffic is unaffected. On v6+ fp8
+    # is a valid MXU operand, so we keep K in fp8 and matmul directly (compute
+    # win). K/V are raw-cast to fp8 (no scale), so no dequant is needed; the
+    # optional k_scale below stays unused on the fp8 KV path.
+    if get_tpu_version() < 6 and k.dtype != q.dtype:
+      k = k.astype(q.dtype)
+
     s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32).astype(out_dtype)
     s *= sm_scale
     if k_scale is not None:
@@ -652,7 +764,7 @@ def _ragged_paged_attention_kernel_loop(
       mask = mask_and(mask, q_span < k_span + sliding_window)
 
     if mask is not None:
-      s = jnp.where(mask, s, mask_value)
+      s = jnp.where(mask, s, mask_value)  # pyrefly: ignore[bad-argument-type]
 
     s_rowmax = jnp.max(s, axis=1, keepdims=True)
     m_prev = m_ref[...]
@@ -680,6 +792,12 @@ def _ragged_paged_attention_kernel_loop(
     assert v.shape == (bkv_csz, head_dim)
     assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
     assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
+    # See the QK^T note above: on TPU < v6 upcast a low-precision (fp8) V to the
+    # probability dtype so the PV MXU matmul uses a supported RHS dtype; on v6+
+    # fp8 is a valid MXU operand so V stays fp8. V is raw-cast fp8 (no scale) on
+    # the fp8 KV path, so no dequant is applied.
+    if get_tpu_version() < 6 and v.dtype != p.dtype:
+      v = v.astype(p.dtype)
     pv = jnp.matmul(p, v, preferred_element_type=jnp.float32).astype(out_dtype)
     if v_scale is not None:
       pv *= v_scale
@@ -1102,10 +1220,15 @@ def _ragged_paged_attention_kernel_loop(
 
       next_bq_start_bkv_idx = 0
       if sliding_window is not None:
-        next_bq_start_bkv_idx = _global_pos_to_local_bkv_idx(
-            jnp.maximum(
-                kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0
-            )
+        next_bq_start_bkv_idx = _keep_new_kv_blocks(
+            _global_pos_to_local_bkv_idx(
+                jnp.maximum(
+                    kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0
+                )
+            ),
+            seq_kv_len=kv_len,
+            seq_q_len=q_len,
+            is_writeback_bq=(bq_idx + 1 == num_bq - 1),
         )
       next_bkv_idx = lax.select(
           is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx
@@ -1131,8 +1254,13 @@ def _ragged_paged_attention_kernel_loop(
       start_bkv_idx = 0
       if sliding_window is not None:
         # Recalculate the start_bkv_idx based on the processed_q_len.
-        start_bkv_idx = _global_pos_to_local_bkv_idx(
-            jnp.maximum(processed_q_len - sliding_window, 0)
+        start_bkv_idx = _keep_new_kv_blocks(
+            _global_pos_to_local_bkv_idx(
+                jnp.maximum(processed_q_len - sliding_window, 0)
+            ),
+            seq_kv_len=kv_len,
+            seq_q_len=q_len,
+            is_writeback_bq=(bq_idx == num_bq - 1),
         )
       if use_causal_mask:
         effective_kv_len = jnp.minimum(

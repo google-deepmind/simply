@@ -95,19 +95,19 @@ class PatchEncoder(module.SimplyModule):
   def apply(self, params: PyTree, image: Array) -> Array:
     params = common.get_raw_arrays(params)
     kernel = common.convert_or_dequantize(
-        params['kernel'], dtype=self.activation_dtype
+        params['kernel'], dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
     )
     bias = common.convert_or_dequantize(
-        params['bias'], dtype=self.activation_dtype
+        params['bias'], dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
     )
     pos_embedding = common.convert_or_dequantize(
-        params['pos_embedding'], dtype=self.activation_dtype
+        params['pos_embedding'], dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
     )
 
     image = self._normalize_image(image)
     image = image.astype(self.activation_dtype)
     x = jax.lax.conv_general_dilated(
-        image,
+        image,  # pyrefly: ignore[bad-argument-type]
         kernel,
         dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
         window_strides=self.patch_size,
@@ -235,7 +235,7 @@ class VisionTransformer(module.SimplyModule):
   def apply(self, params: PyTree, image: Array) -> Array:
     assert self.width % self.num_heads == 0
 
-    x = self.patch_encoder.apply(params['patch_encoder'], image)
+    x = self.patch_encoder.apply(params['patch_encoder'], image)  # pyrefly: ignore[bad-index, unsupported-operation]
     n, seq_len = x.shape[:2]
 
     # Set all positions to 0 to effectively turn off rotary embeddings. For
@@ -245,13 +245,13 @@ class VisionTransformer(module.SimplyModule):
 
     for i, block in enumerate(self.transformer_blocks):
       x, _ = block.apply(
-          params[f'encoderblock_{i}'],
+          params[f'encoderblock_{i}'],  # pyrefly: ignore[bad-index, unsupported-operation]
           x,
           segment_ids=segment_ids,
           segment_positions=segment_positions,
       )
 
-    x = self.pre_downsample_norm.apply(params['pre_downsample_ln'], x)
+    x = self.pre_downsample_norm.apply(params['pre_downsample_ln'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x = self.downsample(
         x,
         input_patch_dims=self.patch_encoder.output_grid_shape,
@@ -260,6 +260,6 @@ class VisionTransformer(module.SimplyModule):
 
     # "Embedder" part of Gemma 3 vision encoding that converts the
     # Siglip dimension to the internal transformer dimension.
-    x = self.post_downsample_norm.apply(params['post_downsample_ln'], x)
-    x = self.final_projection.apply(params['final_projection'], x)
+    x = self.post_downsample_norm.apply(params['post_downsample_ln'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
+    x = self.final_projection.apply(params['final_projection'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     return x

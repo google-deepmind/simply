@@ -20,38 +20,39 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
-
-	"amplio/internal/env"
 )
+
+// extraWorkspaceModes lists the workspace sources this build offers beyond a
+// plain path, in the order the picker should show them. A build that cannot
+// resolve a mode must not advertise it: the picker would offer a choice that
+// fails at run start. Empty here; builds that add sources install their own.
+var extraWorkspaceModes = func() []string { return nil }
 
 // recentWorkspacesLimit caps the New-Run workspace picker. It's a recency
 // quick-select, not an exhaustive browser — the operator can always type an
 // alias not in the list.
 const recentWorkspacesLimit = 50
 
-// citcCloudRoot is the service-managed CitC cloud filesystem mount root,
-// under which each of the operator's named workspaces is a directory. Empty
-// in OSS — citc is internal-only; a 1P init in workspaces_internal.go
-// overrides this so the recent-workspaces picker can list real CitC
-// directories.
-var citcCloudRoot = ""
+// workspaceRecentRoot is the per-user directory whose children are offered as
+// recent workspaces. Empty here (nothing to list); builds with a managed
+// workspace root install their own.
+var workspaceRecentRoot = ""
 
-// workspaceInfo feeds the New-Run workspace control: whether CitC modes apply
-// (1P dev env), the path to prefill (the server's cwd — the "inherit" default),
-// and the operator's recent named CitC workspaces.
+// workspaceInfo feeds the New-Run workspace control: the extra workspace
+// sources this build offers, the path to prefill (the server's cwd — the
+// "inherit" default), and recent workspaces to quick-select.
 type workspaceInfo struct {
-	CitcAvailable bool     `json:"citc_available"`
-	ServerRoot    string   `json:"server_root"`
-	Recent        []string `json:"recent"`
+	Modes      []string `json:"workspace_modes"`
+	ServerRoot string   `json:"server_root"`
+	Recent     []string `json:"recent"`
 }
 
 func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	user := os.Getenv("USER")
 	writeJSON(w, http.StatusOK, workspaceInfo{
-		// CitC is a 1P-dev-env feature; in that mode we assume it's present.
-		CitcAvailable: env.Internal(),
-		ServerRoot:    serverCwd(),
-		Recent:        listRecentWorkspaces(filepath.Join(citcCloudRoot, user)),
+		Modes:      extraWorkspaceModes(),
+		ServerRoot: serverCwd(),
+		Recent:     listRecentWorkspaces(filepath.Join(workspaceRecentRoot, user)),
 	})
 }
 
@@ -63,7 +64,7 @@ func serverCwd() string {
 }
 
 // listRecentWorkspaces returns the names of root's immediate subdirectories,
-// most-recently-modified first, capped at recentWorkspacesLimit. On CitC's cloud
+// most-recently-modified first, capped at recentWorkspacesLimit. On a networked
 // FS each attached alias is a directory whose mtime tracks last use, so a plain
 // mtime sort yields recency with no shell-out. Best-effort: any FS error yields
 // an empty list so the picker degrades to free-form entry.

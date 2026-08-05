@@ -63,6 +63,21 @@ class SimplyModule(abc.ABC):
   def init(self, prng_key: jax.Array) -> PyTree:
     """initialize the parameters associated with the module."""
 
+  def quantize(self, params: PyTree) -> PyTree:
+    """Returns this module's params quantized.
+
+    Default is a no-op (returns `params` unchanged). Quantizing modules (e.g.
+    `MoEFeedForward`) override this; container modules recurse into their named
+    sub-modules (mirroring `init`).
+
+    Args:
+      params: This module's params subtree.
+
+    Returns:
+      The quantized params (unchanged by default).
+    """
+    return params
+
   @abc.abstractmethod
   def apply(self, params: PyTree, x: Any, **kwargs: Any) -> Any:
     """Run forward pass of the module with parameters and inputs."""
@@ -321,16 +336,16 @@ class EinsumLinear(SimplyModule):
           params[self.bias_name], dim_annotation=self.bias_dim_annotation)
     return params
 
-  def apply(self, params: PyTree, x: Array) -> Array:
+  def apply(self, params: PyTree, x: Array) -> Array:  # pyrefly: ignore[bad-override]
     raw_params = get_raw_arrays(params)
     x = jnp.asarray(x, dtype=self.activation_dtype)
     weight = common.convert_or_dequantize(
-        raw_params[self.weight_name], dtype=self.activation_dtype)
+        raw_params[self.weight_name], dtype=self.activation_dtype)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
     output = jnp.einsum(self.eqn, weight, x)
 
     if self.bias_term:
       bias = common.convert_or_dequantize(
-          raw_params[self.bias_name], dtype=self.activation_dtype)
+          raw_params[self.bias_name], dtype=self.activation_dtype)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       output += _reshape_bias(
           bias, output_term=self.output_term, bias_term=self.bias_term,
           output_shape=output.shape)
@@ -421,14 +436,14 @@ class EmbeddingLinear(SimplyModule):
     prng_key, embed_key = jax.random.split(prng_key)
     params = self.einsum_linear.init(prng_key)
     if not self.use_tied_embedding:
-      params[self.embed_name] = self.embed_init(
+      params[self.embed_name] = self.embed_init(  # pyrefly: ignore[unsupported-operation]
           embed_key,
           shape=(self.vocab_size, self.dim),
           dtype=self.weight_dtype,
           dim_annotation='.i',
       )
-      params[self.embed_name] = sharding_lib.with_sharding_constraint(
-          params[self.embed_name], self.weight_partition
+      params[self.embed_name] = sharding_lib.with_sharding_constraint(  # pyrefly: ignore[unsupported-operation]
+          params[self.embed_name], self.weight_partition  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       )
     return params
 
@@ -444,10 +459,10 @@ class EmbeddingLinear(SimplyModule):
     """
     params = get_raw_arrays(params)
     if self.use_tied_embedding:
-      params = params[self.weight_name]
+      params = params[self.weight_name]  # pyrefly: ignore[bad-index, unsupported-operation]
     else:
-      params = params[self.embed_name]
-    params = common.convert_or_dequantize(params, dtype=self.activation_dtype)
+      params = params[self.embed_name]  # pyrefly: ignore[bad-index, unsupported-operation]
+    params = common.convert_or_dequantize(params, dtype=self.activation_dtype)  # pyrefly: ignore[bad-argument-type]
     if self.use_lookup:
       output = jnp.take(params, x, axis=0)
     else:
@@ -465,5 +480,5 @@ class EmbeddingLinear(SimplyModule):
     )
     return output * scaling_factor
 
-  def apply(self, params: PyTree, x: Array) -> Array:
+  def apply(self, params: PyTree, x: Array) -> Array:  # pyrefly: ignore[bad-override]
     return self.einsum_linear.apply(params, x)

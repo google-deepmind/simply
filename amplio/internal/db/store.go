@@ -58,6 +58,11 @@ type Store interface {
 	// MarkRunSeen records that the operator viewed the run now, clearing its
 	// dashboard "has updates" badge. Single-operator: global, not per-viewer.
 	MarkRunSeen(ctx context.Context, runID string) error
+	// MarkRunUnseen puts the run's badge back: an operator who looked at a run
+	// but hasn't finished with it says so, and finds it again later the same way
+	// they found it the first time. Rewinds last_seen_at to the run's creation,
+	// so "unseen" means what it means for a run nobody has opened.
+	MarkRunUnseen(ctx context.Context, runID string) error
 	// DeleteRun permanently removes a run and ALL its DB rows (the Run row plus
 	// its Sessions, Events, and Observations) in one transaction. Mined Lessons
 	// (which carry source_run_id as a soft reference) are intentionally kept —
@@ -142,6 +147,13 @@ type Store interface {
 
 	// GetEventCount returns the number of events matching the filter.
 	GetEventCount(ctx context.Context, runID, sessionID string, opts EventFilter) (int, error)
+
+	// CountEnvNotices returns how many environment notifications ($AMPLIO_NOTIFY
+	// MessageEvents) are already recorded at the session's CURRENT step. It backs
+	// the notify flood guard (server.handleNotify); the step is resolved inside
+	// the same statement so the count cannot be read against a step the session
+	// has since advanced past.
+	CountEnvNotices(ctx context.Context, runID, sessionID string) (int, error)
 
 	// GetTailEvent returns the most recent event in a session, or nil.
 	GetTailEvent(ctx context.Context, runID, sessionID string) (*EventRecord, error)

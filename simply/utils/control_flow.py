@@ -139,8 +139,8 @@ class ControlFlow(module_lib.SimplyModule):
       if step.module_name:
         input_spec['params'] = f'params/{step.module_name}'
       for k, v in step.overwrite_input_spec.items():
-        input_spec[k] = v
-      step.input_spec = input_spec
+        input_spec[k] = v  # pyrefly: ignore[unsupported-operation]
+      step.input_spec = input_spec  # pyrefly: ignore[missing-attribute]
 
       input_parameters = {}
       for k, v in input_spec.items():
@@ -209,7 +209,7 @@ class ScanModule(module_lib.SimplyModule):
       local_state = {**global_state, **state, 'x': x}
       input_spec = default_input_spec(self.module.apply)
       for k, v in self.overwrite_input_spec.items():
-        input_spec[k] = v
+        input_spec[k] = v  # pyrefly: ignore[unsupported-operation]
       input_parameters = {}
       for k, v in input_spec.items():
         if isinstance(v, Constant):

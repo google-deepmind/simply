@@ -383,6 +383,17 @@ func (m *RunManager) workspaceForSession(sess *db.SessionRecord, runCfg config.R
 	return m.workspaceFactory(runCfg.Workspace)
 }
 
+// SessionStatus returns a session's current status (ok=false if it can't be
+// read). Passed to NewCommitNotifier as its StatusFunc to gate environment
+// revival of terminal sessions.
+func (m *RunManager) SessionStatus(runID, sessionID string) (string, bool) {
+	sess, err := m.store.GetSession(context.Background(), runID, sessionID)
+	if err != nil || sess == nil {
+		return "", false
+	}
+	return sess.Status, true
+}
+
 // RespawnSession re-creates an agent goroutine for a session that has no
 // active goroutine (after idle timeout or server restart).
 func (m *RunManager) RespawnSession(runID, sessionID string) {

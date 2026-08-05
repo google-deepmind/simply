@@ -22,6 +22,7 @@ import (
 	"amplio/internal/config"
 	"amplio/internal/db"
 	"amplio/internal/event"
+	"amplio/internal/llm"
 	"amplio/internal/workspace"
 )
 
@@ -123,12 +124,13 @@ type runSummary struct {
 	Archived           bool       `json:"archived"`
 	CreatedAt          time.Time  `json:"created_at"`
 	Workspace          string     `json:"workspace"`                      // full resolved path (tooltip)
-	WorkspaceName      string     `json:"workspace_name"`                 // cheap display (basename / citc alias)
+	WorkspaceName      string     `json:"workspace_name"`                 // cheap display (basename / workspace alias)
 	WorkspaceKind      string     `json:"workspace_kind"`                 // "citc"/"plain"/"jj"/"external"/""
-	WorkspaceAlias     string     `json:"workspace_alias,omitempty"`      // CitC-named only (internal build)
-	WorkspaceNumericID int        `json:"workspace_numeric_id,omitempty"` // CitC only (internal build)
-	CiderURL           string     `json:"cider_url,omitempty"`            // CitC-named only; row pill becomes a link to this when non-empty
-	LLM                string     `json:"llm"`
+	WorkspaceAlias     string     `json:"workspace_alias,omitempty"`      // set only by backends that name workspaces
+	WorkspaceNumericID int        `json:"workspace_numeric_id,omitempty"` // set only by backends that have one
+	CiderURL           string     `json:"cider_url,omitempty"`            // editor URL; the row pill becomes a link when non-empty
+	LLM                string     `json:"llm"`                            // full spec (tooltip); the only form that may be copied or re-used
+	LLMName            string     `json:"llm_name"`                       // cheap display label, derived — never show it without llm reachable
 	Roots              []rootInfo `json:"roots"`
 	// Primary-root convenience fields (the autonomous agent if present, else the
 	// chatbot root). The UI can show all roots via Roots; these keep the simple
@@ -163,6 +165,7 @@ func toRunSummary(rw db.RunWithSessions) runSummary {
 		WorkspaceNumericID: wm.NumericID,
 		CiderURL:           wm.CiderURL,
 		LLM:                rw.Run.Config.LLM,
+		LLMName:            llm.ShortLabel(rw.Run.Config.LLM),
 		SessionCount:       len(rw.RootSessions),
 		Roots:              make([]rootInfo, 0, len(rw.RootSessions)),
 	}
@@ -237,7 +240,7 @@ type sessionDTO struct {
 	CreatedAt       time.Time `json:"created_at"`
 	StatusChangedAt time.Time `json:"status_changed_at"` // mirrors rootInfo so the run-page header can synthesize the same view as a dashboard row
 	// Per-session workspace from the session's own metadata: sub-agents spawned
-	// with WorkspaceMode "link" run in their own worktree/CitC link, so this can
+	// with WorkspaceMode "link" run in their own linked worktree, so this can
 	// differ from the run's (and across siblings). Empty if not yet persisted.
 	Workspace     string `json:"workspace,omitempty"`      // full path (tooltip)
 	WorkspaceName string `json:"workspace_name,omitempty"` // cheap display (basename / link name / numeric id)
@@ -290,10 +293,11 @@ type runDetail struct {
 	Workspace          string  `json:"workspace"`                      // full resolved path (tooltip / detail)
 	WorkspaceName      string  `json:"workspace_name"`                 // cheap display name (basename / numeric id)
 	WorkspaceKind      string  `json:"workspace_kind"`                 // "citc"/"plain"/"jj"/"external"/""
-	WorkspaceAlias     string  `json:"workspace_alias,omitempty"`      // CitC-named only (internal build)
-	WorkspaceNumericID int     `json:"workspace_numeric_id,omitempty"` // CitC only (internal build)
-	CiderURL           string  `json:"cider_url,omitempty"`            // CitC-named only (internal build)
-	LLM                string  `json:"llm"`
+	WorkspaceAlias     string  `json:"workspace_alias,omitempty"`      // set only by backends that name workspaces
+	WorkspaceNumericID int     `json:"workspace_numeric_id,omitempty"` // set only by backends that have one
+	CiderURL           string  `json:"cider_url,omitempty"`            // editor URL, when the backend provides one
+	LLM                string  `json:"llm"`                            // full spec (Overview shows it verbatim)
+	LLMName            string  `json:"llm_name"`                       // cheap display label, derived — never show it without llm reachable
 	// Configured at run creation; full picture of the run's persisted RunConfig
 	// so the Overview page can show "everything we know about this run" without
 	// needing extra round-trips.

@@ -14,7 +14,13 @@
 
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"amplio/internal/config"
+)
 
 func TestServerInfoRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -54,4 +60,33 @@ func TestLockDataDir_Exclusive(t *testing.T) {
 		t.Fatalf("lock after unlock should succeed: %v", err)
 	}
 	_ = lk2.Unlock()
+}
+
+// Claiming the data dir must also furnish it. This lives with the lock (rather
+// than in serve) precisely so headless runs get it too: the first version
+// installed the shim in serve only, and headless agents were told by their
+// prompt to use a command that did not exist for them.
+func TestLockDataDirInstallsNotifyShim(t *testing.T) {
+	dir := t.TempDir()
+	lk, err := lockDataDir(dir)
+	if err != nil {
+		t.Fatalf("lockDataDir: %v", err)
+	}
+	defer lk.Unlock() //nolint:errcheck
+
+	exe, _ := os.Executable()
+	// Both names: the narrow one the prompt teaches, and the CLI the skill does.
+	for _, name := range []string{config.NotifyShimName, config.CLIShimName} {
+		target, err := os.Readlink(filepath.Join(dir, "bin", name))
+		if err != nil {
+			t.Fatalf("no %s shim: %v", name, err)
+		}
+		if target != exe {
+			t.Errorf("%s points at %q, want the running binary %q", name, target, exe)
+		}
+	}
+	// Rerunning must be idempotent — every boot re-claims the same data dir.
+	if err := installNotifyShim(dir); err != nil {
+		t.Errorf("second install: %v", err)
+	}
 }

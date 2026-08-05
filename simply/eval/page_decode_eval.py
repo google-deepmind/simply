@@ -71,10 +71,37 @@ _N_REPEATS = flags.DEFINE_integer(
     'n_repeats', 1, 'Number of times to repeat the dataset.'
 )
 
+_DATA_SHARD_COUNT = flags.DEFINE_integer(
+    'data_shard_count',
+    1,
+    'Number of data shards to split the dataset into (>1 enables sharding).',
+)
+
+_DATA_SHARD_INDEX = flags.DEFINE_integer(
+    'data_shard_index',
+    0,
+    'Which data shard this job processes, in [0, data_shard_count-1].',
+)
+
+_NUM_EVAL_THREADS = flags.DEFINE_integer(
+    'num_eval_threads',
+    None,
+    'Number of threads to use for evaluation. Defaults to batch_size * 2.',
+)
+
 _SAVE_FULL_INFO = flags.DEFINE_bool(
     'save_full_info',
     False,
     'If True, save full information in history, else only save critical info.',
+)
+
+_SEED = flags.DEFINE_integer(
+    'seed',
+    None,
+    'Decode-sampling PRNG seed. None (default) seeds from wall-clock time'
+    ' (each run differs). Set a fixed int to seed sampling for eval sweeps;'
+    ' note batch decode is not fully reproducible even with a fixed seed'
+    ' (async queueing). Recorded in final_result.json as "seed".',
 )
 
 
@@ -95,11 +122,6 @@ def get_last_file(directory: epath.PathLike, pattern: str) -> epath.Path | None:
 def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
-
-  set_notes = functools.partial(
-      experiment_helper.set_notes,
-      should_set=experiment_helper.is_primary_task(),
-  )
 
   experiment_helper.setup_work_unit()
 
@@ -168,6 +190,12 @@ def main(argv: Sequence[str]) -> None:
   config_replace_kwargs['global_total_num_pages'] = global_total_num_pages
   config_replace_kwargs['local_total_num_pages'] = local_total_num_pages
   config_replace_kwargs['page_size'] = page_size
+  if common_flags.FFN_WEIGHT_QUANT.value is not None:
+    config_replace_kwargs['ffn_weight_quant'] = (
+        common_flags.FFN_WEIGHT_QUANT.value
+    )
+  if common_flags.KV_CACHE_QUANT.value is not None:
+    config_replace_kwargs['kv_cache_quant'] = common_flags.KV_CACHE_QUANT.value
 
   config = dataclasses.replace(
       config,
@@ -179,7 +207,10 @@ def main(argv: Sequence[str]) -> None:
   experiment_dir = _EXPERIMENT_DIR.value
   if not experiment_dir:
     raise ValueError('Must specify --experiment_dir.')
-  helper = experiment_helper.ExperimentHelper(experiment_dir=experiment_dir)
+  helper = experiment_helper.ExperimentHelper(
+      experiment_dir=experiment_dir,
+      is_primary=experiment_helper.is_primary_task(),
+  )
   experiment_dir = epath.Path(helper.experiment_dir)
   helper.save_config_info(config, config.sharding_config)
 
@@ -188,23 +219,29 @@ def main(argv: Sequence[str]) -> None:
       lm_format=lm_format_lib.LMFormatRegistry.get_instance(lm_format_name),
       max_seq_len=common_flags.MAX_SEQ_LEN.value,
       max_decode_steps=common_flags.MAX_DECODE_STEPS.value,
-      page_size=common_flags.PAGE_SIZE.value,
       temperature=common_flags.TEMPERATURE.value,
       top_k=common_flags.TOP_K.value,
       top_p=common_flags.TOP_P.value,
       intermediate_steps=common_flags.INTERMEDIATE_STEPS.value,
       response_asap=common_flags.RESPONSE_ASAP.value,
+      enable_prefix_caching=common_flags.ENABLE_PREFIX_CACHING.value,
+      max_num_issue_tokens=common_flags.MAX_NUM_ISSUE_TOKENS.value,
+      decode_seed=_SEED.value,
   )
 
-  set_notes('Compiling ...')
+  helper.set_notes('Compiling ...')
   _ = batcher.compiled_decode_fn
+  _ = batcher.compiled_prefill_fn
   _ = batcher.compiled_push_fn
   _ = batcher.compiled_release_fn
+  if batcher.prefix_cache is not None:
+    _ = batcher.compiled_inject_chunk_fn
+    _ = batcher.compiled_extract_chunk_fn
 
   checkpoint_path = checkpoint_lib.get_checkpoint_path(
       config.init_ckpt_dir, config.init_ckpt_step
   )
-  set_notes(f'Loading checkpoint from {checkpoint_path} ...')
+  helper.set_notes(f'Loading checkpoint from {checkpoint_path} ...')
   batcher.update_params_from_checkpoint_path(checkpoint_path)
 
   stop_event = threading.Event()
@@ -222,6 +259,18 @@ def main(argv: Sequence[str]) -> None:
 
   datasource = data_lib.DataSourceRegistry.get_instance(_DATASOURCE_NAME.value)
   dataset = data_lib.get_data_source(datasource)
+  if _DATA_SHARD_COUNT.value > 1:
+    # Shard the dataset: strided slice so shard i gets examples i, i+count,
+    # i+2*count, ... (grain's documented sharding idiom, dataset.py:
+    # ds[shard_index::shard_count]). Union of all shards covers the dataset
+    # exactly once with no overlap.
+    dataset = dataset[_DATA_SHARD_INDEX.value :: _DATA_SHARD_COUNT.value]
+    logging.info(
+        'DATA SHARD %d/%d -> %d examples (strided)',
+        _DATA_SHARD_INDEX.value,
+        _DATA_SHARD_COUNT.value,
+        len(dataset),
+    )
   dataset = dataset.repeat(_N_REPEATS.value)
   num_total_examples = len(dataset)
 
@@ -237,36 +286,103 @@ def main(argv: Sequence[str]) -> None:
 
   logging.info('dataiter_state=%s', dataiter_state)
   logging.info('num_past_examples=%d', num_past_examples)
-  set_notes(
-      f'Starting to decode from example {num_past_examples}.'
-  )
+  helper.set_notes(f'Starting to decode from example {num_past_examples}.')
+
+  async def model_fn(
+      messages: Sequence[Mapping[str, Any]], *, index: int = 0
+  ) -> Mapping[str, Any]:
+    """Posts messages to the in-process batcher; returns the response dict."""
+    # DEBUG: phase markers to localize a hang to one span in the path
+    # do_POST -> text_model_fn -> model_fn -> batcher.enqueue -> await future.
+    # See chatty-bot run 9nkpcrhw for context.
+    logging.info(
+        '[page_decode_eval.model_fn] ENTER index=%d num_messages=%d',
+        index,
+        len(messages),
+    )
+    # `__index__` lets the batcher log per-example timing; it must be on
+    # the first message (the framework strips it before tokenisation).
+    # Copy each message to a fresh dict so we never mutate the caller's data.
+    request: list[dict[str, Any]] = [dict(m) for m in messages]
+    if request:
+      request[0]['__index__'] = index
+    future_response = asyncio.Future[serving_common.SimplyServiceResponse]()
+    logging.info(
+        '[page_decode_eval.model_fn] about to enqueue index=%d'
+        ' (queue depth=%d/%d)',
+        index,
+        batcher.request_queue.qsize(),
+        batcher.max_queue_size,
+    )
+    batcher.enqueue(request, future_response)
+    logging.info(
+        '[page_decode_eval.model_fn] enqueued index=%d; awaiting future',
+        index,
+    )
+    response = await future_response
+    logging.info(
+        '[page_decode_eval.model_fn] future resolved index=%d code=%s',
+        index,
+        response.code,
+    )
+    assert response.code == grpc.StatusCode.OK
+    return response.result
 
   async def query_and_evaluate(
       index: int, example: Mapping[str, Any]
   ) -> Mapping[str, Any]:
-    """Queries the server and evaluates the response."""
+    """Queries the server and evaluates the response.
+
+    If the registered evaluation defines an async `evaluate_async(example,
+    model_fn)` method, we dispatch to it (for multi-turn / agentic evals).
+    Otherwise we use the legacy single-turn path: `get_messages` ->
+    `batcher.enqueue` -> `evaluate(response_text)`.
+
+    Args:
+      index: Zero-based example index within the eval split; threaded into
+        `model_fn` so the batcher can log per-example timing.
+      example: The raw example dict from the dataset iterator.
+
+    Returns:
+      A dict shaped like the legacy `responsed_example`: the input
+      `example` merged with at minimum `lm_request`, `lm_response`, and
+      any verification fields the evaluation produced. For the agentic
+      path the `lm_request` / `lm_response` are populated inside
+      `evaluate_async`; for the legacy single-turn path they are added
+      here from the synchronous enqueue + evaluate flow.
+    """
+    if getattr(evaluation, 'in_sandbox_loop', False):
+      assert getattr(evaluation, 'evaluate_async')
+      logging.info('agentic evaluate_async index=%s', index)
+      bound_model_fn = functools.partial(model_fn, index=index)
+      example = dict(example)
+      example['__index__'] = index
+      result = await evaluation.evaluate_async(example, bound_model_fn)
+      # evaluate_async returns a dict shaped like the legacy responsed_example
+      # (must include 'lm_request' + 'lm_response' for history.jsonl).
+      return example | result
 
     request = evaluation.get_messages(example)
     assert pytree.tree_is_sequence(request)
     logging.info('enqueue index=%s', index)
-    request[0]['__index__'] = index
-    future_response = asyncio.Future[serving_common.SimplyServiceResponse]()
-    batcher.enqueue(request, future_response)
-    response = await future_response
+    response = await model_fn(request, index=index)
     logging.info('response=%s', response)
-    assert response.code == grpc.StatusCode.OK
-    response = response.result
-    responsed_example = example | dict(lm_request=request, lm_response=response)
+    responsed_example = example | dict(lm_request=request, lm_response=response)  # pyrefly: ignore[unsupported-operation]
     result = evaluation.evaluate(responsed_example, response['output_text'])
     return responsed_example | result
 
   dataset = dataset.map_with_index(
       lambda i, x: asyncio.run(query_and_evaluate(i, x))
   )
+  num_eval_threads = (
+      _NUM_EVAL_THREADS.value
+      if _NUM_EVAL_THREADS.value is not None
+      else common_flags.BATCH_SIZE.value * 2
+  )
   dataset = dataset.to_iter_dataset(
       grain.ReadOptions(
-          num_threads=common_flags.BATCH_SIZE.value * 2,
-          prefetch_buffer_size=4096,
+          num_threads=num_eval_threads,
+          prefetch_buffer_size=common_flags.BATCH_SIZE.value * 8,
       )
   )
   dataiter = dataset.__iter__()
@@ -274,9 +390,7 @@ def main(argv: Sequence[str]) -> None:
   if dataiter_state is not None:
     dataiter.set_state(dataiter_state)
 
-  set_notes(
-      f'Starting to decode from example {num_past_examples}.'
-  )
+  helper.set_notes(f'Starting to decode from example {num_past_examples}.')
   start_time = time.time()
   num_saved_examples = num_past_examples
   history = []
@@ -326,7 +440,7 @@ def main(argv: Sequence[str]) -> None:
       iter_state_tmp_path.rename(iter_state_path)
 
       avg_generation_time = total_generation_time / num_past_examples
-      set_notes(
+      helper.set_notes(
           f'Completed {num_past_examples}/{num_total_examples} examples,'
           f' {avg_generation_time:.2f} s/example'
       )
@@ -352,7 +466,7 @@ def main(argv: Sequence[str]) -> None:
   stop_event.set()
 
   async def _stats_all_history() -> Mapping[str, int | float]:
-    history_paths = experiment_dir.glob('history_*.jsonl')
+    history_paths = experiment_dir.glob('history_*.jsonl')  # pyrefly: ignore[missing-attribute]
     stat_futures = []
     for history_path in history_paths:
       # Validate the name of history paths.
@@ -373,7 +487,7 @@ def main(argv: Sequence[str]) -> None:
   logging.info('results=%s', results)
   correct = results['correct']
   total = results['total']
-  set_notes(
+  helper.set_notes(
       f'Finished: accuracy is {correct=}/{total=} ='
       f' {correct / total * 100:.2f}%,'
       f' {total_generation_time / total:.2f} s/example'
@@ -384,6 +498,7 @@ def main(argv: Sequence[str]) -> None:
       'correct': correct,
       'total': total,
       'avg_generation_time': total_generation_time / total,
+      'seed': _SEED.value,
   }
   logging.info('final_result=%s', final_result)
   experiment_dir = epath.Path(helper.experiment_dir)

@@ -65,7 +65,7 @@ type provider struct {
 // VERTEXAI_PROJECT and VERTEXAI_LOCATION from the environment (the same ADC auth
 // as the Gemini provider and the embedder). args are spec `?k=v` overrides
 // applied to the request body verbatim (see specReqOpts).
-func NewVertex(model string, maxTokens int, args url.Values) (llm.Provider, error) {
+func NewVertex(model string, maxTokens int, clientArgs, args url.Values) (llm.Provider, error) {
 	project := os.Getenv("VERTEXAI_PROJECT")
 	location := os.Getenv("VERTEXAI_LOCATION")
 	if project == "" {
@@ -82,19 +82,19 @@ func NewVertex(model string, maxTokens int, args url.Values) (llm.Provider, erro
 			"https://www.googleapis.com/auth/cloud-platform"),
 		option.WithMaxRetries(maxRetries),
 	)
-	return &provider{client: client, model: model, maxTokens: maxTokens, reqOpts: specReqOpts(args), cacheTTL: parseCacheTTL(args)}, nil
+	return &provider{client: client, model: model, maxTokens: maxTokens, reqOpts: specReqOpts(args), cacheTTL: parseCacheTTL(clientArgs)}, nil
 }
 
 // NewAPIKey creates a Provider on the direct Anthropic API backend using
 // ANTHROPIC_API_KEY — the no-GCP path, mirroring gemini.NewAPIKey. args are spec
 // `?k=v` overrides applied to the request body verbatim (see specReqOpts).
-func NewAPIKey(model string, maxTokens int, args url.Values) (llm.Provider, error) {
+func NewAPIKey(model string, maxTokens int, clientArgs, args url.Values) (llm.Provider, error) {
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	if key == "" {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
 	}
 	client := anthropic.NewClient(option.WithAPIKey(key), option.WithMaxRetries(maxRetries))
-	return &provider{client: client, model: model, maxTokens: maxTokens, reqOpts: specReqOpts(args), cacheTTL: parseCacheTTL(args)}, nil
+	return &provider{client: client, model: model, maxTokens: maxTokens, reqOpts: specReqOpts(args), cacheTTL: parseCacheTTL(clientArgs)}, nil
 }
 
 // specReqOpts turns spec args into raw request-body overrides via sjson paths,
@@ -102,22 +102,21 @@ func NewAPIKey(model string, maxTokens int, args url.Values) (llm.Provider, erro
 // Values are coerced to the natural JSON type. The model itself validates them
 // (e.g. opus-4-8 rejects thinking.type=enabled), so we don't second-guess keys.
 //
-// Client-only spec args (see clientOnlyArgs) are skipped: they control our
-// behavior, not the request body, and the API rejects unknown body fields.
+// Client args never reach here: they control our behavior, not the request body
+// (and the API rejects unknown body fields), so they are split off before
+// construction — see llm.ClientArgs.
 func specReqOpts(args url.Values) []option.RequestOption {
 	var opts []option.RequestOption
 	for k := range args {
-		if clientOnlyArgs[k] {
-			continue
-		}
 		opts = append(opts, option.WithJSONSet(k, coerce(args.Get(k))))
 	}
 	return opts
 }
 
-// clientOnlyArgs are spec args interpreted client-side and never forwarded to
-// the request body (the Anthropic API rejects unknown fields with 400).
-var clientOnlyArgs = map[string]bool{
+// ClientArgs are the arguments this provider interprets — the `{k=v}` block in a
+// spec (see internal/llm/spec.go). They are never forwarded to the request body
+// (the Anthropic API rejects unknown fields with 400).
+var ClientArgs = map[string]bool{
 	"cache_ttl": true,
 }
 
@@ -178,10 +177,10 @@ func (p *provider) callOpts(req llm.Request) []option.RequestOption {
 	return opts
 }
 
-// parseCacheTTL reads the ?cache_ttl spec arg; "1h" selects the 1-hour tier,
+// parseCacheTTL reads the cache_ttl client arg; "1h" selects the 1-hour tier,
 // "5m"/empty the 5-minute tier. Any other value warns and defaults to 5m.
-func parseCacheTTL(args url.Values) anthropic.CacheControlEphemeralTTL {
-	switch v := args.Get("cache_ttl"); v {
+func parseCacheTTL(clientArgs url.Values) anthropic.CacheControlEphemeralTTL {
+	switch v := clientArgs.Get("cache_ttl"); v {
 	case "1h":
 		return anthropic.CacheControlEphemeralTTLTTL1h
 	case "", "5m":

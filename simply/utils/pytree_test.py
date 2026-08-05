@@ -38,7 +38,7 @@ class _B(_A):
 @dataclasses.dataclass
 class _C:
   a: _A
-  b: _B = dataclasses.field(default_factory=_B)
+  b: _B = dataclasses.field(default_factory=_B)  # pyrefly: ignore[no-matching-overload]
   d: Sequence[_A] = dataclasses.field(default_factory=list)
 
 
@@ -258,15 +258,15 @@ class PyTreeTest(absltest.TestCase):
     self.assertEqual(loaded, tree)
 
   def test_concatenate_pytrees(self):
-    tree1 = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])
-    tree2 = _C(a=_A(x=1), b=_B(x=1, y=2), d=[5, 6])
+    tree1 = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])  # pyrefly: ignore[bad-argument-type]
+    tree2 = _C(a=_A(x=1), b=_B(x=1, y=2), d=[5, 6])  # pyrefly: ignore[bad-argument-type]
     self.assertEqual(
-        pytree.concatenate_pytrees([tree1, tree2]),
-        _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4, 5, 6]),
+        pytree.concatenate_pytrees([tree1, tree2]),  # pyrefly: ignore[bad-argument-type]
+        _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4, 5, 6]),  # pyrefly: ignore[bad-argument-type]
     )
     tree2.b.y = 4
     with self.assertRaises(ValueError):
-      pytree.concatenate_pytrees([tree1, tree2])
+      pytree.concatenate_pytrees([tree1, tree2])  # pyrefly: ignore[bad-argument-type]
 
   def test_trim_none(self):
     tree = {'a': 1, 'b': [None, {'z': None}], 'c': {'d': None, 'e': 2}}
@@ -280,7 +280,7 @@ class PyTreeTest(absltest.TestCase):
     self.assertEqual(pytree.to_flat_dict(tree, sep='/'), {'a': 1, 'b/z': 'foo'})
 
   def test_save_and_load_pytree(self):
-    tree = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])
+    tree = _C(a=_A(x=1), b=_B(x=1, y=2), d=[1, 3, 4])  # pyrefly: ignore[bad-argument-type]
     path = self.create_tempfile().full_path
     pytree.save_pytree_to(tree, path)
     self.assertEqual(pytree.load_pytree_from(path), tree)
@@ -311,6 +311,67 @@ class PyTreeTest(absltest.TestCase):
             jax.tree_util.DictKey('loss'),
         ]),
     )
+
+  def test_filter_tree(self):
+    tree = {'a': 1, 'b': {'c': 2, 'd': 3}, 'e': [4, 5]}
+
+    def is_odd(path, value):
+      del path
+      return value % 2 == 1
+
+    true_tree, false_tree = pytree.filter_tree(tree, is_odd)
+    self.assertEqual(
+        true_tree, {'a': 1, 'b': {'c': None, 'd': 3}, 'e': [None, 5]}
+    )
+    self.assertEqual(
+        false_tree, {'a': None, 'b': {'c': 2, 'd': None}, 'e': [4, None]}
+    )
+
+    true_tree, false_tree = pytree.filter_tree(tree, None)
+    self.assertEqual(true_tree, tree)
+    self.assertEqual(
+        false_tree, {'a': None, 'b': {'c': None, 'd': None}, 'e': [None, None]}
+    )
+
+    def path_has_b(path, value):
+      del value
+      return 'b' in path
+
+    registry.FunctionRegistry.register(path_has_b, name='path_has_b')
+    true_tree, false_tree = pytree.filter_tree(tree, 'path_has_b')
+    self.assertEqual(
+        true_tree, {'a': None, 'b': {'c': 2, 'd': 3}, 'e': [None, None]}
+    )
+    self.assertEqual(
+        false_tree, {'a': 1, 'b': {'c': None, 'd': None}, 'e': [4, 5]}
+    )
+
+  def test_merge_filtered_trees(self):
+    tree = {'a': 1, 'b': {'c': 2, 'd': 3}, 'e': [4, 5]}
+    true_tree, false_tree = pytree.filter_tree(
+        tree, lambda path, value: value > 2
+    )
+    merged = pytree.merge_filtered_trees(true_tree, false_tree)
+    self.assertEqual(merged, tree)
+
+    left = {'a': 1, 'b': None}
+    right = {'a': None, 'b': 2}
+    self.assertEqual(pytree.merge_filtered_trees(left, right), {'a': 1, 'b': 2})
+
+  def test_filtered_map(self):
+    tree1 = {'a': 1, 'b': {'c': None, 'd': 3}}
+    res = pytree.filtered_map(lambda x: x * 2, tree1)
+    self.assertEqual(res, {'a': 2, 'b': {'c': None, 'd': 6}})
+
+    tree2 = {'a': 10, 'b': {'c': 20, 'd': None}}
+    res_multi = pytree.filtered_map(lambda x, y: x + y, tree1, tree2)
+    self.assertEqual(res_multi, {'a': 11, 'b': {'c': None, 'd': None}})
+
+    default_tree = {'a': 0, 'b': {'c': -1, 'd': -2}}
+    res_default = pytree.filtered_map(
+        lambda x: x * 2, tree1, default=default_tree
+    )
+    self.assertEqual(res_default, {'a': 2, 'b': {'c': -1, 'd': 6}})
 
 
 if __name__ == '__main__':

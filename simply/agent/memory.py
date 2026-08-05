@@ -275,7 +275,7 @@ class MemorySystem:
         knowledge = dataclasses.replace(knowledge, summary=summary)
       files[knowledge.uri] = knowledge
 
-    self.memory = None
+    self.memory = None  # pyrefly: ignore[bad-assignment]
     self.memory_snapshots = []
     self._record_memory_snapshot(
         Memory(files=files, log_order=[]),
@@ -465,7 +465,7 @@ class MemorySystem:
           snapshot_step=snapshot_step,
           token_counter=token_counter,
       )
-      self.memory = None
+      self.memory = None  # pyrefly: ignore[bad-assignment]
 
   def get_events_for_step(self, step: int) -> list[MemoryFile]:
     """Returns all log events belonging to a particular step.

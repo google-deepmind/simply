@@ -34,6 +34,11 @@
 	// "Load more" pages backwards in time via the server cursor. 25 is the
 	// sweet spot — a full first screen without an over-long initial paint.
 	const PAGE_SIZE = 25;
+	// Upper bound for a single refetch, mirroring the server's maxRunsPage cap. A
+	// live (SSE) refresh re-requests up to this many rows to PRESERVE an expanded
+	// ("Load more") view instead of snapping back to page 1; past it the list
+	// stabilizes at the cap (still far better than resetting to one page).
+	const MAX_RUNS_PAGE = 200;
 
 	let runs = $state<RunSummary[]>([]);
 	let hasMore = $state(false);
@@ -113,15 +118,19 @@
 		searchTimer = setTimeout(() => updateURL('q', searchInput.trim()), 250);
 	}
 
-	// refresh reloads PAGE 1, resetting the cursor. Used on mount, on a server
-	// filter (archived) change, and on every (debounced) SSE signal. Paging state
-	// from a prior "Load more" is intentionally discarded — a live update rebuilds
-	// from the top so the newest runs always show.
-	async function refresh() {
+	// refresh reloads from the TOP. A mount/filter refresh loads page 1; a live
+	// (SSE) refresh passes preserveExpanded=true to refetch as many rows as are
+	// currently shown (capped at MAX_RUNS_PAGE), so a background update doesn't snap
+	// a "Load more"-expanded list back to page 1. Either way it rebuilds from the
+	// top so the newest runs and latest statuses always show.
+	async function refresh(preserveExpanded = false) {
+		const limit = preserveExpanded
+			? Math.min(Math.max(PAGE_SIZE, runs.length), MAX_RUNS_PAGE)
+			: PAGE_SIZE;
 		try {
 			const pageData = await api.listRuns({
 				showArchived,
-				limit: PAGE_SIZE,
+				limit,
 				filter: statusFilter,
 				search,
 				starred: starredOnly,
@@ -140,7 +149,8 @@
 	}
 
 	// loadMore appends the next page using the server cursor. Guarded against
-	// concurrent clicks. A subsequent SSE refresh() resets to page 1 (by design).
+	// concurrent clicks. A subsequent live (SSE) refresh PRESERVES this expanded
+	// count (see refresh's preserveExpanded), so it no longer snaps back to page 1.
 	async function loadMore() {
 		if (loadingMore || !hasMore) return;
 		loadingMore = true;
@@ -167,7 +177,8 @@
 	}
 	function schedule() {
 		clearTimeout(timer);
-		timer = setTimeout(refresh, 250);
+		// Live update: preserve the expanded ("Load more") view rather than resetting.
+		timer = setTimeout(() => refresh(true), 250);
 	}
 
 	onMount(() => {
@@ -256,7 +267,7 @@
 				onclick={() => updateURL('starred', starredOnly ? null : '1')}>★ Starred</button
 			>
 			<label class="chip">
-				<input type="checkbox" bind:checked={showArchived} onchange={refresh} /> Archived
+				<input type="checkbox" bind:checked={showArchived} onchange={() => refresh()} /> Archived
 			</label>
 		</div>
 	</div>

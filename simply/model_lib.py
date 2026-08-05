@@ -18,6 +18,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 import copy
 import dataclasses
 import functools
+import math
 import time
 from typing import Any, Callable, cast, ClassVar, Literal, Self, Tuple
 import warnings
@@ -32,6 +33,7 @@ import jax.numpy as jnp
 import jax.sharding as js
 import numpy as np
 from simply import data_lib
+from simply.kernels import gmm_v2 as gmm_v2_kernel
 from simply.utils import checkpoint_lib as ckpt_lib
 from simply.utils import common
 from simply.utils import experiment_helper as exp_helper
@@ -41,6 +43,7 @@ from simply.utils import moe_lib
 from simply.utils import optimizers as opt_lib
 from simply.utils import position_encoding as pe_lib
 from simply.utils import pytree
+from simply.utils import quant as quant_lib
 from simply.utils import ragged_paged_attention as rpa
 from simply.utils import registry
 from simply.utils import sampling_lib
@@ -102,7 +105,7 @@ registry.FunctionRegistry.register(jax.nn.silu, 'silu')
 
 
 def soft_cap(x: Array, cap: float):
-  cap = jnp.asarray(cap, x.dtype)
+  cap = jnp.asarray(cap, x.dtype)  # pyrefly: ignore[bad-assignment]
   return jnp.asarray(cap * jnp.tanh(x / cap), x.dtype)
 
 
@@ -148,7 +151,7 @@ class LayerNorm(module.SimplyModule):
           params['scale'], dim_annotation='h')
     return params
 
-  def apply(self, params: PyTree, x: Array) -> Array:
+  def apply(self, params: PyTree, x: Array) -> Array:  # pyrefly: ignore[bad-override]
     params = get_raw_arrays(params)
     inputs_dtype = x.dtype
     # Perform reduction in float32 for better stability.
@@ -161,7 +164,7 @@ class LayerNorm(module.SimplyModule):
       x *= jax.lax.rsqrt(var + self.epsilon)
       x = jnp.asarray(x, self.activation_dtype)
       scale = common.convert_or_dequantize(
-          params['scale'], dtype=self.activation_dtype
+          params['scale'], dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       )
       if self.scale_plus_one:
         x *= scale + jnp.array(1.0, dtype=self.activation_dtype)
@@ -170,7 +173,7 @@ class LayerNorm(module.SimplyModule):
     x = x.astype(self.activation_dtype)
     if self.use_bias:
       x += common.convert_or_dequantize(
-          params['bias'], dtype=self.activation_dtype
+          params['bias'], dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       )
     return x.astype(inputs_dtype)
 
@@ -192,38 +195,149 @@ class PerDimScale(module.SimplyModule):
         params['scale'], dim_annotation='h')
     return params
 
-  def apply(self, params: PyTree, x: Array) -> Array:
+  def apply(self, params: PyTree, x: Array) -> Array:  # pyrefly: ignore[bad-override]
     params = get_raw_arrays(params)
     r_softplus_0 = 1.442695041
     scaling_factor = jnp.array(
         r_softplus_0 / jnp.sqrt(self.dim), dtype=self.activation_dtype)
-    scaling_factor *= jax.nn.softplus(params['scale'])
+    scaling_factor *= jax.nn.softplus(params['scale'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
     x *= scaling_factor
     return x
 
 
 @jax.named_scope('gmm')
-def gmm(lhs, rhs, group_sizes, *, tiling, gmm_impl, activation_dtype):
+def gmm(
+    lhs,
+    rhs,
+    group_sizes,
+    *,
+    tiling,
+    gmm_impl,
+    activation_dtype,
+    rhs_scale=None,
+):
+  """Grouped matrix multiply using megablox or ragged_dot.
+
+  Zeroes out rows in the output buffer beyond ``sum(group_sizes)`` to work
+  around a megablox Pallas kernel bug where the trailing "padding-token" rows
+  (rows that no active group claims, because they were routed to a phantom
+  expert ``num_experts``) are left UNINITIALIZED. Those uninitialized rows
+  often contain bit patterns that decode as inf/NaN in bf16, which then
+  propagate through downstream einsums / RMSNorm / attention into the loss.
+  The prior ``nan_to_num`` workaround was insufficient: it hid the NaNs but
+  not the garbage magnitudes underneath them.
+
+  Args:
+    lhs: Left-hand side input of shape ``[total_tokens, in_dim]`` after
+      token-routing concatenation across experts.
+    rhs: Right-hand side stacked expert weights of shape
+      ``[n_experts, in_dim, out_dim]``.
+    group_sizes: ``[n_experts]`` int32 array giving the number of
+      consecutive tokens in ``lhs`` that belong to each expert.
+    tiling: Pallas tiling tuple ``(M, K, N)`` for the underlying kernel.
+    gmm_impl: ``'megablox'`` (Pallas kernel), ``'ragged_dot'``
+      (`jax.lax.ragged_dot` reference), or ``'gmm_v2'`` (weight-only int8/int4
+      via the forked gmm_v2 kernel; requires ``rhs_scale``).
+    activation_dtype: dtype of the output activations.
+    rhs_scale: Optional per-expert dequant scale ``[n_experts, n_blocks, n]``
+      for the ``'gmm_v2'`` weight-only path (``rhs`` is then an integer dtype).
+      ``None`` for the bf16 path.
+
+  Returns:
+    The grouped matmul output of shape ``[total_tokens, out_dim]``, with
+    rows ``>= sum(group_sizes)`` explicitly zeroed (see workaround above).
+  """
   if gmm_impl == 'megablox':
-    output = megablox.gmm(
+    out = megablox.gmm(
         lhs,
         rhs,
         group_sizes=group_sizes,
         tiling=tiling,
         preferred_element_type=activation_dtype,
     )
+    # Mask rows >= sum(group_sizes). For our routing, these correspond to
+    # padding tokens that were assigned to a phantom expert and therefore
+    # never visited by the GMM kernel.
+    active_end = jnp.sum(group_sizes).astype(jnp.int32)
+    row_iota = jax.lax.broadcasted_iota(jnp.int32, (out.shape[0],), 0)
+    valid = (row_iota < active_end)[:, None]
+    out = jnp.where(valid, out, jnp.zeros((), dtype=out.dtype))
+    return out
   elif gmm_impl == 'ragged_dot':
     with xla_metadata.set_xla_metadata(
-        ragged_dot_tiling=','.join([str(t) for t in tiling])):
-      output = jax.lax.ragged_dot(
+        ragged_dot_tiling=','.join([str(t) for t in tiling])
+    ):
+      return jax.lax.ragged_dot(
           lhs=lhs,
           rhs=rhs,
           group_sizes=group_sizes,
           preferred_element_type=activation_dtype,
       )
+  elif gmm_impl == 'gmm_v2':
+    # gmm_v2 grouped matmul. Supports weight-only int8/int4 (integer `rhs` +
+    # `rhs_scale`) which cuts expert-weight HBM traffic at decode while keeping
+    # the activation (lhs) in bf16 (W8A16 / W4A16), preserving accuracy.
+    if rhs_scale is not None and rhs_scale.ndim == 3:
+      # [g, n_blocks, n] -> [g, n_blocks, 1, n] expected by gmm_v2. The middle
+      # axis is ALWAYS the K-block axis (1 for per-channel), so the singleton
+      # lane axis goes at position 2 for both per-channel and block-wise scales.
+      rhs_scale = rhs_scale[:, :, None, :]
+    out = gmm_v2_kernel.gmm_v2(
+        lhs=lhs,
+        rhs=rhs,
+        group_sizes=group_sizes,
+        rhs_scale=rhs_scale,
+        preferred_element_type=jnp.dtype(activation_dtype),
+        # Weight-only: keep activations (lhs) in bf16. Setting this True would
+        # also quantize lhs to int8/fp8 (W8A8/W4A8) for MXU throughput, but
+        # decode is bandwidth-bound (the win is the smaller weights) and A8
+        # would change the validated W8A16/W4A16 numerics -- so keep it False.
+        maybe_quantize_lhs=False,
+    )
+    # gmm_v2's output carries a tiled physical layout whose row padding differs
+    # from ragged_dot's. Downstream code reshapes the MoE output via a pure
+    # bitcast that assumes ragged_dot's layout, which XLA rejects for gmm_v2
+    # output ("Bitcast cannot have different shape sizes"). An optimization
+    # barrier forces XLA to insert a real relayout/copy instead of a bitcast,
+    # making the downstream reshape valid.
+    return jax.lax.optimization_barrier(out)
   else:
     raise ValueError(f'Unsupported gmm impl: {gmm_impl}')
-  return output
+
+
+def rotary_positional_embedding(
+    embedding_mat,
+    segment_positions=None,
+    min_timescale=1,
+    max_timescale=10_000,
+    scale_factor=1.0,
+):
+  embedding_dims = embedding_mat.shape[-1]
+  half_embedding_dim = embedding_dims // 2
+  fraction = 2 * jnp.arange(0, half_embedding_dim) / embedding_dims
+  timescale = min_timescale * (max_timescale / min_timescale)**fraction
+  query_segment_pos = segment_positions
+  if query_segment_pos is None:
+    seq_length = embedding_mat.shape[1]
+    query_segment_pos = jnp.arange(
+        seq_length, dtype=jnp.float32)[jnp.newaxis, :]
+  else:
+    query_segment_pos = jnp.asarray(query_segment_pos, dtype=jnp.float32)
+  query_segment_pos = query_segment_pos[:, :, jnp.newaxis, jnp.newaxis]
+  timescale = timescale[jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+  sinusoid_inp = query_segment_pos / timescale / scale_factor
+  sin = jnp.sin(sinusoid_inp)
+  cos = jnp.cos(sinusoid_inp)
+  # Convert to float32.
+  embedding_dtype = embedding_mat.dtype
+  embedding_mat = jnp.asarray(embedding_mat, jnp.float32)
+  first_half, second_half = jnp.split(embedding_mat, 2, axis=-1)
+  first_part = first_half * cos - second_half * sin
+  second_part = second_half * cos + first_half * sin
+  embedding_mat = jnp.concatenate([first_part, second_part], axis=-1)
+  # Convert back to original dtype.
+  embedding_mat = jnp.asarray(embedding_mat, embedding_dtype)
+  return embedding_mat
 
 
 def updated_decode_state(
@@ -349,7 +463,7 @@ def updated_decode_state(
   # in the output to avoid a pytree mismatch.
   if decode_state is not None and 'prefill_position' in decode_state:
     new_decode_state['prefill_position'] = decode_state['prefill_position']
-  return k, v, segment_positions, segment_ids, new_decode_state
+  return k, v, segment_positions, segment_ids, new_decode_state  # pyrefly: ignore[bad-return]
 
 
 def create_mask(
@@ -540,6 +654,11 @@ class FeedForward(module.SimplyModule):
   ffn_use_bias: bool = True
   ffn_activation: str = 'gelu'
   ffn_weight_init: initializer.Initializer = initializer.XavierUniformInit()
+  # Weight-only quant for the FFN weights, propagated from
+  # `config.ffn_weight_quant`. Fused spec `<dtype>[:<n_blocks>]` (e.g. 'int8',
+  # 'int4:8'); empty disables. See `simply.utils.quant`. Consumed by
+  # `quantize`; only `MoEFeedForward` (expert weights) currently acts on it.
+  weight_quant: str = ''
 
   @property
   def expand_dim(self) -> int:
@@ -592,7 +711,7 @@ class FeedForward(module.SimplyModule):
     params['ffn_1'] = self.ffn_1.init(ffn1_key)
     return params
 
-  def apply(
+  def apply(  # pyrefly: ignore[bad-override]
       self,
       params: PyTree,
       x: Array,
@@ -600,14 +719,14 @@ class FeedForward(module.SimplyModule):
   ) -> tuple[Array, PyTree]:
     del inputs_mask
     extra_output = {}
-    projected_x = self.ffn_0.apply(params['ffn_0'], x)
+    projected_x = self.ffn_0.apply(params['ffn_0'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
     if self.use_gated_activation_in_ffn:
-      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], x)
+      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
       x = jnp.asarray(activation_fn(gate), self.activation_dtype) * projected_x
     else:
       x = jnp.asarray(activation_fn(projected_x), self.activation_dtype)
-    x = self.ffn_1.apply(params['ffn_1'], x)
+    x = self.ffn_1.apply(params['ffn_1'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     return x, extra_output
 
 
@@ -729,7 +848,26 @@ class MoEFeedForward(FeedForward):
     params['ffn_1'] = self.ffn_1.init(ffn1_key)
     return params
 
-  def apply(
+  def quantize(self, params: PyTree) -> PyTree:
+    """Quantizes the FFN weights."""
+    if not self.weight_quant:
+      return params
+    quant_dtype, block_size = quant_lib.parse_weight_quant(self.weight_quant)
+    expert_linears = [('ffn_0', self.ffn_0), ('ffn_1', self.ffn_1)]
+    if self.use_gated_activation_in_ffn:
+      expert_linears.append(('ffn_0_gate', self.ffn_0_gate))
+    params = dict(params)  # pyrefly: ignore[no-matching-overload]
+    for name, linear in expert_linears:
+      sub = dict(params[name])
+      w = common.get_raw_arrays(sub[linear.weight_name])
+      quant, scale = quant_lib.quantize_moe_weight(
+          w, block_size=block_size, quant_dtype=quant_dtype  # pyrefly: ignore[bad-argument-type]
+      )
+      sub[linear.weight_name] = {'quant_array': quant, 'scale': scale}
+      params[name] = sub
+    return params
+
+  def apply(  # pyrefly: ignore[bad-override]
       self,
       params: PyTree,
       x: Array,
@@ -741,7 +879,7 @@ class MoEFeedForward(FeedForward):
     if inputs_mask is not None:
       inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
     # router_logits: [batch_size, seq_len, num_experts]
-    router_logits = self.router.apply(params['router'], inputs)
+    router_logits = self.router.apply(params['router'], inputs)  # pyrefly: ignore[bad-index, unsupported-operation]
     router_logits = router_logits.astype(jnp.float32)
     # router_probs: [batch_size, seq_len, num_experts]
     router_probs = jax.nn.softmax(router_logits, axis=-1)
@@ -797,17 +935,18 @@ class MoEFeedForward(FeedForward):
       raise ValueError(f'Unsupported MoE method: {self.ep_method=} with'
                        f' {self.ep_capacity_factor=}')
 
-    load = ffn_extra_output['load']
-    extra_output.update(ffn_extra_output)
+    load = ffn_extra_output['load']  # pyrefly: ignore[bad-index, unsupported-operation]
+    pipeline_metrics = ffn_extra_output.get('metrics', {})
     router_entropy = - jnp.sum(router_probs * jnp.where(
         router_probs > 0, jnp.log(router_probs), 0.0), axis=-1)
+    extra_output['metric'].update(pipeline_metrics)
     extra_output['metric'].update({
-        'max_load': jnp.max(load),
-        'min_load': jnp.min(load),
+        'max_load': jnp.max(load),  # pyrefly: ignore[bad-argument-type]
+        'min_load': jnp.min(load),  # pyrefly: ignore[bad-argument-type]
         'router_entropy': (
             jnp.mean(router_entropy, where=inputs_mask)
         ),
-        'gini': jnp.sum(load ** 2) * self.num_experts - 1,
+        'gini': jnp.sum(load ** 2) * self.num_experts - 1,  # pyrefly: ignore[unsupported-operation]
     })
     if self.lbl_loss_weight > 0:
       if inputs_mask is None:
@@ -831,7 +970,7 @@ class MoEFeedForward(FeedForward):
     if inputs_mask is not None:
       outputs = jnp.where(inputs_mask[..., None], outputs, 0.0)
     outputs = sharding_lib.with_sharding_constraint(
-        outputs, self.sharding_config.activation_partition
+        outputs, self.sharding_config.activation_partition  # pyrefly: ignore[bad-argument-type]
     )
     return outputs, extra_output
 
@@ -861,32 +1000,60 @@ class MoEFeedForward(FeedForward):
           None)
     selected_weights_partition = selected_indices_partition
 
+    def _w_and_scale(leaf):
+      if self.weight_quant:
+        return leaf['quant_array'], leaf['scale']
+      return common.convert_or_dequantize(
+          leaf, dtype=self.activation_dtype
+      ), None
+
     # ffn0_w: [num_experts, model_dim, expand_dim]
-    ffn0_w = params['ffn_0']['w']
-    ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)
+    ffn0_w, ffn0_scale = _w_and_scale(params['ffn_0']['w'])  # pyrefly: ignore[bad-index, unsupported-operation]
     ffn0_partition = sharding_lib.partition_spec(self.ffn0_partition)
 
     if self.use_gated_activation_in_ffn:
       # ffn0_gate_w: [num_experts, model_dim, expand_dim]
-      ffn0_gate_w = params['ffn_0_gate']['w']
-      ffn0_gate_w = common.convert_or_dequantize(
-          ffn0_gate_w, dtype=self.activation_dtype
-      )
+      ffn0_gate_w, ffn0_gate_scale = _w_and_scale(params['ffn_0_gate']['w'])  # pyrefly: ignore[bad-index, unsupported-operation]
       ffn0_gate_partition = ffn0_partition
     else:
       ffn0_gate_w = None
+      ffn0_gate_scale = None
       ffn0_gate_partition = None
 
     # ffn1_w: [num_experts, expand_dim, model_dim]
-    ffn1_w = params['ffn_1']['w']
-    ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)
+    ffn1_w, ffn1_scale = _w_and_scale(params['ffn_1']['w'])  # pyrefly: ignore[bad-index, unsupported-operation]
     ffn1_partition = sharding_lib.partition_spec(self.ffn1_partition)
+
+    # Scales are sharded only on the expert axis (same EP axis as the weight's
+    # expert axis); the K-block and output axes are replicated/None.
+    if self.weight_quant:
+      ep_axis = sharding_lib.get_partition_axis(self.ffn0_partition, axis=0)
+      tp_axis = sharding_lib.get_partition_axis(self.ffn0_partition, axis=-1)
+      if sharding_lib.get_partition_size(tp_axis) > 1:
+        raise ValueError(
+            'TP > 1 is not supported for quantized MoE: '
+            f'ffn0_partition={self.ffn0_partition}, tp_axis={tp_axis}'
+        )
+      scale_partition = js.PartitionSpec(ep_axis, None, None)
+    else:
+      scale_partition = js.PartitionSpec()
 
     if self.sharding_config.activation_partition is None:
       activation_partition = js.PartitionSpec()
     else:
       activation_partition = js.PartitionSpec(
           *self.sharding_config.activation_partition)
+
+    # Scale specs mirror the weight specs but are None when the corresponding
+    # weight is absent (no gate) or bf16 (scale is None). shard_map accepts
+    # None operands with a None in_spec.
+    ffn0_scale_spec = scale_partition if self.weight_quant else None
+    ffn1_scale_spec = scale_partition if self.weight_quant else None
+    ffn0_gate_scale_spec = (
+        scale_partition
+        if (self.weight_quant and self.use_gated_activation_in_ffn)
+        else None
+    )
 
     @jax.shard_map(
         mesh=js.get_abstract_mesh(),
@@ -897,6 +1064,9 @@ class MoEFeedForward(FeedForward):
             ffn1_partition,
             selected_indices_partition,
             selected_weights_partition,
+            ffn0_scale_spec,
+            ffn0_gate_scale_spec,
+            ffn1_scale_spec,
         ),
         out_specs=(activation_partition, js.PartitionSpec()),
         # Needed when using megablox.
@@ -904,7 +1074,8 @@ class MoEFeedForward(FeedForward):
     )
     def moe_ffn(
         inputs, ffn0_w, ffn0_gate_w, ffn1_w,
-        selected_indices, selected_weights):
+        selected_indices, selected_weights,
+        ffn0_scale, ffn0_gate_scale, ffn1_scale):
 
       def all_gather_if_sharded(w, partition, axis):
         if axis_name := get_partition_axis(partition, axis=axis):
@@ -1045,15 +1216,21 @@ class MoEFeedForward(FeedForward):
           round_up_to_base(min(ffn0_tiling[2], n), base=128, threshold=128),
       )
       ffn1_tiling = (ffn0_tiling[0], ffn0_tiling[2], ffn0_tiling[1])
-      gmm_ = functools.partial(gmm, gmm_impl=self.gmm_impl,
+      # Weight-only quant routes through gmm_v2 (W8A16/W4A16); otherwise the
+      # configured bf16 impl. `rhs_scale` is None on the bf16 path.
+      gmm_impl = 'gmm_v2' if self.weight_quant else self.gmm_impl
+      gmm_ = functools.partial(gmm, gmm_impl=gmm_impl,
                                activation_dtype=self.activation_dtype,
                                tiling=ffn0_tiling)
-      projected_inputs = gmm_(sorted_inputs, ffn0_w, local_group_sizes)
+      projected_inputs = gmm_(
+          sorted_inputs, ffn0_w, local_group_sizes, rhs_scale=ffn0_scale)
       activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
       if self.use_gated_activation_in_ffn:
         ffn0_gate_w = all_gather_if_sharded(
             ffn0_gate_w, self.sharding_config.ffn0_partition, axis=1)
-        gate = gmm_(sorted_inputs, ffn0_gate_w, local_group_sizes)
+        gate = gmm_(
+            sorted_inputs, ffn0_gate_w, local_group_sizes,
+            rhs_scale=ffn0_gate_scale)
         gate = activation_fn(gate)
         middle = jnp.asarray(gate, self.activation_dtype) * projected_inputs
       else:
@@ -1061,19 +1238,19 @@ class MoEFeedForward(FeedForward):
             activation_fn(projected_inputs), self.activation_dtype
         )
       sorted_outputs = gmm_(middle, ffn1_w, local_group_sizes,
-                            tiling=ffn1_tiling)
+                            tiling=ffn1_tiling, rhs_scale=ffn1_scale)
 
       # Dispatch tokens from expert shards to original shards
       # if using expert parallelism.
       if num_ep > 1:
         sorted_outputs = permute(
-            sorted_outputs, jnp.argsort(local_expert_sort_indices))
+            sorted_outputs, jnp.argsort(local_expert_sort_indices))  # pyrefly: ignore[unbound-name]
         global_input_offsets, global_output_offsets = (
-            get_global_input_output_offsets(global_send_sizes.T)
+            get_global_input_output_offsets(global_send_sizes.T)  # pyrefly: ignore[unbound-name]
         )
         local_input_offsets = global_input_offsets[ep_shard_idx]
         local_output_offsets = global_output_offsets[ep_shard_idx]
-        local_send_sizes, local_recv_sizes = local_recv_sizes, local_send_sizes
+        local_send_sizes, local_recv_sizes = local_recv_sizes, local_send_sizes  # pyrefly: ignore[unbound-name]
         output_buffer = jax.lax.empty(
             shape=(local_num_tokens, model_dim),
             dtype=self.activation_dtype,
@@ -1124,6 +1301,9 @@ class MoEFeedForward(FeedForward):
         ffn1_w,
         selected_indices,
         selected_weights,
+        ffn0_scale,
+        ffn0_gate_scale,
+        ffn1_scale,
     )
     return outputs, {'load': load}
 
@@ -1155,8 +1335,8 @@ class MoEFeedForward(FeedForward):
     selected_weights_partition = selected_indices_partition
 
     # ffn0_w: [num_experts, model_dim, expand_dim]
-    ffn0_w = params['ffn_0']['w']
-    ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)
+    ffn0_w = params['ffn_0']['w']  # pyrefly: ignore[bad-index, unsupported-operation]
+    ffn0_w = common.convert_or_dequantize(ffn0_w, dtype=self.activation_dtype)  # pyrefly: ignore[bad-argument-type]
     ffn0_partition = (
         js.PartitionSpec(*self.ffn0_partition)
         if self.ffn0_partition is not None
@@ -1165,9 +1345,9 @@ class MoEFeedForward(FeedForward):
 
     if self.use_gated_activation_in_ffn:
       # ffn0_gate_w: [num_experts, model_dim, expand_dim]
-      ffn0_gate_w = params['ffn_0_gate']['w']
+      ffn0_gate_w = params['ffn_0_gate']['w']  # pyrefly: ignore[bad-index, unsupported-operation]
       ffn0_gate_w = common.convert_or_dequantize(
-          ffn0_gate_w, dtype=self.activation_dtype
+          ffn0_gate_w, dtype=self.activation_dtype  # pyrefly: ignore[bad-argument-type]
       )
       ffn0_gate_partition = ffn0_partition
     else:
@@ -1175,8 +1355,8 @@ class MoEFeedForward(FeedForward):
       ffn0_gate_partition = None
 
     # ffn1_w: [num_experts, expand_dim, model_dim]
-    ffn1_w = params['ffn_1']['w']
-    ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)
+    ffn1_w = params['ffn_1']['w']  # pyrefly: ignore[bad-index, unsupported-operation]
+    ffn1_w = common.convert_or_dequantize(ffn1_w, dtype=self.activation_dtype)  # pyrefly: ignore[bad-argument-type]
     ffn1_partition = sharding_lib.partition_spec(self.ffn1_partition)
 
     if self.sharding_config.activation_partition is None:
@@ -1232,7 +1412,6 @@ class MoEFeedForward(FeedForward):
                             tiling=ffn1_tiling)
       return sorted_outputs.reshape(inputs_shape)
 
-    metrics_partition = js.PartitionSpec()
     @jax.shard_map(
         mesh=sharding_lib.get_default_mesh(),
         in_specs=(
@@ -1243,7 +1422,7 @@ class MoEFeedForward(FeedForward):
             selected_indices_partition,
             selected_weights_partition
         ),
-        out_specs=(activation_partition, metrics_partition),
+        out_specs=(activation_partition, js.PartitionSpec()),
         check_vma=False  # Needed when using megablox.
     )
     def moe_ffn(inputs, ffn0_w, ffn0_gate_w, ffn1_w,
@@ -1284,14 +1463,15 @@ class MoEFeedForward(FeedForward):
         moe_fwd_fn = moe_lib.run_moe_pipelined_shard_map
       else:
         raise ValueError(f'Unsupported ep_method: {self.ep_method}')
-      outputs = moe_fwd_fn(
+      outputs, metrics = moe_fwd_fn(
           selected_indices, inputs, ffn0_w, ffn0_gate_w, ffn1_w,
-          axis_name=ep_axis, num_experts=self.num_experts,
+          axis_name=ep_axis, num_experts=self.num_experts,  # pyrefly: ignore[bad-argument-type]
           config=moe_pipeline_config,
           experts_per_tok=self.num_experts_per_token,
-          splits=self.ep_pipeline_stages, metrics=(metrics := {}),
-          compute_block=compute_block, scales=selected_weights,
-      ).reshape(inputs_shape)
+          splits=self.ep_pipeline_stages,
+          compute_block=compute_block, scales=selected_weights,  # pyrefly: ignore[bad-argument-type]
+      )
+      outputs = outputs.reshape(inputs_shape)
       load = jax.lax.all_gather(metrics['load_factor'], axis_name=ep_axis)
 
       # Assume megatron-style tensor parallelism on FFN.
@@ -1309,9 +1489,9 @@ class MoEFeedForward(FeedForward):
       elif num_tp > 1:
         outputs = jax.lax.psum(outputs, axis_name=tp_axis)
 
-      return outputs, load
+      return outputs, {'load': load, 'metrics': metrics}
 
-    outputs, load = moe_ffn(
+    outputs, metrics_dict = moe_ffn(
         inputs,
         ffn0_w,
         ffn0_gate_w,
@@ -1319,7 +1499,7 @@ class MoEFeedForward(FeedForward):
         selected_indices,
         selected_weights,
     )
-    return outputs, {'load': load}
+    return outputs, metrics_dict
 
   def _apply_dense_moe(
       self,
@@ -1333,7 +1513,7 @@ class MoEFeedForward(FeedForward):
     batch_size, seq_len, _ = inputs.shape
     num_tokens = batch_size * seq_len
     expert_capacity = max(
-        1, int(num_tokens / self.num_experts * self.ep_capacity_factor)
+        1, int(num_tokens / self.num_experts * self.ep_capacity_factor)  # pyrefly: ignore[unsupported-operation]
     )
     logging.info('expert_capacity=%s', expert_capacity)
     # selected_indices: [batch_size * seq_len, num_experts_per_token]
@@ -1388,10 +1568,10 @@ class MoEFeedForward(FeedForward):
     # projected_inputs:
     # [num_experts, expert_capacity, model_dim * expand_factor]
     expert_inputs = jnp.asarray(expert_inputs, self.activation_dtype)
-    projected_inputs = self.ffn_0.apply(params['ffn_0'], expert_inputs)
+    projected_inputs = self.ffn_0.apply(params['ffn_0'], expert_inputs)  # pyrefly: ignore[bad-index, unsupported-operation]
     activation_fn = registry.FunctionRegistry.get(self.ffn_activation)
     if self.use_gated_activation_in_ffn:
-      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], expert_inputs)
+      gate = self.ffn_0_gate.apply(params['ffn_0_gate'], expert_inputs)  # pyrefly: ignore[bad-index, unsupported-operation]
       gate = jnp.asarray(activation_fn(gate), self.activation_dtype)
       middle = gate * projected_inputs
     else:
@@ -1399,7 +1579,7 @@ class MoEFeedForward(FeedForward):
           activation_fn(projected_inputs), self.activation_dtype
       )
     # outputs: [num_experts, expert_capacity, model_dim]
-    outputs = self.ffn_1.apply(params['ffn_1'], middle)
+    outputs = self.ffn_1.apply(params['ffn_1'], middle)  # pyrefly: ignore[bad-index, unsupported-operation]
 
     # outputs: [num_tokens, model_dim]
     outputs = jnp.einsum('ecd,tec->td', outputs, dispatch_weights)
@@ -1409,6 +1589,15 @@ class MoEFeedForward(FeedForward):
         outputs, '(b s) d -> b s d', b=batch_size, s=seq_len
     )
     return outputs, extra_outputs
+
+
+# Wrap-around sentinel for the chunked-local-AG path: on shard 0 the
+# permuted-in "left neighbor" is the wrapped-around last shard, whose KV
+# tokens must be masked out. We rewrite their segment ids to this sentinel,
+# which is guaranteed to mismatch every real segment id (real ids fit in
+# int32 with plenty of headroom under 2**30), so the splash/`SegmentIds`
+# equality test drops them. See `Attention._chunked_local_flash_attention`.
+_WRAPAROUND_SENTINEL_SEGMENT_ID = 2**30
 
 
 @module.ModuleRegistry.register
@@ -1437,8 +1626,31 @@ class Attention(module.SimplyModule):
   # Experimental flags.
   use_flash_attention: bool = False
   flash_attention_block_size: int = 512
+  flash_residual_checkpoint_name: str | None = None
+  # Asymmetric splash block sizes (None = use flash_attention_block_size).
+  flash_block_q: int | None = None
+  flash_block_kv: int | None = None
+  flash_block_kv_compute: int | None = None
+  flash_block_q_dkv: int | None = None
+  flash_block_kv_dkv: int | None = None
+  flash_block_kv_dkv_compute: int | None = None
+  flash_block_q_dq: int | None = None
+  flash_block_kv_dq: int | None = None
+  flash_use_fused_bwd_kernel: bool = False
   window_size: int = 0
   use_window_chunk: bool = False
+  # Local-attention chunked all-gather. When True and `window_size > 0`, the
+  # local-attention flash path replaces the full-sequence K/V all-gather with a
+  # single `jax.lax.ppermute` from the left neighbor shard, then runs splash on
+  # a `(shard_size, slice + shard_size)` window with a local-causal mask. This
+  # is correct only when `window_size <= shard_size` (= `seq_len /
+  # seq_axis_size`); on layers that do not satisfy the bound, the code falls
+  # back to the all-gather implementation. The `slice` is auto-derived by
+  # `_chunked_local_flash_attention` as the smallest multiple of
+  # `block_sizes.block_kv` that covers `window_size` KV tokens of left
+  # context (see that method's docstring), so this is the only knob the user
+  # needs to set to opt in.
+  use_chunked_local_ag: bool = False
   n_kv_heads: int = 0
   qkv_use_bias: bool = False
   o_use_bias: bool = False
@@ -1448,6 +1660,10 @@ class Attention(module.SimplyModule):
   # Ragged paged attention
   total_num_pages: int = 0
   page_size: int = 0
+  rpa_block_q: int | None = None
+  # Low-precision (fp8) KV cache for the paged KV cache. See
+  # `quant.parse_kv_cache_quant`.
+  kv_cache_quant: str = ''
   # Position encoding (None = NoPE, no positional encoding).
   position_encoding: pe_lib.PositionEncodingConfig | None = pe_lib.RoPE()
 
@@ -1494,6 +1710,280 @@ class Attention(module.SimplyModule):
     """
     return output
 
+  def _full_flash_attention(
+      self,
+      *,
+      q: Array,
+      k: Array,
+      v: Array,
+      q_segment_ids: Array,
+      kv_segment_ids: Array,
+      mask: splash_attention.MultiHeadMask,
+      block_sizes: splash_attention.BlockSizes,
+      shard_count: int,
+      seq_len_axis: str | tuple[str, ...] | None,
+      num_heads_axis: str | None,
+      bnlh: js.PartitionSpec,
+      bnlh_unsharded_seq: js.PartitionSpec,
+      bl: js.PartitionSpec,
+      bl_unsharded_seq: js.PartitionSpec,
+  ) -> Array:
+    """Flash attention with K/V all-gathered across the sequence axis.
+
+    The default flash-attention path: K/V are passed into the shard_map with
+    seq-unsharded specs (forcing an implicit all-gather), and splash sees
+    the full sequence on every shard. Use `_chunked_local_flash_attention`
+    instead for local-attention layers that fit the chunked-AG eligibility
+    predicate — it cuts the cross-shard payload by 1-2 orders of magnitude.
+
+    Args:
+      q: Query, shape `[B, N, L, H]` with `L` sharded over `seq_len_axis`.
+      k: Key, same shape and sharding as `q`.
+      v: Value, same shape and sharding as `q`.
+      q_segment_ids: Per-token Q segment ids, shape `[B, L]`.
+      kv_segment_ids: Per-token KV segment ids, shape `[B, L]`.
+      mask: Splash `MultiHeadMask` for this attention layer.
+      block_sizes: Splash kernel block sizes.
+      shard_count: Number of seq shards (= `get_partition_size(seq_len_axis)`).
+      seq_len_axis: Mesh axis (or composite) over which the sequence is sharded;
+        `None` means unsharded.
+      num_heads_axis: Mesh axis over which heads are sharded.
+      bnlh: `PartitionSpec` over `(B, N, L, H)`.
+      bnlh_unsharded_seq: Same as `bnlh` but with the seq axis replicated.
+      bl: `PartitionSpec` over `(B, L)`.
+      bl_unsharded_seq: Same as `bl` but with the seq axis replicated.
+
+    Returns:
+      Attention output in BNLH format, sharded the same way as `q`.
+    """
+    splash_attn_kernel = splash_attention.make_splash_mha(
+        mask=mask,
+        block_sizes=block_sizes,
+        mask_value=self.attn_mask_value,
+        attn_logits_soft_cap=(
+            self.attn_soft_cap if self.attn_soft_cap > 0 else None
+        ),
+        head_shards=sharding_lib.get_partition_size(num_heads_axis),
+        q_seq_shards=shard_count,
+        residual_checkpoint_name=self.flash_residual_checkpoint_name,
+    )
+    kernel_sharding = splash_attn_kernel.manual_sharding_spec(
+        sharding_lib.named_sharding((num_heads_axis, seq_len_axis))
+    )
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=js.get_abstract_mesh(),
+        in_specs=(
+            kernel_sharding,
+            bnlh,
+            bnlh_unsharded_seq,
+            bnlh_unsharded_seq,
+            bl,
+            bl_unsharded_seq,
+        ),
+        out_specs=bnlh,
+        check_vma=False,
+    )
+    def flash_attention_fn(kernel, query, key, value, q_seg_ids, kv_seg_ids):
+      return jax.vmap(kernel)(
+          q=query,
+          k=key,
+          v=value,
+          segment_ids=splash_attention.SegmentIds(q=q_seg_ids, kv=kv_seg_ids),
+      )
+
+    return flash_attention_fn(
+        splash_attn_kernel, q, k, v, q_segment_ids, kv_segment_ids
+    )
+
+  def _chunked_local_flash_attention(
+      self,
+      *,
+      q: Array,
+      k: Array,
+      v: Array,
+      q_segment_ids: Array,
+      kv_segment_ids: Array,
+      shard_size: int,
+      block_sizes: splash_attention.BlockSizes,
+      seq_len_axis: str | tuple[str, ...],
+      num_heads_axis: str | None,
+      bnlh: js.PartitionSpec,
+      bl: js.PartitionSpec,
+  ) -> Array:
+    """Local-attention flash attention using a single left-neighbor permute.
+
+    For a local-attention layer with `window_size <= shard_size`, every Q
+    position only attends to KV positions within `window_size` of itself. Each
+    seq shard therefore needs at most its own KV plus the LAST `window_size`
+    KV tokens from the immediate left neighbor (none from any other shard).
+
+    Instead of all-gathering K/V across the entire `seq_len_axis`, this method
+    issues a single `jax.lax.ppermute` that rotates the relevant tail of each
+    shard's K/V to its right neighbor, concatenates it on the left of the
+    local K/V, and runs splash attention on a `(shard_size, slice +
+    shard_size)` window with a local-causal mask offset by `slice`.
+
+    `slice` is auto-derived as the smallest value satisfying both:
+      (a) `slice >= window_size`, so the leftmost Q of each shard sees its
+          full window of left context; and
+      (b) `(slice + shard_size) % block_kv == 0`, so the splash kernel
+          consumes the concatenated KV without partial blocks.
+    Closed form: `slice = ceil((window_size + shard_size) / block_kv) *
+    block_kv - shard_size`.
+
+    Args:
+      q: Query, shape `[B, N, L, H]` with `L` sharded over `seq_len_axis`.
+      k: Key, same shape and sharding as `q`.
+      v: Value, same shape and sharding as `q`.
+      q_segment_ids: Per-token Q segment ids, shape `[B, L]`.
+      kv_segment_ids: Per-token KV segment ids, shape `[B, L]`.
+      shard_size: Per-shard sequence length (`L / shard_count`).
+      block_sizes: splash kernel block sizes (only `block_kv` is read here;
+        the rest flow into `make_splash_mha`).
+      seq_len_axis: The mesh axis (or composite tuple of axes) along which the
+        sequence is sharded. If composite, the LAST axis (innermost) is used as
+        the ppermute axis so that shard `i` chains to shard `i + 1` in linear
+        sequence order.
+      num_heads_axis: The mesh axis over which heads are sharded.
+      bnlh: `PartitionSpec` over `(B, N, L, H)`.
+      bl: `PartitionSpec` over `(B, L)`.
+
+    Returns:
+      Attention output in BNLH format, sharded the same way as `q`.
+    """
+    # Auto-derive the smallest legal slice; see the docstring for the
+    # constraints and closed form.
+    block_kv = block_sizes.block_kv
+    chunk_kv_len = (
+        math.ceil((self.window_size + shard_size) / block_kv) * block_kv
+    )
+    left_slice = chunk_kv_len - shard_size
+    # By construction `left_slice >= window_size`; defensive check.
+    assert left_slice >= self.window_size, (
+        f'derived left_slice={left_slice} < window_size={self.window_size}; '
+        'closed-form derivation is broken.'
+    )
+    # The eligibility predicate in `apply()` enforces `window_size <=
+    # shard_size`, but the closed form can still produce `left_slice >
+    # shard_size` when `block_kv > 2 * shard_size` (a pathological
+    # configuration: splash blocks larger than two seq shards combined).
+    # The ppermute path can't help in that regime -- callers should fall
+    # through to `_full_flash_attention` -- so we make the failure mode
+    # loud.
+    assert left_slice <= shard_size, (
+        f'derived left_slice={left_slice} exceeds shard_size={shard_size}; '
+        f'eligibility predicate should have rejected this config '
+        f'(window_size={self.window_size}, block_kv={block_kv}). '
+        'Tighten the predicate or fall through to _full_flash_attention.'
+    )
+
+    # Splash kernel sees Q (size shard_size) vs concatenated KV (size
+    # slice + shard_size), with a local-causal mask offset by `slice` so
+    # that mask position 0 corresponds to the FIRST permuted-in KV token.
+    chunk_kv_len = left_slice + shard_size
+    chunk_mask = splash_attention.CausalMask(
+        (shard_size, chunk_kv_len), offset=left_slice
+    )
+    chunk_mask &= splash_attention.LocalMask(
+        (shard_size, chunk_kv_len),
+        (self.window_size, None),
+        offset=left_slice,
+    )
+    chunk_mask = splash_attention.MultiHeadMask([chunk_mask] * self.n_heads)
+
+    chunked_kernel = splash_attention.make_splash_mha(
+        mask=chunk_mask,
+        block_sizes=block_sizes,
+        mask_value=self.attn_mask_value,
+        attn_logits_soft_cap=(
+            self.attn_soft_cap if self.attn_soft_cap > 0 else None
+        ),
+        head_shards=sharding_lib.get_partition_size(num_heads_axis),
+        q_seq_shards=1,  # Q within each shard is contiguous.
+        residual_checkpoint_name=self.flash_residual_checkpoint_name,
+    )
+    chunked_kernel_sharding = chunked_kernel.manual_sharding_spec(
+        sharding_lib.named_sharding((num_heads_axis, None))
+    )
+
+    # The seq axis can be a composite (tuple). The ppermute must go along
+    # the LAST (innermost) axis so that shard `i` chains to shard `i + 1`
+    # in linear sequence order; permuting an outer axis would jump by a
+    # full sub-mesh and bring in non-adjacent KV.
+    permute_axis = (
+        seq_len_axis[-1] if isinstance(seq_len_axis, tuple) else seq_len_axis
+    )
+
+    @functools.partial(
+        jax.shard_map,
+        mesh=js.get_abstract_mesh(),
+        in_specs=(chunked_kernel_sharding, bnlh, bnlh, bnlh, bl, bl),
+        out_specs=bnlh,
+        check_vma=False,
+    )
+    def chunked_local_flash_attn_fn(
+        kernel, query, key, value, q_seg_ids, kv_seg_ids
+    ):
+      # Build a ring permute: every shard sends to its right neighbor.
+      n_shards = jax.lax.psum(1, axis_name=permute_axis)
+      perm = [(i, (i + 1) % n_shards) for i in range(n_shards)]
+
+      # Pull only the LAST `left_slice` KV tokens out of each shard before
+      # the permute. K/V have shape `[B, N, L, H]` (seq axis = 2);
+      # `kv_seg_ids` has shape `[B, L]` (seq axis = 1). If `left_slice ==
+      # shard_size`, this slice is a no-op and the full payload is sent.
+      if left_slice < shard_size:
+        key_tail = jax.lax.slice_in_dim(
+            key, shard_size - left_slice, shard_size, axis=2
+        )
+        value_tail = jax.lax.slice_in_dim(
+            value, shard_size - left_slice, shard_size, axis=2
+        )
+        kv_seg_tail = jax.lax.slice_in_dim(
+            kv_seg_ids, shard_size - left_slice, shard_size, axis=1
+        )
+      else:
+        key_tail = key
+        value_tail = value
+        kv_seg_tail = kv_seg_ids
+
+      left_key = jax.lax.ppermute(key_tail, axis_name=permute_axis, perm=perm)
+      left_value = jax.lax.ppermute(
+          value_tail, axis_name=permute_axis, perm=perm
+      )
+      left_kv_seg_ids = jax.lax.ppermute(
+          kv_seg_tail, axis_name=permute_axis, perm=perm
+      )
+
+      # On shard 0 the "left neighbor" is the wrapped-around last shard;
+      # rewrite its segment ids to the wrap-around sentinel so the splash
+      # `SegmentIds` equality test drops those KV tokens.
+      shard_idx = jax.lax.axis_index(permute_axis)
+      left_kv_seg_ids = jnp.where(
+          shard_idx == 0,
+          jnp.int32(_WRAPAROUND_SENTINEL_SEGMENT_ID),
+          left_kv_seg_ids,
+      )
+
+      # Concat along the seq axis: `[left_neighbor_tail, own]`.
+      chunk_key = jnp.concatenate([left_key, key], axis=2)
+      chunk_value = jnp.concatenate([left_value, value], axis=2)
+      chunk_kv_seg_ids = jnp.concatenate([left_kv_seg_ids, kv_seg_ids], axis=1)
+      return jax.vmap(kernel)(
+          q=query,
+          k=chunk_key,
+          v=chunk_value,
+          segment_ids=splash_attention.SegmentIds(
+              q=q_seg_ids, kv=chunk_kv_seg_ids
+          ),
+      )
+
+    return chunked_local_flash_attn_fn(
+        chunked_kernel, q, k, v, q_segment_ids, kv_segment_ids
+    )
+
   def _scale_qk(
       self,
       q: Array,
@@ -1514,15 +2004,15 @@ class Attention(module.SimplyModule):
     """
 
     if self.qk_norm:
-      q = self.qk_norm.apply(params['q_norm'], q)
-      k = self.qk_norm.apply(params['k_norm'], k)
+      q = self.qk_norm.apply(params['q_norm'], q)  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = self.qk_norm.apply(params['k_norm'], k)  # pyrefly: ignore[bad-index, unsupported-operation]
 
     if self.position_encoding is not None:
       q = self.position_encoding.apply(q, segment_positions=segment_positions)
       k = self.position_encoding.apply(k, segment_positions=segment_positions)
 
     if self.use_per_dim_scale:
-      q = self.per_dim_scale.apply(params['per_dim_scale'], q)
+      q = self.per_dim_scale.apply(params['per_dim_scale'], q)  # pyrefly: ignore[bad-index, unsupported-operation]
     elif self.query_scale > 0:
       q = q / self.query_scale
     else:
@@ -1578,7 +2068,7 @@ class Attention(module.SimplyModule):
         eqn='ihd,...hd->...i',
         weight_shape=q_shape,
         weight_partition=self.o_partition,
-        **o_kwargs,
+        **o_kwargs,  # pyrefly: ignore[bad-argument-type]
     )
 
   def init(self, prng_key: PRNGKey) -> PyTree:
@@ -1598,7 +2088,7 @@ class Attention(module.SimplyModule):
 
     return params
 
-  def apply(
+  def apply(  # pyrefly: ignore[bad-override]
       self,
       params: PyTree,
       x: Array,
@@ -1613,11 +2103,26 @@ class Attention(module.SimplyModule):
     assert len(x.shape) == 3
     assert x.shape[-1] == self.model_dim
     # q: [batch_size, seq_len, n_heads, per_head_dim]
-    q = self.q_proj.apply(params['q_proj'], x)
+    q = self.q_proj.apply(params['q_proj'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     # k: [batch_size, seq_len, n_heads, per_head_dim]
-    k = self.k_proj.apply(params['k_proj'], x)
+    k = self.k_proj.apply(params['k_proj'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     # v: [batch_size, seq_len, n_heads, per_head_dim]
-    v = self.v_proj.apply(params['v_proj'], x)
+    v = self.v_proj.apply(params['v_proj'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
+
+    # Optional KV cache sharing across layers: when extra_inputs supplies
+    # a 'kv_override' tuple of (k, v), use those tensors in place of the
+    # just-projected k, v. This allows shared layers to reuse the
+    # (pre-rmsnorm) k, v computed by a previous unshared layer.
+    if extra_inputs is not None:
+      _kv_override = extra_inputs.get('kv_override')
+      if _kv_override is not None:
+        k, v = _kv_override
+
+    # Capture the (post-override, post-projection / pre-scale) k, v so that
+    # callers implementing KV cache sharing across layers can replay them via
+    # extra_inputs['kv_override'] on subsequent shared layers. The captured
+    # values are pre-rmsnorm and post-projection.
+    _kv_pre_scale = (k, v)
 
     q, k = self._scale_qk(q, k, segment_positions, params)
 
@@ -1626,7 +2131,7 @@ class Attention(module.SimplyModule):
     # k in [batch_size, seq_len, n_kv_heads, per_head_dim]
     # v in [batch_size, seq_len, n_kv_heads, per_head_dim]
 
-    extra_output = {}
+    extra_output = {'kv_pre_scale': _kv_pre_scale}
 
     if isinstance(decode_state, rpa.DecodeState):
       q = einops.rearrange(q, '1 l ... -> l ...')
@@ -1641,6 +2146,7 @@ class Attention(module.SimplyModule):
           mask_value=self.attn_mask_value,
           update_kv_cache=extra_inputs.get('update_kv_cache', True),
           page_manage_cache=extra_inputs.get('page_manage_cache'),
+          num_queries_per_block=self.rpa_block_q,
       )
       output = einops.rearrange(output, 'l ... -> 1 l ...')
       output = sharding_lib.with_sharding_constraint(
@@ -1653,7 +2159,7 @@ class Attention(module.SimplyModule):
           is not None
       ):
         decode_state = decode_state or {}
-        decode_state['prefill_position'] = prefill_position
+        decode_state['prefill_position'] = prefill_position  # pyrefly: ignore[unsupported-operation]
 
       update_kv_cache = True
       if extra_inputs is not None:
@@ -1676,7 +2182,7 @@ class Attention(module.SimplyModule):
 
       # At decoding time (q.shape[1] == 1), we don't use flash attention.
       if self.use_flash_attention and q_seq_len > 1:
-        batch_size_axis, seq_len_axis, num_heads_axis, per_head_size_axis = (
+        batch_size_axis, seq_len_axis, num_heads_axis, per_head_size_axis = (  # pyrefly: ignore[not-iterable]
             self.attn_activation_partition
         )
         bnlh = js.PartitionSpec(
@@ -1700,61 +2206,89 @@ class Attention(module.SimplyModule):
             q, segment_ids, q_seq_len, kv_seq_len, shard_count)
         mask = splash_attention.MultiHeadMask([mask] * self.n_heads)
 
-        block_sizes = splash_attention.BlockSizes(
-            block_q=self.flash_attention_block_size,
-            block_kv=self.flash_attention_block_size,
-            block_kv_compute=self.flash_attention_block_size,
-            block_q_dkv=self.flash_attention_block_size,
-            block_kv_dkv=self.flash_attention_block_size,
-            block_kv_dkv_compute=self.flash_attention_block_size,
-            block_q_dq=self.flash_attention_block_size,
-            block_kv_dq=self.flash_attention_block_size,
-        )
-
-        splash_attn_kernel = splash_attention.make_splash_mha(
-            mask=mask,
-            block_sizes=block_sizes,
-            mask_value=self.attn_mask_value,
-            attn_logits_soft_cap=(
-                self.attn_soft_cap if self.attn_soft_cap > 0 else None
-            ),
-            head_shards=sharding_lib.get_partition_size(num_heads_axis),
-            q_seq_shards=shard_count,
-        )
-        kernel_sharding = splash_attn_kernel.manual_sharding_spec(
-            sharding_lib.named_sharding((num_heads_axis, seq_len_axis))
-        )
-
-        @functools.partial(
-            jax.shard_map,
-            mesh=js.get_abstract_mesh(),
-            in_specs=(
-                kernel_sharding,
-                bnlh,
-                bnlh_unsharded_seq,
-                bnlh_unsharded_seq,
-                bl,
-                bl_unsharded_seq,
-            ),
-            out_specs=bnlh,
-            check_vma=False,
-        )
-        def flash_attention_fn(
-            kernel, query, key, value, q_segment_ids, kv_segment_ids
-        ):
-          attn_out = jax.vmap(kernel)(
-              q=query,
-              k=key,
-              v=value,
-              segment_ids=splash_attention.SegmentIds(
-                  q=q_segment_ids, kv=kv_segment_ids
-              ),
+        if self.flash_block_q is not None:
+          # Fused bwd kernel requires block_q_dq/block_kv_dq=None.
+          if self.flash_use_fused_bwd_kernel:
+            block_sizes = splash_attention.BlockSizes(
+                block_q=self.flash_block_q,
+                block_kv=self.flash_block_kv,  # pyrefly: ignore[bad-argument-type]
+                block_kv_compute=self.flash_block_kv_compute
+                or self.flash_block_kv,
+                block_q_dkv=self.flash_block_q_dkv or self.flash_block_q,
+                block_kv_dkv=self.flash_block_kv_dkv or self.flash_block_kv,
+                block_kv_dkv_compute=self.flash_block_kv_dkv_compute
+                or self.flash_block_kv_dkv
+                or self.flash_block_kv,
+                use_fused_bwd_kernel=True,
+            )
+          else:
+            block_sizes = splash_attention.BlockSizes(
+                block_q=self.flash_block_q,
+                block_kv=self.flash_block_kv,  # pyrefly: ignore[bad-argument-type]
+                block_kv_compute=self.flash_block_kv_compute
+                or self.flash_block_kv,
+                block_q_dkv=self.flash_block_q_dkv or self.flash_block_q,
+                block_kv_dkv=self.flash_block_kv_dkv or self.flash_block_kv,
+                block_kv_dkv_compute=self.flash_block_kv_dkv_compute
+                or self.flash_block_kv_dkv
+                or self.flash_block_kv,
+                block_q_dq=self.flash_block_q_dq or self.flash_block_q,
+                block_kv_dq=self.flash_block_kv_dq or self.flash_block_kv,
+            )
+        else:
+          block_sizes = splash_attention.BlockSizes(
+              block_q=self.flash_attention_block_size,
+              block_kv=self.flash_attention_block_size,
+              block_kv_compute=self.flash_attention_block_size,
+              block_q_dkv=self.flash_attention_block_size,
+              block_kv_dkv=self.flash_attention_block_size,
+              block_kv_dkv_compute=self.flash_attention_block_size,
+              block_q_dq=self.flash_attention_block_size,
+              block_kv_dq=self.flash_attention_block_size,
           )
-          return attn_out
 
-        output = flash_attention_fn(
-            splash_attn_kernel, q, k, v, q_segment_ids, kv_segment_ids
+        # Local-attention chunked all-gather optimization: when the window
+        # fits inside one neighbor shard, replace the full K/V all-gather
+        # with a single `ppermute` of the left neighbor's KV (or just its
+        # tail). See `_chunked_local_flash_attention` for details.
+        shard_size = q_seq_len // shard_count
+        chunked_local_eligible = (
+            self.use_chunked_local_ag
+            and self.window_size > 0
+            and shard_count > 1
+            and self.window_size <= shard_size
         )
+        if chunked_local_eligible:
+          output = self._chunked_local_flash_attention(
+              q=q,
+              k=k,
+              v=v,
+              q_segment_ids=q_segment_ids,
+              kv_segment_ids=kv_segment_ids,
+              shard_size=shard_size,
+              block_sizes=block_sizes,
+              seq_len_axis=seq_len_axis,  # pyrefly: ignore[bad-argument-type]
+              num_heads_axis=num_heads_axis,  # pyrefly: ignore[bad-argument-type]
+              bnlh=bnlh,
+              bl=bl,
+          )
+        else:
+          output = self._full_flash_attention(
+              q=q,
+              k=k,
+              v=v,
+              q_segment_ids=q_segment_ids,
+              kv_segment_ids=kv_segment_ids,
+              mask=mask,
+              block_sizes=block_sizes,
+              shard_count=shard_count,
+              seq_len_axis=seq_len_axis,  # pyrefly: ignore[bad-argument-type]
+              num_heads_axis=num_heads_axis,  # pyrefly: ignore[bad-argument-type]
+              bnlh=bnlh,
+              bnlh_unsharded_seq=bnlh_unsharded_seq,
+              bl=bl,
+              bl_unsharded_seq=bl_unsharded_seq,
+          )
         # Hook: post-process flash attention output (e.g., un-interleave).
         output = self._postprocess_flash_output(output, shard_count)
         output = jnp.swapaxes(output, 1, 2)  # Swap back.
@@ -1782,7 +2316,7 @@ class Attention(module.SimplyModule):
               None,
               *self.attn_activation_partition[3:],
           )
-        q = sharding_lib.with_sharding_constraint(q, group_sharding)
+        q = sharding_lib.with_sharding_constraint(q, group_sharding)  # pyrefly: ignore[bad-argument-type]
 
         # q: [batch_size, seq_len, n_groups, self.n_kv_heads, self.per_head_dim]
         # k, v: [batch_size, seq_len, self.n_kv_heads, self.per_head_dim]
@@ -1796,9 +2330,9 @@ class Attention(module.SimplyModule):
           # have better way there.
           output = chunked_local_attn(
               q,
-              k,
-              v,
-              mask,
+              k,  # pyrefly: ignore[bad-argument-type]
+              v,  # pyrefly: ignore[bad-argument-type]
+              mask,  # pyrefly: ignore[bad-argument-type]
               self.window_size,
               attn_soft_cap=self.attn_soft_cap,
               attn_mask_value=self.attn_mask_value,
@@ -1824,9 +2358,9 @@ class Attention(module.SimplyModule):
       output = sharding_lib.with_sharding_constraint(
           output, self.attn_activation_partition
       )
-    extra_output['decode_state'] = decode_state
-    output = self.o_proj.apply(params['o_proj'], output)
-    return output, extra_output
+    extra_output['decode_state'] = decode_state  # pyrefly: ignore[bad-assignment]
+    output = self.o_proj.apply(params['o_proj'], output)  # pyrefly: ignore[bad-index, unsupported-operation]
+    return output, extra_output  # pyrefly: ignore[bad-return]
 
   def init_decode_state(self, batch_size: int, max_seq_len: int) -> PyTree:
     if self.total_num_pages <= 0 or self.page_size <= 0:
@@ -1865,17 +2399,26 @@ class Attention(module.SimplyModule):
     seq_partition = sharding_lib.get_partition_axis(
         self.attn_activation_partition, 1
     )
-    return rpa.DecodeStateConfig(
+    cache_dtype = self.activation_dtype
+    k_scale = None
+    v_scale = None
+    if self.kv_cache_quant:
+      cache_dtype, k_scale, v_scale = quant_lib.parse_kv_cache_quant(
+          self.kv_cache_quant
+      )
+    return rpa.DecodeStateConfig(  # pyrefly: ignore[bad-return]
         total_num_pages=self.total_num_pages,
         page_size=self.page_size,
         n_kv_heads=self.n_kv_heads,
         per_head_dim=self.per_head_dim,
         batch_size=batch_size,
-        dtype=self.activation_dtype,
+        dtype=cache_dtype,
         max_seq_len=max_seq_len,
         window_size=self.window_size if self.window_size > 0 else None,
         head_partition=head_partition,
         seq_partition=seq_partition,
+        k_scale=k_scale,
+        v_scale=v_scale,
     ).init()
 
 
@@ -1911,6 +2454,16 @@ class TransformerBlock(module.SimplyModule):
   ffn_expand_dim: int | None = None
   use_flash_attention: bool = False
   flash_attention_block_size: int = 512
+  flash_residual_checkpoint_name: str | None = None
+  flash_block_q: int | None = None
+  flash_block_kv: int | None = None
+  flash_block_kv_compute: int | None = None
+  flash_block_q_dkv: int | None = None
+  flash_block_kv_dkv: int | None = None
+  flash_block_kv_dkv_compute: int | None = None
+  flash_block_q_dq: int | None = None
+  flash_block_kv_dq: int | None = None
+  flash_use_fused_bwd_kernel: bool = False
   window_size: int = 0
   use_window_chunk: bool = False
   n_kv_heads: int = 0
@@ -1931,9 +2484,16 @@ class TransformerBlock(module.SimplyModule):
   tile_expand_dim: int = 128
   # Implementation of gmm.
   gmm_impl: str = 'ragged_dot'
+  # Weight-only quant for the MoE expert weights (fused '<dtype>[:<n_blocks>]'
+  # spec, e.g. 'int8'/'int4:8'; empty disables). Propagated to MoEFeedForward.
+  ffn_weight_quant: str = ''
   # For ragged paged attention.
   total_num_pages: int = 0
   page_size: int = 0
+  rpa_block_q: int | None = None
+  # Low-precision (fp8) KV cache dtype ('fp8'/'fp8_e4m3'/'fp8_e5m2'; empty
+  # disables). Propagated to Attention.
+  kv_cache_quant: str = ''
 
   @property
   def expand_dim(self) -> int:
@@ -2024,6 +2584,8 @@ class TransformerBlock(module.SimplyModule):
         query_scale=self.query_scale,
         total_num_pages=self.total_num_pages,
         page_size=self.page_size,
+        rpa_block_q=self.rpa_block_q,
+        kv_cache_quant=self.kv_cache_quant,
         weight_init=self.attn_weight_init,
     )
     if self.use_moe:
@@ -2050,6 +2612,7 @@ class TransformerBlock(module.SimplyModule):
           tile_expand_dim=self.tile_expand_dim,
           # Implementation of gmm.
           gmm_impl=self.gmm_impl,
+          weight_quant=self.ffn_weight_quant,
       )
     else:
       self.ffn = FeedForward(
@@ -2065,6 +2628,7 @@ class TransformerBlock(module.SimplyModule):
           ffn_use_bias=self.ffn_use_bias,
           ffn_activation=self.ffn_activation,
           ffn_weight_init=self.ffn_weight_init,
+          weight_quant=self.ffn_weight_quant,
       )
 
   def init(self, prng_key: PRNGKey) -> PyTree:
@@ -2084,7 +2648,15 @@ class TransformerBlock(module.SimplyModule):
 
     return params
 
-  def apply(
+  def quantize(self, params: PyTree) -> PyTree:
+    # Mirror `init`: recurse into named sub-modules. Only `ffn` (MoEFeedForward)
+    # currently quantizes; the rest fall through to the no-op base.
+    params = dict(params)  # pyrefly: ignore[no-matching-overload]
+    params['ffn'] = self.ffn.quantize(params['ffn'])
+    params['attn'] = self.attn.quantize(params['attn'])
+    return params
+
+  def apply(  # pyrefly: ignore[bad-override]
       self,
       params: PyTree,
       x: Array,
@@ -2097,9 +2669,9 @@ class TransformerBlock(module.SimplyModule):
     extra_output = {}
     x_res = x
     if self.use_pre_ln:
-      x = self.pre_ln_0.apply(params['pre_ln_0'], x)
+      x = self.pre_ln_0.apply(params['pre_ln_0'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x, attn_extra_output = self.attn.apply(
-        params['attn'],
+        params['attn'],  # pyrefly: ignore[bad-index, unsupported-operation]
         x,
         segment_ids=segment_ids,
         segment_positions=segment_positions,
@@ -2107,30 +2679,30 @@ class TransformerBlock(module.SimplyModule):
         decode_state=decode_state,
     )
     if self.use_post_ln:
-      x = self.post_ln_0.apply(params['post_ln_0'], x)
+      x = self.post_ln_0.apply(params['post_ln_0'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x += x_res
     if self.use_post_skip_ln:
-      x = self.post_skip_ln_0.apply(params['post_skip_ln_0'], x)
+      x = self.post_skip_ln_0.apply(params['post_skip_ln_0'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.activation_partition
+        x, self.sharding_config.activation_partition  # pyrefly: ignore[bad-argument-type]
     )
 
     x_res = x
     if self.use_pre_ln:
-      x = self.pre_ln_1.apply(params['pre_ln_1'], x)
+      x = self.pre_ln_1.apply(params['pre_ln_1'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     # Assumes pad id for segment_ids is 0.
-    x, ffn_extra_output = self.ffn.apply(
-        params['ffn'], x, inputs_mask=segment_ids != 0)
+    x, ffn_extra_output = self.ffn.apply(  # pyrefly: ignore[bad-assignment, not-iterable]
+        params['ffn'], x, inputs_mask=segment_ids != 0)  # pyrefly: ignore[bad-index, unsupported-operation]
     if self.use_post_ln:
-      x = self.post_ln_1.apply(params['post_ln_1'], x)
+      x = self.post_ln_1.apply(params['post_ln_1'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x += x_res
     if self.use_post_skip_ln:
-      x = self.post_skip_ln_1.apply(params['post_skip_ln_1'], x)
+      x = self.post_skip_ln_1.apply(params['post_skip_ln_1'], x)  # pyrefly: ignore[bad-index, unsupported-operation]
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.activation_partition
+        x, self.sharding_config.activation_partition  # pyrefly: ignore[bad-argument-type]
     )
 
-    extra_output['decode_state'] = attn_extra_output['decode_state']
+    extra_output['decode_state'] = attn_extra_output['decode_state']  # pyrefly: ignore[bad-index, unsupported-operation]
     if self.use_moe:
       extra_output['ffn'] = ffn_extra_output
     return x, extra_output
@@ -2192,6 +2764,7 @@ class TransformerLM(module.SimplyModule):
         vocab_size=config.vocab_size,
         dim=config.model_dim,
         weight_partition=sharding_config.embed_partition,
+        output_partition=sharding_config.logits_partition,
         activation_dtype=self.activation_dtype,
         embedding_scale_by_sqrt_dim=config.embedding_lookup_scale,
         use_tied_embedding=config.use_tied_embedding,
@@ -2237,6 +2810,7 @@ class TransformerLM(module.SimplyModule):
           tile_model_dim=config.tile_model_dim,
           tile_expand_dim=config.tile_expand_dim,
           gmm_impl=config.gmm_impl,
+          ffn_weight_quant=config.ffn_weight_quant,
           # Mixed precision related.
           activation_dtype=self.activation_dtype,
           sharding_config=sharding_config,
@@ -2256,6 +2830,8 @@ class TransformerLM(module.SimplyModule):
           query_scale=config.query_scale,
           total_num_pages=total_num_pages,
           page_size=config.page_size,
+          rpa_block_q=config.rpa_block_q,
+          kv_cache_quant=config.kv_cache_quant,
           ffn_weight_init=config.ffn_weight_init,
           attn_weight_init=config.attn_weight_init,
       )
@@ -2295,6 +2871,36 @@ class TransformerLM(module.SimplyModule):
     params['final_ln'] = self.final_ln.init()
     return params
 
+  def quantize(self, params: PyTree) -> PyTree:
+    """Returns `params` with each sub-module quantized.
+
+    Organized like `init`: walk the same named sub-modules and dispatch to each
+    one's `quantize`. Sub-modules that don't override it (the base no-op) pass
+    their params through unchanged; today only the MoE `ffn` inside each block
+    actually quantizes, gated by `config.ffn_weight_quant`.
+
+    Args:
+      params: The model param pytree.
+
+    Returns:
+      A new pytree with quantizable sub-module weights as int dicts.
+    """
+    params = dict(params)  # pyrefly: ignore[no-matching-overload]
+    params['embed_linear'] = self.embed_linear.quantize(
+        params['embed_linear'])
+    if 'input_encoders' in params:
+      enc_params = dict(params['input_encoders'])
+      for input_encoder in self.input_encoders:
+        name = input_encoder.name
+        if name in enc_params:
+          enc_params[name] = input_encoder.quantize(enc_params[name])
+      params['input_encoders'] = enc_params
+    for i, block in enumerate(self.blocks):
+      key = f'block_{i}'
+      params[key] = block.quantize(params[key])
+    params['final_ln'] = self.final_ln.quantize(params['final_ln'])
+    return params
+
   def _replace_embeddings(
       self, orig_embeddings, replacement_embeddings, replacement_mask
   ):
@@ -2326,7 +2932,7 @@ class TransformerLM(module.SimplyModule):
         orig_embeddings, replacement_embeddings, replacement_mask
     )
 
-  def apply(
+  def apply(  # pyrefly: ignore[bad-override]
       self,
       params: PyTree,
       x: Array,
@@ -2366,13 +2972,13 @@ class TransformerLM(module.SimplyModule):
     self.sharding_config = cast(SimplyConfig, self.sharding_config)
     # Add sharding constraints to the inputs.
     x = sharding_lib.with_sharding_constraint(
-        x, self.sharding_config.data_partition
+        x, self.sharding_config.data_partition  # pyrefly: ignore[bad-argument-type]
     )
     segment_ids = sharding_lib.with_sharding_constraint(
-        segment_ids, self.sharding_config.data_partition
+        segment_ids, self.sharding_config.data_partition  # pyrefly: ignore[bad-argument-type]
     )
     segment_positions = sharding_lib.with_sharding_constraint(
-        segment_positions, self.sharding_config.data_partition
+        segment_positions, self.sharding_config.data_partition  # pyrefly: ignore[bad-argument-type]
     )
 
     # Convert `params` to lower bits to avoid sending float32 params to
@@ -2395,7 +3001,7 @@ class TransformerLM(module.SimplyModule):
 
     for input_encoder in self.input_encoders:
       missing_keys = [
-          k not in extra_inputs for k in input_encoder.extra_input_keys
+          k not in extra_inputs for k in input_encoder.extra_input_keys  # pyrefly: ignore[not-iterable]
       ]
       if all(missing_keys):
         continue
@@ -2406,9 +3012,9 @@ class TransformerLM(module.SimplyModule):
         )
 
       input_enc_params = params['input_encoders'][input_encoder.name]
-      kwargs = {k: extra_inputs[k] for k in input_encoder.extra_input_keys}
+      kwargs = {k: extra_inputs[k] for k in input_encoder.extra_input_keys}  # pyrefly: ignore[bad-index, unsupported-operation]
       encoder_output = input_encoder.apply(
-          input_enc_params, input_tokens, **kwargs
+          input_enc_params, input_tokens, **kwargs  # pyrefly: ignore[bad-argument-type]
       )
       x = self._replace_embeddings(
           x, encoder_output.embeddings, encoder_output.embedding_mask
@@ -2564,9 +3170,18 @@ class TransformerLM(module.SimplyModule):
       for k, v in extra_output_per_repeat.items():
         if k not in extra_output:
           extra_output[k] = {}
-        extra_output[k][f'block_{i}'] = v
+        if isinstance(v, dict) and 'metric' in v:
+          new_ffn = dict(v)
+          new_ffn['metric'] = {
+              f'block_{i}/{mk}': mv for mk, mv in v['metric'].items()
+          }
+          extra_output[k][f'block_{i}'] = new_ffn
+        else:
+          extra_output[k][f'block_{i}'] = v
 
+    extra_output['activation_prenorm'] = x
     x = self.final_ln.apply(params['final_ln'], x)
+    extra_output['activation'] = x
     logits = self.embed_linear.apply(params['embed_linear'], x)
     if self.config.output_logits_soft_cap > 0:
       logits = soft_cap(logits, self.config.output_logits_soft_cap)
@@ -2592,6 +3207,14 @@ class TransformerLM(module.SimplyModule):
 
 ################################################################################
 ## Loss and backprop.
+
+
+# Tiny floor used in the loss / accuracy divisors so that a fully zero-weight
+# batch (or a custom loss-weighting scheme with weights << 1.0) does not
+# division-by-zero into a NaN. A value of 1e-9 is far below any legitimate
+# custom per-token loss weight users have been observed to use, so it only
+# clamps the true zero-weight degenerate case.
+_LOSS_WEIGHT_EPS = 1e-9
 
 
 def compute_loss(model, params, batch, add_extra_loss=True):
@@ -2621,15 +3244,25 @@ def compute_loss(model, params, batch, add_extra_loss=True):
   targets_one_hot = jax.nn.one_hot(targets, logits.shape[-1], axis=-1)
   token_loss = jnp.einsum(
       'blv,blv->bl', targets_one_hot, jax.nn.log_softmax(logits))
-  total_loss = - jnp.sum(token_loss * loss_weights)
   total_loss_weight = sharding_lib.with_sharding_constraint(
       jnp.sum(loss_weights), None)
-  loss = total_loss / total_loss_weight
+  # NaN-safe reduction unified across training and eval. The
+  # ``jnp.where(loss_weights > 0, ...)`` guard absorbs NaNs that may live at
+  # zero-weight padding positions (e.g. in-loop validation batches we do
+  # not fully control end-to-end). The ``_LOSS_WEIGHT_EPS`` floor on the
+  # divisor guards a fully zero-weight batch from a 0/0 = NaN. On
+  # numerically clean batches with positive total loss weight this branch
+  # is bit-identical to the legacy unmasked sum / unfloored divisor that
+  # used to live on the training-only path.
+  weighted_token_loss = jnp.where(
+      loss_weights > 0, token_loss * loss_weights, 0.0)
+  total_loss = - jnp.sum(weighted_token_loss)
+  safe_divisor = jnp.maximum(total_loss_weight, _LOSS_WEIGHT_EPS)
+  loss = total_loss / safe_divisor
+  correct = (jnp.argmax(logits, axis=-1) == targets).astype(
+      jnp.float32) * loss_weights
+  accuracy = jnp.sum(correct) / safe_divisor
   loss = sharding_lib.with_sharding_constraint(loss, None)
-  # Compute accuracy.
-  pred = jnp.argmax(logits, axis=-1)
-  correct = (pred == targets).astype(jnp.float32) * loss_weights
-  accuracy = jnp.sum(correct) / total_loss_weight
   accuracy = sharding_lib.with_sharding_constraint(accuracy, None)
   extra_output = {'accuracy': accuracy, 'loss_weight': total_loss_weight}
   if model_extra_output:
@@ -2780,9 +3413,8 @@ def train_one_step(
       compute_tree_info_fn, fn=tree_rms, fn_name='rms')
 
   log_dict = {}
-  if add_log_info:
-    log_dict.update(norm_info_fn(state['params'], name='weights'))
-    log_dict.update(rms_info_fn(state['params'], name='weights'))
+  log_dict.update(norm_info_fn(state['params'], name='weights'))
+  log_dict.update(rms_info_fn(state['params'], name='weights'))
 
   def _compute_grad(batch):
     if teacher_model is None:
@@ -2855,6 +3487,9 @@ def train_one_step(
   else:
     loss, extra_output, grad = _compute_grad(batch)
 
+  # filter grads out to avoid computing grad stats on frozen params.
+  grad, _ = pytree.filter_tree(grad, model.config.trainable_params_filter)
+
   # Log additional info computed by the loss function, for example,
   # prediction accuracy.
   log_dict.update(extra_output)
@@ -2863,16 +3498,26 @@ def train_one_step(
   if clip_grad_norm > 0:
     grad, clip_log_dict = clip_norm_fn(
         grad, name='grad', threshold=clip_grad_norm,
-        add_log_info=add_log_info)
+        add_log_info=True)
     log_dict.update(clip_log_dict)
   else:
     log_dict.update(norm_info_fn(grad, name='grad'))
 
-  update, new_state = opt.apply(state, grad)
+  # Use the base ``Optimizer.apply_with_nan_skip`` wrapper so the
+  # subclass-defined ``apply`` is automatically guarded by the
+  # ``skip_updates_grad_nans`` flag if the optimizer opts in. When the
+  # flag is False this is a thin pass-through to ``opt.apply``. When True
+  # a ``state['nan_skips']`` scalar tracks how many skips have fired so
+  # far and is surfaced to tensorboard below.
+  update, new_state = opt.apply_with_nan_skip(state, grad)
+  if 'nan_skips' in new_state:
+    # Per-step counter visible on tensorboard; train loop diff between
+    # consecutive steps gives the per-step skip indicator (0 or 1).
+    log_dict['optimizer/nan_skips'] = new_state['nan_skips']
   if clip_update_norm > 0:
     update, clip_log_dict = clip_norm_fn(
         update, name='update', threshold=clip_update_norm,
-        add_log_info=add_log_info)
+        add_log_info=True)
     log_dict.update(clip_log_dict)
   else:
     log_dict.update(norm_info_fn(update, name='update'))
@@ -2883,17 +3528,24 @@ def train_one_step(
         clip_local=clip_local_update_rms > 0,
         threshold=(clip_local_update_rms
                    if clip_local_update_rms > 0 else clip_update_rms),
-        add_log_info=add_log_info)
+        add_log_info=True)
     log_dict.update(clip_log_dict)
   else:
     log_dict.update(rms_info_fn(update, name='update'))
 
   if weight_decay > 0:
-    update = jax.tree_util.tree_map(
-        lambda x, y: x + y * weight_decay, update, new_state['params'])
+    update = pytree.filtered_map(
+        lambda x, y: x + y * weight_decay,
+        update,
+        new_state['params'],
+    )
   new_state = opt.apply_updates(
       new_state, jax.tree.map(lambda x: x * lr, update))
   new_state['steps'] += 1
+
+  if not add_log_info:
+    log_dict = extra_output
+
   return loss, new_state, log_dict
 
 
@@ -2921,21 +3573,24 @@ def safe_clip(x, val, threshold):
 def clip_tree_fn(
     tree, name, threshold, fn, fn_name,
     clip_local=False, add_log_info=False):
-  val = local_val = clipped_tree = None
-  if add_log_info or not clip_local:
-    val = fn(tree)
-    clipped_tree = jax.tree_util.tree_map(
-        lambda x: safe_clip(x, val, threshold), tree)
+  # Compute both norms up front: `global_val` is the scalar tree norm,
+  # `local_val` is the per-leaf pytree of norms. Under jit, XLA will DCE
+  # whichever is unused by both the returned tensor and `log_dict`.
+  global_val = fn(tree)
+  local_val = jax.tree_util.tree_map(fn, tree)
 
-  if add_log_info or clip_local:
-    local_val = jax.tree_util.tree_map(fn, tree)
+  # `clip_local` alone decides which clipped tree is returned;
+  # `add_log_info` must never change the math.
+  if clip_local:
     clipped_tree = jax.tree_util.tree_map(
-        lambda x, y: safe_clip(x, y, threshold),
-        tree, local_val)
+        lambda x, y: safe_clip(x, y, threshold), tree, local_val)
+  else:
+    clipped_tree = jax.tree_util.tree_map(
+        lambda x: safe_clip(x, global_val, threshold), tree)
 
   log_dict = {}
   if add_log_info:
-    log_dict[f'global_{name}_{fn_name}'] = val
+    log_dict[f'global_{name}_{fn_name}'] = global_val
     log_dict[f'local_{name}_{fn_name}'] = local_val
     log_dict[f'global_clipped_{name}_{fn_name}'] = fn(clipped_tree)
     log_dict[f'local_clipped_{name}_{fn_name}'] = jax.tree_util.tree_map(
@@ -3015,7 +3670,17 @@ def run_experiment(
 
   # Compile loss, train and learning rate functions.
   @functools.partial(
-      jax.jit, donate_argnames=['state'], static_argnames=['add_log_info']
+      jax.jit,
+      donate_argnames=['state'],
+      static_argnames=['add_log_info'],
+      # Fully replicate log_dict
+      out_shardings=(
+          None,  # 1. loss: UNCONSTRAINED
+          None,  # 2. state: UNCONSTRAINED (preserves natural parameter/optimizer sharding)
+          sharding_lib.named_sharding(
+              None
+          ),  # 3. log_dict: fully replicated / all-gathered across all devices
+      ),
   )
   def train_one_step_fn(state, batch, lr, add_log_info=False):
     return train_one_step(
@@ -3047,40 +3712,102 @@ def run_experiment(
   train_iter_state = None
   if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
     data_state = ckpt_lib.load_data_state_from_dir(
-        helper.ckpt_dir, helper.ckpt_mngr.latest_step()
+        helper.ckpt_dir, helper.ckpt_mngr.latest_step()  # pyrefly: ignore[bad-argument-type]
     )
     assert isinstance(data_state, Mapping)
     train_iter_state = data_state.get('train_iter_state', None)
     if train_iter_state is not None:
-      train_iter_state = data_lib.grain_iter_local_state(train_iter_state)
+      train_iter_state = data_lib.grain_iter_local_state(train_iter_state)  # pyrefly: ignore[bad-argument-type]
 
   if train_iter_state is not None:
-    train_iter.set_state(train_iter_state)
+    train_iter.set_state(train_iter_state)  # pyrefly: ignore[bad-argument-type]
 
   # Start training.
   prev_step_timestamp = time.time()
   final_result = {}
   steps = int(state['steps'])
 
-  # Create eval_fn for validation set.
-  if config.validation_dataset:
+  # Build per-entry eval_fns for `validation_datasets`. The same
+  # JIT-compiled `loss_fn` is shared across all entries so they inherit
+  # the NaN-safe eval reduction in `compute_loss`. Each entry is a
+  # `data_lib.DatasetConfig`. Two paths, duck-typed on the source:
+  #   (a) source defines `make_eval_fn` -> fast path: call the source's
+  #       eval method directly. The source owns its byte stream + the
+  #       per-batch accumulator, so iterating it as-is preserves
+  #       bit-identity with the offline reference. Required for
+  #       streaming loaders whose chunking is part of the loss
+  #       semantics (e.g. CMS sliding-stride perplexity eval) — the
+  #       standard `create_iter_dataset` path below would re-chunk the
+  #       byte stream via `PACKING_PAD_OR_TRUNCATE`.
+  #   (b) otherwise -> route through `create_iter_dataset` (forced to
+  #       `PACKING_PAD_OR_TRUNCATE` per validation convention) and use
+  #       the standard `run_eval` aggregator.
+  # Stored as a list of (name, eval_fn) tuples in the same order as
+  # `config.validation_datasets`. Each `eval_fn(state) -> dict[str, float]`.
+  if config.validation_datasets:
     loss_fn = common.named_jit(
         compute_eval_loss, 'validation_loss_fn', model=model
     )
-    validation_set = data_lib.create_iter_dataset(
-        config, training=False
-    )
-    eval_fn = functools.partial(
-        run_eval,
-        eval_set=validation_set,
-        num_eval_steps=config.validation_num_eval_steps,
-        loss_fn=loss_fn,
-    )
   else:
-    eval_fn = None
+    loss_fn = None
+  # Build a per-token-id utf-8 byte-length lookup for the vocab-independent
+  # bits-per-byte (bpb) eval metric. This is strictly additive: if the vocab is
+  # not a SentencePiece vocab, or construction fails for any reason, we log a
+  # warning and leave `token_bytes` as None (bpb is simply not emitted).
+  token_bytes = None
+  if config.validation_datasets:
+    try:
+      vocab = tokenization.TokenizerRegistry.get_instance(config.vocab_name)
+      token_bytes = vocab.token_byte_lengths()
+      if token_bytes is None:
+        logging.warning(
+            'eval_bpb disabled: vocab %r does not define token_byte_lengths.',
+            config.vocab_name,
+        )
+    except Exception:  # pylint: disable=broad-except
+      logging.warning(
+          'eval_bpb disabled: failed to build token byte lengths for vocab %r.',
+          config.vocab_name,
+          exc_info=True,
+      )
+      token_bytes = None
+  validation_dataset_fns: list[tuple[str, Any]] = []
+  for ds_cfg in config.validation_datasets:
+    source = ds_cfg.source
+    if isinstance(source, str):
+      source = data_lib.DataSourceRegistry.get_instance(source)
+    name = getattr(source, 'name', None) or type(source).__name__
+    if hasattr(source, 'make_eval_fn'):
+      # Fast path: source owns its loader + per-batch accumulator.
+      validation_dataset_fns.append(
+          (name, functools.partial(source.make_eval_fn, loss_fn=loss_fn))
+      )
+    else:
+      # Standard path: route through `create_iter_dataset`. Materialize
+      # the per-entry iterator lazily inside the eval_fn closure so each
+      # invocation gets a fresh pass.
+      def _make_standard_eval_fn(bound_ds_cfg, bound_name):
+        def _standard_eval_fn(state):
+          eval_set = data_lib.create_iter_dataset(
+              config, training=False, ds_config=bound_ds_cfg
+          )
+          raw = run_eval(
+              eval_set=eval_set,
+              num_eval_steps=config.validation_num_eval_steps,
+              loss_fn=loss_fn,
+              state=state,
+              token_bytes=token_bytes,
+          )
+          return {f'{bound_name}/{k}': v for k, v in raw.items()}
+        return _standard_eval_fn
+      validation_dataset_fns.append(
+          (name, _make_standard_eval_fn(ds_cfg, name))
+      )
   agg_metrics = {}
   eval_result = {}
+  profile_session = None
   should_early_stop = False
+  train_flops_per_step = None  # captured once from XLA cost_analysis below.
   while steps <= config.num_train_steps and not should_early_stop:
     with jax.profiler.StepTraceAnnotation('train', step_num=steps):
       logging.info('steps: %s', steps)
@@ -3096,14 +3823,39 @@ def run_experiment(
                 shard_data_method=config.shard_data_method,
             )},
         )
-      # Run eval every validation_eval_interval steps and at the very end.
-      if config.validation_dataset and (
+      # Run `validation_datasets` evals every validation_eval_interval
+      # steps and at the very end. Each entry produces a
+      # `<source.name>/<metric>` scalar dict logged verbatim via
+      # `helper.write_scalars`. Errors in one dataset emit a single
+      # `<name>/failed=1.0` sentinel and the others continue — a
+      # network blip on one data shard should not abort training.
+      # `eval_result` is set to the union of all per-dataset results so
+      # downstream consumers (final_result, last-step eval) see them.
+      if validation_dataset_fns and (
           steps % config.validation_eval_interval == 0
           or steps == config.num_train_steps
       ):
-        eval_result = eval_fn(state=state)
-        helper.write_scalars(steps, eval_result)
-        helper.flush()
+        eval_result = {}
+        for name, ds_eval_fn in validation_dataset_fns:
+          logging.info(
+              'Running validation_datasets[%r] at step %d', name, steps
+          )
+          try:
+            ds_results = ds_eval_fn(state=state)
+          except Exception as e:  # pylint: disable=broad-except
+            logging.exception(
+                'validation_datasets[%r]: eval failed (%s) — emitting'
+                ' sentinel',
+                name,
+                e,
+            )
+            ds_results = {f'{name}/failed': 1.0}
+          helper.write_scalars(steps, ds_results)
+          helper.flush()
+          logging.info(
+              'validation_datasets[%r] results: %s', name, ds_results
+          )
+          eval_result.update(ds_results)
 
       t1 = time.time()
       batch = next(train_iter)
@@ -3124,8 +3876,52 @@ def run_experiment(
       logging.info('%s ses to get next batch ready.', data_generation_step_time)
       logging.info('batch=%s', batch)
 
+      if config.profile_steps and steps in config.profile_steps:
+        jax.block_until_ready(state)  # sync steps for profiling
+        if steps == config.profile_steps[0]:
+          profile_session = exp_helper.start_profile(config, experiment_dir)
+        elif steps == config.profile_steps[1]:
+          exp_helper.stop_profile(config, profile_session, experiment_dir)
+          profile_session = None
+
       t1 = time.time()
       lr = lr_fn(state['steps'])
+      # One-time: capture the compiled train-step FLOPs from XLA's HLO cost
+      # model. `train_one_step_fn` is already JIT-compiled for these argument
+      # shapes, so `.lower(...).compile()` reuses the compilation cache (no
+      # recompile) and cost_analysis is a cheap static pass. This is the FLOPs
+      # of the ACTUAL compiled train step (fwd+bwd+optimizer) on THIS device/
+      # topology -- it counts attention, multi-pass, MoE routing, optimizer
+      # compute and remat that 6ND misses. NOTE: the value is topology/kernel
+      # dependent, so it is only comparable across runs on the same platform.
+      if train_flops_per_step is None:
+        try:
+          _compiled = train_one_step_fn.lower(
+              state, batch, lr,
+              add_log_info=helper.should_log_additional_info(steps),
+          ).compile()
+          _ca = _compiled.cost_analysis()
+          if isinstance(_ca, (list, tuple)):
+            _ca = _ca[0]
+          # cost_analysis reports PER-PARTITION (per-device) FLOPs; multiply by
+          # the device count to get the GLOBAL per-step FLOPs. Verified
+          # empirically: global is topology-invariant within a chip family
+          # at small meshes (identical across pf_1x1x1/1x2x1/2x2x1), with some
+          # drift at larger meshes (~10% at pf_2x2x2) and across accelerator
+          # generations; the raw per-partition value alone is NOT comparable.
+          # Also multiply by grad_accum_steps: with grad accumulation the step
+          # is a jax.lax.scan whose body cost_analysis counts ONCE, so a raw
+          # reading would undercount the true per-optimizer-step FLOPs by the
+          # grad_accum factor (and let a config understate its compute budget).
+          _grad_accum = max(1, int(config.grad_accum_steps))
+          train_flops_per_step = (
+              float(_ca.get('flops', float('nan')))
+              * jax.device_count()
+              * _grad_accum
+          )
+        except Exception as e:  # pylint: disable=broad-except
+          logging.warning('cost_analysis for train FLOPs failed: %s', e)
+          train_flops_per_step = float('nan')
       loss, state, log_dict = train_one_step_fn(
           state=state,
           batch=batch,
@@ -3160,7 +3956,8 @@ def run_experiment(
       logging.info('%s secs per step, log_additional_info: %s',
                    step_time, helper.should_log_additional_info(steps))
       helper.add_metric('loss', train_loss)
-      helper.add_metric('accuracy', float(log_dict['accuracy']))
+      if 'accuracy' in log_dict:
+        helper.add_metric('accuracy', float(log_dict['accuracy']))
       helper.add_metric(
           'data_generation_step_time', data_generation_step_time)
 
@@ -3181,19 +3978,67 @@ def run_experiment(
             steps_per_sec=1 / agg_metrics['avg_total_step_time'],
         )
         metrics_dict.update(agg_metrics)
-        metrics_dict.update(pytree.to_flat_dict(log_dict, sep='/'))
+        log_dict = jax.device_get(log_dict)
+        flat_log = pytree.to_flat_dict(log_dict, sep='/')
+        images, scalars = pytree.filter_tree(
+            flat_log, lambda k, _: 'image' in k
+        )
+        images = {k: v for k, v in images.items() if v is not None}
+        scalars = {k: v for k, v in scalars.items() if v is not None}
+        metrics_dict.update(scalars)
+        # Images don't get aggregated so get temporally subsampled.
+        helper.write_images(steps, images)
         helper.write_scalars(steps, metrics_dict)
         helper.flush()
         event_write_time = time.time() - t1
         logging.info('%s secs per writing metrics.', event_write_time)
       steps = int(state['steps'])
+  if profile_session is not None:
+    exp_helper.stop_profile(config, profile_session, experiment_dir)
   final_result['steps'] = steps - 1
   final_result['train_loss'] = float(agg_metrics['loss'])
-  final_result['train_accuracy'] = float(agg_metrics['accuracy'])
+  if 'accuracy' in agg_metrics:
+    final_result['train_accuracy'] = float(agg_metrics['accuracy'])
   if eval_result:
-    final_result['validation_loss'] = float(eval_result['eval_loss'])
-    final_result['validation_accuracy'] = float(
-        eval_result['eval_accuracy'])
+    # Forward the validation *metrics* to final_result
+    # For each known metric we collect every match, where a match
+    # is the bare '<metric>' or any dataset-prefixed '<name>/<metric>' key.
+    #   * exactly one match  -> set the canonical key (validation_<metric>);
+    #     this is the pre-existing behavior for loss/accuracy (validation_bpb is
+    #     new here).
+    #   * multiple matches (multiple validation datasets) -> forward each under
+    #     its original '<name>/<metric>' name and do NOT set the ambiguous
+    #     canonical key, so the consumer decides how to combine them.
+    for metric_key, canonical in (
+        ('eval_loss', 'validation_loss'),
+        ('eval_accuracy', 'validation_accuracy'),
+        ('eval_bpb', 'validation_bpb'),  # only emitted for SPM/byte vocabs
+    ):
+      matches = {
+          k: v for k, v in eval_result.items()
+          if k == metric_key or k.endswith('/' + metric_key)
+      }
+      if len(matches) == 1:
+        final_result[canonical] = float(next(iter(matches.values())))
+      else:
+        final_result.update({k: float(v) for k, v in matches.items()})
+  # Compute cross-check stats in final_result (strictly additive), derived from
+  # the authoritative (checkpointed) step count.
+  final_total_steps = int(state['steps'])
+  final_num_tokens_seen = (
+      final_total_steps * config.batch_size * config.seq_len
+  )
+  final_result['num_tokens_seen'] = int(final_num_tokens_seen)
+  # Total training FLOPs from XLA's HLO cost model (per-step x steps). This is
+  # the authoritative compute measure -- it reflects the actual compiled train
+  # step (attention, multi-pass, MoE, optimizer, remat), unlike the 6ND
+  # approximation. Topology/kernel dependent, so compare only within the same
+  # TPU configuration, and the same JAX/XLA version.
+  if train_flops_per_step is not None:
+    final_result['train_flops_per_step_xla'] = float(train_flops_per_step)
+    final_result['training_flops_xla'] = float(
+        train_flops_per_step * final_total_steps
+    )
   final_result['early_stop'] = should_early_stop
   if should_early_stop: logging.info('Training is early stopped!')
   helper.close(final_result)
@@ -3229,7 +4074,7 @@ def build_global_batch_from_sharded(
 ) -> PyTree:
   logging.info('local batch=%s', batch)
   data_sharding = js.NamedSharding(
-      js.get_mesh(), js.PartitionSpec(*data_partition)
+      js.get_mesh(), js.PartitionSpec(*data_partition)  # pyrefly: ignore[not-iterable]
   )
 
   def _build_global_array_from_sharded(array: np.ndarray):
@@ -3247,10 +4092,21 @@ def build_global_batch_from_sharded(
 def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   model, extra_output = create_model(config, sharding_config)
   teacher_model = extra_output.get('teacher')
-  opt = config.optimizer
+
+  def _filtered_opt_init(params):
+    """Handles initialization of optimizer state for trainable params only."""
+    trainable_params, _ = pytree.filter_tree(
+        params, config.trainable_params_filter
+    )
+    state = config.optimizer.init(trainable_params)
+    state['params'] = params
+    return state
+
   init_state_fn = common.named_jit(
       js.explicit_axes(
-          lambda: opt.init(model.init(jax.random.key(config.model_seed))),
+          lambda: _filtered_opt_init(
+              model.init(jax.random.key(config.model_seed))
+          ),
           in_sharding=(),
       ),
       name='init_state',
@@ -3262,16 +4118,8 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
         ckpt_dir, abstract_state, latest_step
     )
   elif config.init_ckpt_dir:
-    # Initialize from a given external ckpt.
     if config.init_ckpt_opt_state:
-      # Initialize params and opt state from a given external ckpt.
       abstract_state = common.eval_abstract_output(init_state_fn)
-      state = ckpt_lib.load_checkpoint_from_dir(
-          config.init_ckpt_dir,
-          abstract_state,
-          config.init_ckpt_step,
-          ckpt_format=config.init_ckpt_format,
-      )
     else:
       # Only initialize params from a given external ckpt.
       abstract_state = {
@@ -3279,13 +4127,50 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
               lambda: model.init(jax.random.key(0))
           )
       }
-      state = ckpt_lib.load_checkpoint_from_dir(
-          config.init_ckpt_dir,
-          abstract_state,
-          config.init_ckpt_step,
-          ckpt_format=config.init_ckpt_format,
+    loaded_state = ckpt_lib.load_checkpoint_from_dir(
+        config.init_ckpt_dir,
+        abstract_state,
+        config.init_ckpt_step,
+        ckpt_format=config.init_ckpt_format,
+    )
+    leaves = jax.tree.leaves(loaded_state['params'])
+    valid_arrays = [l for l in leaves if isinstance(l, jax.Array)]
+    if len(valid_arrays) < len(leaves):
+      logging.info(
+          'Checkpoint structural mismatch detected (%d valid arrays vs %d'
+          ' leaves); initializing missing branches and overlaying checkpoint.',
+          len(valid_arrays),
+          len(leaves),
       )
-      state = opt.init(state['params'])
+      state = init_state_fn()
+      source_tree = (
+          loaded_state if config.init_ckpt_opt_state else loaded_state['params']
+      )
+      target_tree = state if config.init_ckpt_opt_state else state['params']
+
+      loaded_arrays = {
+          path: val
+          for path, val in jax.tree.leaves_with_path(source_tree)
+          if isinstance(val, jax.Array)
+      }
+      logging.info(
+          'Overlaid %d checkpoint tensors onto initialized state.',
+          len(loaded_arrays),
+      )
+      overlaid_tree = jax.tree.map_with_path(
+          lambda path, init_val: loaded_arrays.get(path, init_val),
+          target_tree,
+      )
+      if config.init_ckpt_opt_state:
+        state = overlaid_tree
+      else:
+        state['params'] = overlaid_tree
+    else:
+      state = (
+          loaded_state
+          if config.init_ckpt_opt_state
+          else _filtered_opt_init(loaded_state['params'])
+      )
     if config.reset_steps:
       state['steps'] = opt_lib.get_init_steps()
   else:  # initialize from scratch.
@@ -3305,15 +4190,38 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
         ckpt_format=config.teacher_ckpt_format,
     )
     state['teacher_params'] = teacher_state['params']
+
+  trainable_params, frozen_params = pytree.filter_tree(
+      state['params'], config.trainable_params_filter
+  )
+  trainable_mparams = (
+      sum(getattr(x, 'size', 0) for x in jax.tree.leaves(trainable_params))
+      / 1e6
+  )
+  frozen_mparams = (
+      sum(getattr(x, 'size', 0) for x in jax.tree.leaves(frozen_params)) / 1e6
+  )
+  logging.info('Trainable parameters: %.2f M', trainable_mparams)
+  logging.info('Frozen parameters: %.2f M', frozen_mparams)
+
   return state
 
 
-def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
+def run_eval(
+    eval_set, num_eval_steps, loss_fn, state, token_bytes=None
+) -> dict[str, Any]:
   mean_eval_loss = 0.0
   mean_eval_accuracy = 0.0
   # The `loss_weights` is normally the same as `num_tokens`.
   total_weights = 0.0
   total_num_tokens = 0
+  # Accumulators for the bits-per-byte (bpb) metric. `token_bytes` is a
+  # per-token-id utf-8 byte-length lookup; when it is None bpb is not emitted.
+  total_nats = 0.0
+  total_bytes = 0.0
+  token_bytes_jax = None
+  if token_bytes is not None:
+    token_bytes_jax = jnp.asarray(token_bytes, dtype=jnp.float32)
   eval_start_time = time.time()
   eval_steps = 0
   for eval_steps, eval_batch in enumerate(eval_set):
@@ -3342,6 +4250,26 @@ def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
           (eval_accuracy - mean_eval_accuracy) * weights_ratio)
     total_weights += batch_weights
     total_num_tokens += num_tokens
+    if token_bytes_jax is not None:
+      # Compute the byte denominator on-device via a tiny gather (avoids moving
+      # full logits/targets to the host). Weight each token's bytes by the SAME
+      # loss_weights used in the numerator: the numerator is
+      # `eval_loss * batch_weights` = Sum(loss_weight * per-token nats), so the
+      # denominator must be Sum(loss_weight * per-token bytes) for bpb to be
+      # exactly Sum(nats)/(ln2*Sum(bytes)). Using loss_weights (not just
+      # loss_weights>0) keeps this correct even if weights are fractional; for
+      # the common binary-weight case it is identical to masking. (C4 packing
+      # zero-weights some non-pad tokens; counting their bytes would deflate bpb
+      # and break cross-vocab comparability.)
+      targets = eval_batch['decoder_target_tokens']
+      loss_weights = eval_batch.get('decoder_loss_weights', None)
+      if loss_weights is None:
+        byte_weight = (targets != 0).astype(jnp.float32)
+      else:
+        byte_weight = loss_weights.astype(jnp.float32)
+      batch_bytes = jnp.sum(token_bytes_jax[targets] * byte_weight)
+      total_nats += eval_loss * batch_weights
+      total_bytes += float(batch_bytes)
   eval_time = time.time() - eval_start_time
   if eval_steps == 0:
     eval_step_time = 0
@@ -3350,12 +4278,17 @@ def run_eval(eval_set, num_eval_steps, loss_fn, state) -> dict[str, Any]:
   logging.info(
       '%s secs in validation eval, %s steps, %s secs per step.',
       eval_time, eval_steps, eval_step_time)
-  return dict(eval_loss=float(mean_eval_loss),
-              eval_accuracy=float(mean_eval_accuracy),
-              eval_weights=float(total_weights),
-              eval_tokens=int(total_num_tokens),
-              eval_time=float(eval_time),
-              eval_step_time=int(eval_step_time))
+  result = dict(eval_loss=float(mean_eval_loss),
+                eval_accuracy=float(mean_eval_accuracy),
+                eval_weights=float(total_weights),
+                eval_tokens=int(total_num_tokens),
+                eval_time=float(eval_time),
+                eval_step_time=int(eval_step_time))
+  if token_bytes_jax is not None:
+    # bpb = Sum(per-token CE in nats) / (ln2 * Sum(target-token utf-8 bytes)).
+    result['eval_bpb'] = float(total_nats) / (
+        math.log(2) * max(total_bytes, 1.0))
+  return result
 
 
 def flatten_dict(d: dict[str, Any]):
@@ -3566,7 +4499,7 @@ class SamplingOutput:
 
   @functools.cached_property
   def avg_input_score(self) -> float:
-    return np.mean(self.input_token_scores)
+    return np.mean(self.input_token_scores)  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def sum_output_score(self) -> float:
@@ -3690,7 +4623,7 @@ class LMInterface:
         position: int,
         return_logits: bool = True,
     ) -> tuple[Array | None, PyTree]:
-      extra_inputs = (extra_inputs or {}) | {'prefill_position': position}
+      extra_inputs = (extra_inputs or {}) | {'prefill_position': position}  # pyrefly: ignore[bad-assignment, unsupported-operation]
       logits, extra_output = model.apply(
           params, inputs, extra_inputs=extra_inputs
       )
@@ -3799,9 +4732,9 @@ class LMInterface:
       is_singleton_input = True
 
     if is_singleton_input:
-      raw_inputs = [sampling_lib.input_as_chunks(input_text)]
+      raw_inputs = [sampling_lib.input_as_chunks(input_text)]  # pyrefly: ignore[bad-argument-type]
     else:
-      raw_inputs = [sampling_lib.input_as_chunks(x) for x in input_text]
+      raw_inputs = [sampling_lib.input_as_chunks(x) for x in input_text]  # pyrefly: ignore[bad-argument-type]
 
     unpadded_inputs = [
         self.input_processor.encode(
@@ -4035,7 +4968,7 @@ class LMInterface:
     all_tokens = processed_input_and_output.tokens
     all_scores = self.score_tokens(
         all_tokens,
-        extra_inputs=processed_input_and_output.extra_inputs,
+        extra_inputs=processed_input_and_output.extra_inputs,  # pyrefly: ignore[bad-argument-type]
         scoring_params=scoring_params,
         params=self.model_params if params is None else params,
     )
@@ -4075,19 +5008,19 @@ class LMInterface:
       scoring_params = ScoringParams.from_sampling_params(
           self.default_sampling_params
       )
-    tokens = np.array(tokens).reshape([1, -1])
+    tokens = np.array(tokens).reshape([1, -1])  # pyrefly: ignore[bad-assignment]
     extra_inputs = jax.tree_util.tree_map(
         lambda x: x.expand_dims(axis=0), extra_inputs
     )
     apply_fn = self.model.apply
     logits, _ = jax.jit(apply_fn)(
         self.model_params if params is None else params,
-        tokens[:, :-1],
+        tokens[:, :-1],  # pyrefly: ignore[bad-index]
         extra_inputs=extra_inputs,
     )
     token_scores = sampling_lib.compute_log_likelihood(
         logits,
-        tokens[:, 1:],
+        tokens[:, 1:],  # pyrefly: ignore[bad-index]
         temperature=scoring_params.temperature,
         top_k=scoring_params.top_k,
         top_p=scoring_params.top_p,
@@ -4147,7 +5080,7 @@ def pad_decode_state_to(d: PyTree, length_to_pad: int) -> PyTree:
         block_length_to_pad = window_size + 1
       for k2, v2 in v.items():
         if isinstance(v2, jax.typing.ArrayLike) and jnp.ndim(v2) >= 2:
-          v[k2] = pad_to_along_axis(v2, block_length_to_pad, axis=1)
+          v[k2] = pad_to_along_axis(v2, block_length_to_pad, axis=1)  # pyrefly: ignore[bad-argument-type]
   return d
 
 
@@ -4204,8 +5137,8 @@ def continue_decode(
 
     def _score_fn(logits: Array, tokens: Array) -> Array:
       return sampling_lib.compute_log_likelihood(
-          logits,
-          tokens,
+          logits,  # pyrefly: ignore[bad-argument-type]
+          tokens,  # pyrefly: ignore[bad-argument-type]
           temperature=scoring_temperature,
           top_k=scoring_top_k,
           top_p=scoring_top_p,
@@ -4242,7 +5175,7 @@ def continue_decode(
   def cond_fn(sampling_state: SamplingState) -> jax.typing.ArrayLike:
     return (
         sampling_state.position < sampling_state.decode_state_length
-    ) & ~sampling_state.all_has_ended
+    ) & ~sampling_state.all_has_ended  # pyrefly: ignore[unsupported-operation]
 
   final_sampling_state = jax.lax.while_loop(
       cond_fn, body_fn, init_sampling_state
@@ -4313,24 +5246,24 @@ def quantize_tfm_params(params, symmetric=False):
   if isinstance(params, jnp.ndarray):
     return params
   quant_params = {}
-  for key in params:
+  for key in params:  # pyrefly: ignore[not-iterable]
     if key.startswith('block'):
       quant_params[key] = quantize_tfm_params(
-          params[key], symmetric=symmetric
+          params[key], symmetric=symmetric  # pyrefly: ignore[bad-index, unsupported-operation]
       )
     elif key == 'attn':
-      subparams = copy.copy(params[key])
+      subparams = copy.copy(params[key])  # pyrefly: ignore[bad-index, unsupported-operation]
       for subkey in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-        subparams[subkey]['w'] = common.quantize_array(
-            subparams[subkey]['w'],
+        subparams[subkey]['w'] = common.quantize_array(  # pyrefly: ignore[bad-index, unsupported-operation]
+            subparams[subkey]['w'],  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
             symmetric=symmetric,
         )
       quant_params[key] = subparams
     elif key == 'ffn':
-      subparams = copy.copy(params[key])
+      subparams = copy.copy(params[key])  # pyrefly: ignore[bad-index, unsupported-operation]
       for subkey in ['ffn_0', 'ffn_0_gate', 'ffn_1']:
-        subparams[subkey]['w'] = common.quantize_array(
-            subparams[subkey]['w'],
+        subparams[subkey]['w'] = common.quantize_array(  # pyrefly: ignore[bad-index, unsupported-operation]
+            subparams[subkey]['w'],  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
             symmetric=symmetric,
         )
       quant_params[key] = subparams
@@ -4341,7 +5274,7 @@ def quantize_tfm_params(params, symmetric=False):
         or key.startswith('post_ln')
     ):
       # Leave the embedding linear and layer norm layer unquantized.
-      quant_params[key] = params[key]
+      quant_params[key] = params[key]  # pyrefly: ignore[bad-index, unsupported-operation]
     else:
       raise ValueError(f'Unknown key: {key}!')
   return quant_params

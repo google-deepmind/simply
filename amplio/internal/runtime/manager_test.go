@@ -81,7 +81,7 @@ func TestRecoverRun(t *testing.T) {
 
 	runReg := NewRunRegistry()
 	mgr := NewRunManager(store, func(string) (llm.Provider, error) { return &llm.MockProvider{Model: "m"}, nil }, runReg, plain.Factory)
-	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession))
+	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession, mgr.SessionStatus))
 
 	revived, err := mgr.RecoverRun(ctx, runID)
 	if err != nil {
@@ -351,7 +351,7 @@ func TestRecoverRun_SkipsUnknownAgentType(t *testing.T) {
 
 	runReg := NewRunRegistry()
 	mgr := NewRunManager(store, func(string) (llm.Provider, error) { return &llm.MockProvider{Model: "m"}, nil }, runReg, plain.Factory)
-	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession))
+	store.SetCommitListener(NewCommitNotifier(runReg, mgr.RespawnSession, mgr.SessionStatus))
 
 	revived, err := mgr.RecoverRun(ctx, runID)
 	if err != nil {

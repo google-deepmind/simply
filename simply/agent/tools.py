@@ -89,8 +89,8 @@ class Tool[T: Action]:
 # ==============================================================================
 # Bash Tool
 # ==============================================================================
-# Use 5 min as default timeout, as many 1P tools like ml_python3 and xmanager
-# could have long delays.
+# Use 5 min as default timeout, as many tools (e.g. build and launch
+# commands) could have long delays.
 DEFAULT_TIMEOUT = 300.0
 # Sufficient for catting ~800 lines of code of average line width 40. The LLM
 # can increase this if needed, or use more concise commands.

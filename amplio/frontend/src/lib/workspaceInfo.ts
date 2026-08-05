@@ -58,7 +58,7 @@ let refreshInflight: Promise<WorkspaceInfo> | null = null;
 // refreshWorkspaceInfo forces a fresh fetch (bypassing the cache) and updates the
 // cache on success. Unlike loadWorkspaceInfo (cache-first), this always hits the
 // server — used for a fire-and-forget background refresh when the New-Run form is
-// expanded, so a CitC workspace created or used since page load shows up in the
+// expanded, so a workspace created or used since page load shows up in the
 // recents without a reload. Concurrent calls coalesce; once settled, the next
 // call fetches anew. Failures are non-fatal (the cached list stays usable).
 export function refreshWorkspaceInfo(): Promise<WorkspaceInfo> {

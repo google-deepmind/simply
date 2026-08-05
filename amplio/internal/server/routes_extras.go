@@ -20,6 +20,6 @@ import "net/http"
 
 // registerInternalRoutes is the stub for the OSS build. The internal build
 // replaces it (see routes_extras_internal.go) with handlers that need
-// corp-only backends (CitC alias management). Server.go always calls this
+// optional backends (workspace alias management). Server.go always calls this
 // after the generic routes are wired; OSS gets a no-op.
 func (s *Server) registerInternalRoutes(*http.ServeMux) {}

@@ -19,5 +19,5 @@ package main
 import "amplio/internal/eventstream"
 
 // setupCorpExtras is the stub for the OSS build. The internal build replaces
-// it (see serve_extras_internal.go) with the CitC alias cache wiring.
+// it (see serve_extras_internal.go) with additional wiring.
 func setupCorpExtras(*eventstream.BusBroadcaster) {}

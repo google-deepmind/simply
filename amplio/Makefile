@@ -15,8 +15,8 @@
 .PHONY: build dev test test-race test-integration lint fmt vuln cover frontend-build notices clean
 
 # Build tags applied to every go invocation. The internal tag switches in
-# corp-only implementations (CitC workspace, alias cache, credential probe,
-# Cider UI). The OSS Makefile drops the tag automatically — see
+# environment-specific implementations (workspace backend, credential probe,
+# extra UI). The OSS Makefile drops the tag automatically — see
 # copybara/copy.bara.sky.
 #
 # Raw `go build ./...` (no Makefile, no TAGS) compiles the OSS subset and is

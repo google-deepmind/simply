@@ -39,13 +39,14 @@ const (
 	EnvDataDir       = "AMPLIO_DATA_DIR"
 	EnvArtifactDir   = "AMPLIO_ARTIFACT_DIR"
 	EnvRunID         = "AMPLIO_RUN_ID"
-	EnvListen        = "AMPLIO_LISTEN" // serve bind address override (host:port)
+	EnvListen        = "AMPLIO_LISTEN"   // serve bind address override (host:port)
+	EnvLendLLM       = "AMPLIO_LEND_LLM" // LLM lending listener address (host:port); empty disables
 	EnvSystemLLMHQ   = "AMPLIO_SYSTEM_LLM_HQ"
 	EnvSystemLLMFast = "AMPLIO_SYSTEM_LLM_FAST"
 	EnvEmbedModel    = "AMPLIO_EMBED_MODEL"
 	EnvSkillDirs     = "AMPLIO_SKILL_DIRS" // OS path-list separated (filepath.SplitList)
 	EnvSessionID     = "AMPLIO_SESSION_ID" // bash subprocess: the agent's own session (notify default target)
-	EnvNotify        = "AMPLIO_NOTIFY"     // bash subprocess: path to the amplio binary for `notify`
+	EnvNotify        = "AMPLIO_NOTIFY"     // DEPRECATED: the whole binary, kept for scripts/agents already using it
 )
 
 // --- Data directories ---
@@ -58,17 +59,68 @@ var dataDirOverride string
 // and the default. Call once at startup (from the --data-dir flag) before any
 // DataDir consumer runs.
 func SetDataDir(dir string) {
-	dataDirOverride = dir
-	_ = os.MkdirAll(dir, 0o755)
+	dataDirOverride = expandTilde(dir)
+	_ = os.MkdirAll(dataDirOverride, 0o755)
+}
+
+// expandTilde resolves a leading "~" against the user's home directory.
+//
+// A shell does this, so a flag typed at a prompt never needs it — but these
+// paths also arrive from config.toml, env files, systemd units and container
+// environments, where nothing does. Unexpanded, a "~/x" is a perfectly valid
+// RELATIVE path: we would create a directory literally named "~" in the working
+// directory and report every subsequent error with the tilde still in it, which
+// reads exactly like the path the operator meant.
+//
+// Only a leading "~" alone or before a separator. "~user/x" is a request to
+// resolve somebody else's home, which we cannot do reliably, so it is left as
+// written rather than guessed at.
+func expandTilde(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~"+string(os.PathSeparator)) && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return filepath.Join(home, p[2:])
 }
 
 // DataDir returns the per-user data directory. Precedence: --data-dir (via
 // SetDataDir) > $AMPLIO_DATA_DIR > ~/.amplio.
+// The amplio binary is exposed to agent subprocesses under two names from one
+// shim directory, which is prepended to their PATH:
+//
+//	amplio-notify  the narrow entry point the SYSTEM PROMPT teaches: it dispatches
+//	               to `notify` and nothing else, so a half-remembered
+//	               `amplio-notify client cancel …` does nothing.
+//	amplio         the full CLI, taught on demand by the task-manager skill.
+//
+// The split is editorial, not a privilege boundary — an agent has shell access
+// and can read the server token out of this very directory, so it could drive
+// the API with curl regardless. What the split buys is that the common path is
+// simple and typo-proof, and that run management is something an agent learns
+// deliberately rather than has in front of it.
+const (
+	NotifyShimName = "amplio-notify"
+	CLIShimName    = "amplio"
+)
+
+// ShimDir is <data-dir>/bin, prepended to the PATH of agent subprocesses.
+func ShimDir() string { return filepath.Join(DataDir(), "bin") }
+
+// NotifyShimPath is <data-dir>/bin/amplio-notify.
+func NotifyShimPath() string { return filepath.Join(ShimDir(), NotifyShimName) }
+
 func DataDir() string {
 	if dataDirOverride != "" {
 		return dataDirOverride
 	}
 	if override := os.Getenv(EnvDataDir); override != "" {
+		override = expandTilde(override)
 		_ = os.MkdirAll(override, 0o755)
 		return override
 	}

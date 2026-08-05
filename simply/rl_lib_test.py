@@ -186,7 +186,7 @@ class RewardNormalizerTest(absltest.TestCase):
     np.testing.assert_allclose(normalized_rewards[masks], expected)
 
     normalized_rewards = normalizer.normalize_by_group(
-        rewards, example_ids, masks, std=1.0
+        rewards, example_ids, masks, std=1.0  # pyrefly: ignore[bad-argument-type]
     )
     expected = np.array([0, 0, -0.5, 0.5])
     np.testing.assert_allclose(normalized_rewards[masks], expected)

@@ -44,7 +44,7 @@ class ReplayBuffersTest(absltest.TestCase):
     with self.subTest("Append"):
       buffer = replay_buffers.ReplayBuffer(capacity)
       for i, x in enumerate(data):
-        buffer.append(x)
+        buffer.append(x)  # pyrefly: ignore[bad-argument-type]
         self.assertLen(buffer, min(i + 1, capacity))
         self.assertEqual(buffer.cursor, (i + 1) % capacity)
         self.assertDictEqual(buffer[i % capacity], x)
@@ -64,15 +64,15 @@ class ReplayBuffersTest(absltest.TestCase):
 
       def _test_sample(replace: bool, atol: float) -> None:
         buffer = replay_buffers.ReplayBuffer(capacity)
-        buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})
+        buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type]
 
         num_samples = 20000
         batch_size = 4
         values = np.empty((num_samples, batch_size), dtype=np.int64)
         for i in range(num_samples):
           batch = buffer.sample(batch_size, replace=replace)
-          self.assertEqual(batch["x"].shape, (batch_size, 1))
-          values[i, :] = batch["x"].flatten()
+          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, unsupported-operation]
+          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, unsupported-operation]
 
         probs = np.bincount(values.flatten()) / (num_samples * batch_size)
         self.assertEqual(probs.size, capacity)
@@ -83,20 +83,20 @@ class ReplayBuffersTest(absltest.TestCase):
 
     with self.subTest("Iterator"):
       buffer = replay_buffers.ReplayBuffer(capacity)
-      buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})
+      buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type]
 
       # batch_size = 1
       for i, batch in enumerate(buffer):
-        self.assertEqual(typing.cast(np.ndarray, batch["x"]).item(), i)
+        self.assertEqual(typing.cast(np.ndarray, batch["x"]).item(), i)  # pyrefly: ignore[bad-index, unsupported-operation]
 
       # batch_size > 1
       batch_size = 4
       indices = []
       for i, batch in enumerate(buffer.iterator(batch_size, shuffle=True)):
         self.assertEqual(
-            batch["x"].shape, (min(batch_size, capacity - i * batch_size), 1)
+            batch["x"].shape, (min(batch_size, capacity - i * batch_size), 1)  # pyrefly: ignore[bad-index, unsupported-operation]
         )
-        indices.extend(batch["x"].flatten().tolist())
+        indices.extend(batch["x"].flatten().tolist())  # pyrefly: ignore[bad-index, unsupported-operation]
       self.assertCountEqual(indices, range(capacity))
 
   def test_prioritized_replay_buffer(self):
@@ -123,7 +123,7 @@ class ReplayBuffersTest(absltest.TestCase):
           capacity, alpha=0.9, beta=0.2
       )
       for i, x in enumerate(data):
-        buffer.append(x)
+        buffer.append(x)  # pyrefly: ignore[bad-argument-type]
         self.assertLen(buffer, min(i + 1, capacity))
         self.assertEqual(buffer.cursor, (i + 1) % capacity)
         self.assertEqual(buffer.max_priority, 1.0)
@@ -133,7 +133,7 @@ class ReplayBuffersTest(absltest.TestCase):
           capacity, alpha=0.9, beta=0.2
       )
       for i, x in enumerate(data):
-        buffer.append(x, priority=priorities[i])
+        buffer.append(x, priority=priorities[i])  # pyrefly: ignore[bad-argument-type]
         self.assertLen(buffer, min(i + 1, capacity))
         self.assertEqual(buffer.cursor, (i + 1) % capacity)
         self.assertEqual(
@@ -177,7 +177,7 @@ class ReplayBuffersTest(absltest.TestCase):
             capacity, alpha=1.0, beta=1.0
         )
         buffer.extend(
-            {"x": np.expand_dims(np.arange(capacity), axis=-1)},
+            {"x": np.expand_dims(np.arange(capacity), axis=-1)},  # pyrefly: ignore[bad-argument-type]
             priorities=priorities[:capacity],
         )
 
@@ -187,11 +187,11 @@ class ReplayBuffersTest(absltest.TestCase):
 
         for i in range(num_samples):
           batch, indices, weights = buffer.sample(batch_size, replace=replace)
-          self.assertEqual(batch["x"].shape, (batch_size, 1))
+          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, unsupported-operation]
           self.assertEqual(indices.shape, (batch_size,))
           self.assertEqual(weights.shape, (batch_size,))
 
-          values[i, :] = batch["x"].flatten()
+          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, unsupported-operation]
           np.testing.assert_allclose(
               weights, np.min(priorities[:capacity]) / priorities[indices]
           )
@@ -211,7 +211,7 @@ class ReplayBuffersTest(absltest.TestCase):
       buffer = replay_buffers.PrioritizedReplayBuffer(
           capacity, alpha=1.0, beta=1.0
       )
-      buffer.extend({"x": np.arange(capacity)})
+      buffer.extend({"x": np.arange(capacity)})  # pyrefly: ignore[bad-argument-type]
       self.assertEqual(buffer.max_priority, 1.0)
 
       buffer.update_priorities(np.arange(capacity), priorities[:capacity])

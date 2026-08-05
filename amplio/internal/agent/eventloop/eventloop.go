@@ -40,6 +40,24 @@ import (
 
 const DefaultIdleTimeout = 30 * time.Minute
 
+// maxConcludeNudges bounds how many times an autonomous agent is nudged back
+// into the loop after an empty no-tool turn (a likely-accidental conclusion)
+// before the empty conclusion is allowed through. Small so a degenerate model
+// wastes at most this many extra calls; see concludeNudgeText.
+const maxConcludeNudges = 2
+
+// emptyAssistantPlaceholder is projected into the LLM request in place of the
+// (empty) content of a degenerate assistant turn — no text, no tool calls — so
+// the message is non-empty. Some providers reject an empty assistant message.
+// Instead of dropping it, we replace it with a placeholder so that the
+// conversation flows more naturally (a nudge may follow this empty message).
+const emptyAssistantPlaceholder = "(empty response)"
+
+const concludeNudgeText = "[system] Your previous turn produced no tool calls and no message text, " +
+	"so it does not look like a deliberate completion. If the task is genuinely finished, " +
+	"reply with a concise final summary (no tool calls) — that summary IS your result. " +
+	"Otherwise, continue working with the appropriate tool calls."
+
 // compactionFraming prefixes a CompactionEvent when it is projected into the
 // LLM context, telling the model to treat the summary as its own memory of
 // already-completed work and continue. Applied here (projection time), not
@@ -123,6 +141,12 @@ type EventLoopAgent struct {
 	// bumped current step. -1 outside a turn (pre-loop / between turns) → the
 	// failure marker falls back to the session's current step.
 	callStep int
+	// concludeNudges counts consecutive accidental-conclusion nudges (an empty
+	// no-tool turn from an autonomous agent). In-memory and bounded by
+	// maxConcludeNudges so a degenerate model can't loop forever; reset to 0 on
+	// any substantive turn. Not persisted — it only bounds attempts within one
+	// live loop (a cold respawn is a fresh, legitimate retry).
+	concludeNudges int
 }
 
 // New builds an agent from the shared run env and this agent's instance config.
@@ -290,6 +314,19 @@ func (a *EventLoopAgent) reconcileResume(ctx context.Context, sess *db.SessionRe
 			}
 			return false, true, nil
 		}
+		// Accidental-conclusion guard, on the RECOVERY path. Append the nudge
+		// instead and re-enter the loop: that also makes the tail a user event,
+		// which is what the provider requires before the next assistant turn
+		// (the reason this branch avoids re-calling the LLM in the first place).
+		if isDegenerateTurn(tail.Content) && a.concludeNudges < maxConcludeNudges {
+			a.concludeNudges++
+			a.logger.Debug("resume: at-rest turn is empty; nudging instead of concluding", "nudge", a.concludeNudges)
+			if _, aErr := a.env.Store.AppendEvent(ctx, a.env.RunID, a.cfg.SessionID,
+				&event.UserEvent{Content: concludeNudgeText}); aErr != nil {
+				return false, false, fmt.Errorf("append resume conclude nudge: %w", aErr)
+			}
+			return false, true, nil
+		}
 		// Autonomous: the no-tool reply is the result. Conclude without re-asking.
 		a.logger.Debug("resume: stream at rest, concluding")
 		if cErr := a.conclude(tail.Content); cErr != nil {
@@ -347,6 +384,20 @@ func (a *EventLoopAgent) repairOrphanToolCalls(ctx context.Context, events []db.
 		}
 	}
 	return nil
+}
+
+// isDegenerateTurn reports whether a no-tool turn's text is a non-answer, and
+// so should be nudged rather than accepted as an autonomous agent's result.
+//
+// Empty is the obvious case. The placeholder echo is the learned one: because
+// we project a degenerate turn into the context AS the placeholder, some weak models
+// see "(empty response)" as a legitimate thing for it to say and repeats it —
+// which would otherwise pass the guard, since it is not empty. Treating the
+// echo as empty costs nothing (a model that genuinely wants to emit only that
+// string has nothing to say either) and closes the loop the placeholder opened.
+func isDegenerateTurn(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return trimmed == "" || trimmed == emptyAssistantPlaceholder
 }
 
 // tailAssistantAtRest returns the trailing event iff it is a no-tool
@@ -615,6 +666,7 @@ func (a *EventLoopAgent) loop(ctx context.Context, needsAdvance bool) error {
 			Content:       resp.Content,
 			Thoughts:      resp.Thoughts,
 			ToolCalls:     convertToolCalls(resp.ToolCalls),
+			StopReason:    resp.StopReason,
 			ProviderExtra: resp.ProviderExtra,
 			Usage: &event.Usage{
 				PromptTokens:     resp.Usage.PromptTokens,
@@ -633,6 +685,7 @@ func (a *EventLoopAgent) loop(ctx context.Context, needsAdvance bool) error {
 		// hiding the others' completion; recovery mends any missing results per
 		// tool-call id and finalizes the step (see reconcileResume).
 		if len(resp.ToolCalls) > 0 {
+			a.concludeNudges = 0 // substantive turn — reset the accidental-conclusion guard
 			if err := a.env.Store.AppendEventAtStep(ctx, a.env.RunID, a.cfg.SessionID, callStep, assistantEvt); err != nil {
 				return a.recordFailure(ctx, fmt.Errorf("record assistant: %w", err))
 			}
@@ -669,6 +722,24 @@ func (a *EventLoopAgent) loop(ctx context.Context, needsAdvance bool) error {
 		// A bare no-tool-call turn means "done for now". What it produces
 		// depends on the agent's nature (see docs/session_lifecycle.md).
 		if !a.cfg.Interactive {
+			// Accidental-conclusion guard: an autonomous agent's final turn text IS
+			// its result, so an EMPTY message with no tool calls is almost always a
+			// degenerate turn (the model reasoned but forgot to act), not a real
+			// conclusion. Nudge it back into the loop instead of concluding on
+			// nothing — bounded by maxConcludeNudges (in-memory, reset on any
+			// substantive turn) so a degenerate model can't loop forever. The empty
+			// AssistantEvent stays persisted (step-model invariant); eventToMessage
+			// projects it as a non-empty placeholder so the replayed context is
+			// provider-safe and the nudge that follows reads coherently.
+			if isDegenerateTurn(resp.Content) && a.concludeNudges < maxConcludeNudges {
+				a.concludeNudges++
+				a.logger.Debug("empty no-tool turn; nudging instead of concluding", "nudge", a.concludeNudges)
+				if _, err := a.env.Store.AppendEvent(ctx, a.env.RunID, a.cfg.SessionID,
+					&event.UserEvent{Content: concludeNudgeText}); err != nil {
+					return a.recordFailure(ctx, fmt.Errorf("append conclude nudge: %w", err))
+				}
+				continue
+			}
 			// Autonomous: conclude — the turn's text is the result.
 			a.logger.Debug("no tool calls, concluding")
 			return a.conclude(resp.Content)
@@ -795,9 +866,19 @@ func (a *EventLoopAgent) eventToMessage(evt event.Event) *llm.Message {
 	case *event.UserEvent:
 		return &llm.Message{Role: llm.RoleUser, Content: e.Content}
 	case *event.AssistantEvent:
+		// Empty content + no tool calls (the degenerate turn from the accidental-
+		// conclusion path): substitute a non-empty placeholder so the message is
+		// provider-safe (Gemini rejects empty parts) and stays visible for the nudge.
+		// ProviderExtra is preserved so thought signatures / thinking blocks carry
+		// over — the whole point of keeping the turn (dropping them is API-accepted
+		// but needlessly breaks the reasoning chain).
+		content := e.Content
+		if strings.TrimSpace(content) == "" && len(e.ToolCalls) == 0 {
+			content = emptyAssistantPlaceholder
+		}
 		return &llm.Message{
 			Role:          llm.RoleAssistant,
-			Content:       e.Content,
+			Content:       content,
 			ToolCalls:     eventToolCallsToLLM(e.ToolCalls),
 			ProviderExtra: e.ProviderExtra,
 		}

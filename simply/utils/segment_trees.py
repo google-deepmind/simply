@@ -50,13 +50,13 @@ class SegmentTree:
 
   def __setitem__(self, key: IndexType, value: ValueType) -> None:
     if np.isscalar(key):
-      self.update(key, value)
+      self.update(key, value)  # pyrefly: ignore[bad-argument-type]
       return
 
     assert isinstance(key, np.ndarray) and key.ndim == 1
     if np.isscalar(value):
       for i in range(key.size):
-        self.update(key[i], value)
+        self.update(key[i], value)  # pyrefly: ignore[bad-argument-type]
     else:
       assert isinstance(value, np.ndarray) and value.shape == key.shape
       for i in range(key.size):
@@ -128,9 +128,9 @@ class SumSegmentTree(SegmentTree):
 
   def scan_upper_bound(self, value: ValueType) -> IndexType:
     if np.isscalar(value):
-      return self._scan_upper_bound(value)
+      return self._scan_upper_bound(value)  # pyrefly: ignore[bad-argument-type]
     else:
-      return self._vectorized_scan_upper_bound(value)
+      return self._vectorized_scan_upper_bound(value)  # pyrefly: ignore[bad-argument-type]
 
   def _scan_upper_bound(self, value: float) -> int:
     """Returns the smallest `i` that sum(arr[0:i]) > value.

@@ -18,7 +18,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev,tfds,math-eval,agent]"
+        run: pip install -e ".[dev,tfds,math-eval,agent,serving]"
+
+      - name: Generate serving protos
+        run: python setup/gen_protos.py
 
       - name: Run tests
         run: pytest simply/ -v --tb=short
+
+      # Needs its own process: it forces 4 CPU devices via XLA_FLAGS, which
+      # must be set before JAX initializes its backend.
+      - name: Run multi-device tests
+        run: pytest simply/model_lib_multi_device_test.py -v --tb=short

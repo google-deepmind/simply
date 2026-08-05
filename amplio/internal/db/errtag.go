@@ -100,6 +100,10 @@ func (t *taggedStore) MarkRunSeen(ctx context.Context, runID string) error {
 	return tag(t.s.MarkRunSeen(ctx, runID))
 }
 
+func (t *taggedStore) MarkRunUnseen(ctx context.Context, runID string) error {
+	return tag(t.s.MarkRunUnseen(ctx, runID))
+}
+
 func (t *taggedStore) DeleteRun(ctx context.Context, runID string) error {
 	return tag(t.s.DeleteRun(ctx, runID))
 }
@@ -193,6 +197,11 @@ func (t *taggedStore) GetEvents(ctx context.Context, runID, sessionID string, op
 
 func (t *taggedStore) GetEventCount(ctx context.Context, runID, sessionID string, opts EventFilter) (int, error) {
 	n, err := t.s.GetEventCount(ctx, runID, sessionID, opts)
+	return n, tag(err)
+}
+
+func (t *taggedStore) CountEnvNotices(ctx context.Context, runID, sessionID string) (int, error) {
+	n, err := t.s.CountEnvNotices(ctx, runID, sessionID)
 	return n, tag(err)
 }
 

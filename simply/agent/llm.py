@@ -154,7 +154,7 @@ class LiteLLM(LLMBase):
   def max_tokens(self) -> int:
     """Returns the maximum number of tokens supported."""
     model_info = litellm.get_model_info(self.llm_spec)
-    return model_info['max_input_tokens']
+    return model_info['max_input_tokens']  # pyrefly: ignore[bad-return]
 
   def count_tokens(self, messages: Sequence[Mapping[str, Any]]) -> int:
     """Returns the approxmate number of tokens in the given messages.
@@ -165,4 +165,4 @@ class LiteLLM(LLMBase):
     Returns:
       Estimated token count for the messages.
     """
-    return litellm.token_counter(model=self.llm_spec, messages=messages)
+    return litellm.token_counter(model=self.llm_spec, messages=messages)  # pyrefly: ignore[bad-argument-type]

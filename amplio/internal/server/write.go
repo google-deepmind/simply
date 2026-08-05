@@ -16,6 +16,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -102,10 +103,29 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"run_id": runID})
 }
 
+// maxEnvNoticesPerStep bounds how many environment notifications
+// ($AMPLIO_NOTIFY) may pile up at a SINGLE step of one session, after which
+// handleNotify refuses them.
+const maxEnvNoticesPerStep = 50
+
+// errEnvNoticeCapped is the stable machine-readable prefix of the 429 body when
+// maxEnvNoticesPerStep is hit. Kept constant and free of variable text so a
+// background script can match it exactly (`grep -q env_notice_capped`) and stop
+// itself; the status code alone can't distinguish this from any other refusal.
+const errEnvNoticeCapped = "env_notice_capped"
+
 // handleNotify delivers an environment message to a session, used by the
 // `amplio notify` CLI that background scripts (spawned via the bash tool) call.
-// It's classified as a Notice: it wakes a live/awaiting session (e.g. one parked
-// in await_event) and persists, but never revives a dormant or concluded one.
+// The message is an Input-class MessageEvent (SenderType=environment): it wakes a
+// live session and revives a cold PARKED one (idle/awaiting) — so a background
+// job's completion reaches an agent that merely forgot to await_event — but it
+// does NOT revive a FINISHED session (concluded/crashed/cancelled): the
+// environment can't resurrect a deliberately-finished agent (the wake-path gate
+// in runtime.NewCommitNotifier). See docs/session_lifecycle.md.
+//
+// Because a notification to a finished session still PERSISTS (it is simply not
+// acted on), an abandoned notifier can append for as long as it runs; hence the
+// per-step cap below, which applies uniformly rather than only on that path.
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	id, sid := r.PathValue("id"), r.PathValue("sid")
 	var req struct {
@@ -118,6 +138,29 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Content == "" {
 		writeErr(w, http.StatusBadRequest, "content is required")
+		return
+	}
+	// A mistyped --session is the obvious failure mode now that the target is
+	// named, and an FK violation surfacing as a 500 tells the caller nothing.
+	if _, err := s.store.GetSession(r.Context(), id, sid); err != nil {
+		writeErr(w, http.StatusNotFound,
+			fmt.Sprintf("no session %q in run %q", sid, id))
+		return
+	}
+
+	// Flood guard: refuse once this step has absorbed its budget. 429 rather
+	// than a silent drop, because the caller is a script — `amplio notify` maps
+	// non-2xx to exit code 3 and prints the body on stderr, so a runaway loop
+	// gets a signal it can act on instead of spinning forever. The body is a
+	// fixed, greppable token.
+	n, err := s.store.CountEnvNotices(r.Context(), id, sid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if n >= maxEnvNoticesPerStep {
+		writeErr(w, http.StatusTooManyRequests,
+			fmt.Sprintf("%s: per-step cap %d", errEnvNoticeCapped, maxEnvNoticesPerStep))
 		return
 	}
 	sender := req.Sender
@@ -200,8 +243,9 @@ func (s *Server) handleUpdateRun(w http.ResponseWriter, r *http.Request) {
 		// can't distinguish "absent" from "null".
 		Grade    json.RawMessage `json:"grade"`
 		Archived *bool           `json:"archived"`
-		// Seen=true records that the operator viewed this run now, clearing its
-		// dashboard "has updates" badge. (No "unseen" direction by design.)
+		// Seen records that the operator viewed this run now (true, clearing the
+		// dashboard badge) or that they are not done with it (false, putting the
+		// badge back — see MarkRunUnseen).
 		Seen *bool `json:"seen"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -238,8 +282,14 @@ func (s *Server) handleUpdateRun(w http.ResponseWriter, r *http.Request) {
 	if req.Archived != nil && !apply(s.store.SetRunArchived(r.Context(), id, *req.Archived)) {
 		return
 	}
-	if req.Seen != nil && *req.Seen && !apply(s.store.MarkRunSeen(r.Context(), id)) {
-		return
+	if req.Seen != nil {
+		mark := s.store.MarkRunSeen
+		if !*req.Seen {
+			mark = s.store.MarkRunUnseen
+		}
+		if !apply(mark(r.Context(), id)) {
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }

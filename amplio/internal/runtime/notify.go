@@ -23,6 +23,27 @@ import (
 // has no active goroutine.
 type RespawnFunc func(runID, sessionID string)
 
+// StatusFunc reports a session's current status (ok=false if it can't be read).
+// The commit notifier uses it to gate environment revival of finished sessions.
+// It may be nil (then no env-revival gating is applied).
+type StatusFunc func(runID, sessionID string) (status string, ok bool)
+
+// envUnrevivableStatuses is the set of session statuses that an ENVIRONMENT
+// notification ($AMPLIO_NOTIFY) must NOT revive — the *finished* states, where
+// the session has stopped for good. Deliberately scoped to THIS policy. In
+// particular `crashed` is the debatable member — a crash isn't a deliberate
+// stop — so drop it from this set (only) if env should be allowed to nudge a
+// crashed agent back.
+//
+// The PARKED states (idle/awaiting) are intentionally ABSENT: an idle
+// interactive agent and an awaiting agent are waiting, not finished, so a
+// background job SHOULD still wake them.
+var envUnrevivableStatuses = map[string]bool{
+	db.SessionConcluded: true,
+	db.SessionCancelled: true,
+	db.SessionCrashed:   true,
+}
+
 // NewCommitNotifier returns a db.CommitListener that bridges committed events
 // to the per-run session registries. It is the synchronous, lossless wake path
 // (installed via Store.SetCommitListener):
@@ -30,7 +51,9 @@ type RespawnFunc func(runID, sessionID string)
 //   - If the target session is live, every event wakes it (bumps its waiter).
 //   - If the target session is cold, only an Input-class event (db.IsInput)
 //     revives it; other events just persist.
-func NewCommitNotifier(runReg *RunRegistry, respawn RespawnFunc) db.CommitListener {
+//   - EXCEPTION: an environment notification ($AMPLIO_NOTIFY) does NOT revive a
+//     cold TERMINAL session (concluded/crashed/cancelled). See the gate below.
+func NewCommitNotifier(runReg *RunRegistry, respawn RespawnFunc, statusOf StatusFunc) db.CommitListener {
 	return func(runID, sessionID string, evt event.Event) {
 		// A ToolResultEvent is the session's OWN turn output, never an external
 		// wake. Results are now appended one-by-one as each tool finishes, so
@@ -47,8 +70,23 @@ func NewCommitNotifier(runReg *RunRegistry, respawn RespawnFunc) db.CommitListen
 		if reg != nil && reg.Notify(sessionID) {
 			return // woke a live session
 		}
-		if respawn != nil && db.IsInput(evt) {
-			respawn(runID, sessionID)
+		if respawn == nil || !db.IsInput(evt) {
+			return
 		}
+		// Environment notifications ($AMPLIO_NOTIFY) must not resurrect a cold
+		// TERMINAL state that is a deliberate stop.
+		if isEnvNotification(evt) && statusOf != nil {
+			if status, ok := statusOf(runID, sessionID); ok && envUnrevivableStatuses[status] {
+				return // persist as Notice; leave the finished session at rest
+			}
+		}
+		respawn(runID, sessionID)
 	}
+}
+
+// isEnvNotification reports whether evt is an $AMPLIO_NOTIFY environment message
+// (SenderType==environment), as opposed to an agent-to-agent send_message.
+func isEnvNotification(evt event.Event) bool {
+	m, ok := evt.(*event.MessageEvent)
+	return ok && m.SenderType == event.SenderTypeEnvironment
 }

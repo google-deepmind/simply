@@ -21,10 +21,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/gofrs/flock"
+
+	"amplio/internal/config"
 )
 
 // serverInfo is the discovery metadata a running `serve` writes to
@@ -108,6 +111,12 @@ func readServerInfo(dataDir string) (serverInfo, error) {
 // sqlite DB and would otherwise double-execute the same runs. The lock is an
 // advisory flock the kernel releases automatically on process exit — including
 // a crash — so there is never a stale lock to clean up by hand.
+// lockDataDir claims the data dir for this process and furnishes it: the lock
+// itself, plus the notify shim agents get on their PATH. Both belong here
+// because every process that runs agents — serve, headless run, headless resume
+// — takes this lock first, so a fourth entry point cannot forget the shim (the
+// first version installed it in serve only, and headless agents were told by
+// their prompt to use a command they did not have).
 func lockDataDir(dataDir string) (*flock.Flock, error) {
 	lk := flock.New(filepath.Join(dataDir, "lock"))
 	ok, err := lk.TryLock()
@@ -121,5 +130,45 @@ func lockDataDir(dataDir string) (*flock.Flock, error) {
 		}
 		return nil, fmt.Errorf("another amplio process already owns %s%s", dataDir, hint)
 	}
+	// Non-fatal: without it agents fall back to $AMPLIO_NOTIFY, which still works.
+	if err := installNotifyShim(dataDir); err != nil {
+		slog.Warn("could not install the notify shim; agents fall back to $AMPLIO_NOTIFY", "error", err)
+	}
 	return lk, nil
+}
+
+// installNotifyShim points <data-dir>/bin/{amplio-notify,amplio} at the running
+// binary: the narrow name the prompt teaches, and the full CLI the task-manager
+// skill teaches.
+//
+// A symlink, not a copy: a copy would go stale the moment amplio is rebuilt, and
+// not a wrapper script, because an extra process between the caller and notify
+// changes the parent pid that notify stamps onto the sender — the hint a revived
+// agent uses to kill a runaway notifier. Recreated on every boot so the link
+// follows the binary that is actually serving.
+func installNotifyShim(dataDir string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve the running binary: %w", err)
+	}
+	binDir := filepath.Join(dataDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return err
+	}
+	for _, name := range []string{config.NotifyShimName, config.CLIShimName} {
+		link := filepath.Join(binDir, name)
+		if existing, err := os.Readlink(link); err == nil && existing == exe {
+			continue // already correct
+		}
+		// Replace atomically: a running agent may be invoking it right now.
+		tmp := link + ".tmp"
+		_ = os.Remove(tmp)
+		if err := os.Symlink(exe, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, link); err != nil {
+			return err
+		}
+	}
+	return nil
 }

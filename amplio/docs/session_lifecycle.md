@@ -77,20 +77,53 @@ should revive a *dormant* session:
 | Class | Revives a dormant session? | Examples |
 |---|---|---|
 | **Notice** | no — persists; only a live `awaiting` session reacts | `ChildResultEvent` verdict `crashed`/`cancelled`; self/system writes (Assistant, ToolResult, Compaction, `SystemEvent` markers) |
-| **Input** | yes — restarts any non-`ongoing` session | `UserEvent` (operator/user input); `MessageEvent` — agent (`send_message`) **or** environment (`$AMPLIO_NOTIFY`); `ChildResultEvent` verdict `concluded`; `RecoverEvent` |
+| **Input** | yes — restarts any non-`ongoing` session (but see the environment-notification exception below) | `UserEvent` (operator/user input); `MessageEvent` — agent (`send_message`) **or** environment (`$AMPLIO_NOTIFY`); `ChildResultEvent` verdict `concluded`; `RecoverEvent` |
 
 **Every event is written to the session's stream regardless of the target's
 state** — the class only decides whether it *revives* a dormant session. A
 `Notice` to a terminal session just persists (seen only if the session is later
 restarted).
 
-**Environment notifications (`$AMPLIO_NOTIFY`) are `Input`-class** — they revive
-a dormant/concluded recipient, so a background job's completion notice reaches
-the agent even if it forgot to `await_event`. A runaway/forgotten notifier is
-recoverable: `notify` stamps the caller's pid onto the sender (e.g.
-`environment (pid=12345)`), so the revived agent can identify and `kill` the
-offending script. (Previously these were `Notice` and an idle or concluded
-agent won't respond to them.)
+**Environment notifications (`$AMPLIO_NOTIFY`) are `Input`-class, but do NOT
+revive a *terminal* session.** They revive a *parked* recipient (`idle`/
+`awaiting`), so a background job's completion notice reaches an agent that's
+merely waiting even if it forgot to `await_event`. They do **not** revive a
+`concluded`/`crashed`/`cancelled` session: the environment must not resurrect an
+agent that has deliberately finished (or was deliberately stopped), and reviving
+a terminal just to trivially ack a stale/runaway notifier churns phases, run
+reports, and — via a re-posted `child_result` — the parent chatbot. A terminal
+session is still restartable by a `UserEvent`, an agent `send_message` /
+`child_result`, or `Recover` — only a raw env notification is gated. This
+exception is enforced at the wake path (`runtime.NewCommitNotifier`, against a
+wake-path-private `envUnrevivableStatuses` set — deliberately NOT a general
+"terminal" predicate, since that notion is overloaded and this policy needs to be
+tunable on its own, e.g. `crashed`), not in `Classify` (which stays a pure
+function of the event):
+the env message is still appended (persisted) to the terminal session's stream,
+it just doesn't respawn it, so it's seen on the next genuine restart. A
+runaway/forgotten notifier remains recoverable: `notify` stamps the caller's pid
+onto the sender (e.g. `environment (pid=12345)`), so a revived agent can identify
+and `kill` the offending script.
+
+**Env notifications are capped per step** (`server.maxEnvNoticesPerStep`, 50).
+Since they persist even when they cannot wake anyone, an abandoned poller would
+otherwise append for as long as it runs — and every notice it appends is also
+replayed into the model's context on the next turn. The *step* is the budget
+window, which needs no session state to be the right one: a working session
+advances its step every turn, so 50 is a generous per-turn allowance; a finished
+session never advances again, so the same rule becomes a lifetime cap. Over the
+cap, `POST /notify` answers **429** instead of appending, with the fixed token
+`env_notice_capped` as the body (a script, not a model, is reading it — so no
+prose and no live count, which would defeat an exact match). Since `amplio
+notify` maps non-2xx to exit code 3 with the body on stderr, a stray loop can
+detect this precisely and stop itself.
+
+Relatedly, since a terminal session can no longer be env-rescued, an autonomous
+agent that ends a turn with **no tool calls AND empty content** (a likely
+*accidental* conclusion — the model reasoned but forgot to act) is nudged back
+into the loop rather than concluding on nothing, bounded by a small in-memory
+counter so a degenerate model can't loop forever (see
+`eventloop.maxConcludeNudges`).
 
 **Operator/user input is a `UserEvent`, not a `MessageEvent`.** `MessageEvent` is
 agent-to-agent (`send_message`) or environment (`$AMPLIO_NOTIFY`); rendering user

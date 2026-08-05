@@ -90,6 +90,21 @@ class UpdatesStore {
 		});
 	}
 
+	/** Put a run's badge back. The run page clears a badge the moment it appears
+	 *  (see routes/runs/[id]/+layout.svelte), so the caller must LEAVE the run for
+	 *  this to stick — RunCard navigates to the dashboard when it is the run
+	 *  page's own card. */
+	markUnseen(runId: string) {
+		if (!runId) return;
+		if (!this.byRun[runId]) {
+			this.byRun = { ...this.byRun, [runId]: true };
+			this.count += 1;
+		}
+		void api.markRunUnseen(runId).catch(() => {
+			// On failure, a later refreshCounts/seed re-derives the truth.
+		});
+	}
+
 	hasUpdatesById(runId: string): boolean {
 		return !!this.byRun[runId];
 	}

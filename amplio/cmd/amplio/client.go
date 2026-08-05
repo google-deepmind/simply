@@ -68,6 +68,7 @@ func clientCmd() *cobra.Command {
 func clientSubmitCmd() *cobra.Command {
 	var (
 		task      string
+		title     string
 		workspace string
 		agentType string
 		llmSpec   string
@@ -88,6 +89,7 @@ func clientSubmitCmd() *cobra.Command {
 			}
 			body := map[string]string{
 				"task":      task,
+				"title":     title,
 				"workspace": workspace,
 				"agent":     agentType,
 				"llm":       llmSpec,
@@ -107,6 +109,7 @@ func clientSubmitCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&task, "task", "", "Task description (or pass as a positional arg)")
+	cmd.Flags().StringVar(&title, "title", "", "Run title (default: server auto-generates from the task). Handy to tag/compare runs, e.g. a model-name suffix.")
 	cmd.Flags().StringVar(&workspace, "workspace", "", "Working directory (default: server-side run.workspace)")
 	cmd.Flags().StringVar(&agentType, "agent", "", "Agent type (default: server-side run.agent_type)")
 	cmd.Flags().StringVar(&llmSpec, "llm", "", "Agent LLM spec (default: server-side run.llm)")

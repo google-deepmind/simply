@@ -16,6 +16,7 @@
 
 <script lang="ts">
 	import { api } from '$lib/api';
+	import { goto } from '$app/navigation';
 	import { updates } from '$lib/updates.svelte';
 	import { auth } from '$lib/auth.svelte';
 	import { timeAgo } from '$lib/time';
@@ -28,6 +29,7 @@
 		DotsThreeVerticalIcon,
 		PencilSimpleIcon,
 		ArchiveIcon,
+		EnvelopeIcon,
 		FolderIcon,
 		CubeIcon,
 		XIcon,
@@ -39,7 +41,7 @@
 	} from 'phosphor-svelte';
 	import { iconForName } from '$lib/sessionIcon';
 	import { setRunPrefill } from '$lib/runPrefill.svelte';
-	import { CiderIcon, NameWorkspaceModal } from './internal';
+	import { EditorIcon, WorkspaceNameModal } from './internal';
 	import GradePicker from './GradePicker.svelte';
 
 	// Unified run card. The dashboard renders a list of these (linkable=true,
@@ -78,19 +80,19 @@
 	);
 	const lastChange = $derived(run.root_status_changed_at || run.created_at);
 
-	// --- Workspace pill / "Name workspace" Cider integration ---
+	// --- Workspace pill / "Name workspace" editor integration ---
 	//
 	// Three pill shapes branch off the run's workspace metadata:
-	//   * cider_url present  → pill is an <a> opening Cider in a new tab, with
-	//     the CiderIcon brand mark (instantly recognizable) + trailing ↗
+	//   * cider_url present  → pill is an <a> opening the workspace in its
+	//     editor, with the editor brand mark + trailing ↗
 	//     external-link glyph as a click affordance cue.
-	//   * citc + no alias    → pill stays a plain non-link chip; the overflow
+	//   * nameable, unnamed → pill stays a plain non-link chip; the overflow
 	//     menu surfaces a "Name workspace…" item that opens the modal.
-	//   * non-CitC (plain/jj/external) → plain chip, no menu item, no link.
-	// Anonymous-CitC and named-CitC are the only two states where the menu
+	//   * other backends (plain/jj/external) → plain chip, no menu item.
+	// Unnamed and named are the only two states where the menu
 	// item appears/disappears — we never offer to rename an already-named
 	// workspace from this UI (would risk fighting external mutations).
-	const canOpenInCider = $derived(!!run.cider_url);
+	const canOpenInEditor = $derived(!!run.cider_url);
 	const canNameWorkspace = $derived(
 		run.workspace_kind === 'citc' && !run.workspace_alias && run.workspace_numeric_id > 0
 	);
@@ -257,6 +259,21 @@
 		}
 	}
 
+	// Mark as unread: put the dashboard badge back for a run the operator looked
+	// at but isn't done with. On the RUN PAGE this must also leave the page — the
+	// run-page layout clears a badge the moment it appears while the tab is
+	// visible, so staying would undo it within a refetch. Leaving is the whole
+	// mechanism, which is why it isn't optional.
+	async function markUnread() {
+		closeMenu();
+		// LEAVE FIRST, then mark. The PATCH makes the server emit run_updated; a
+		// still-mounted run page refetches, sees has_updates while visible, and
+		// clears the badge again — measured, not theoretical. Unmounting the page
+		// before the write removes the only thing that would undo it.
+		if (!linkable) await goto('/');
+		updates.markUnseen(run.run_id);
+	}
+
 	async function toggleArchive() {
 		closeMenu();
 		await api.updateRun(run.run_id, { archived: !run.archived });
@@ -367,15 +384,15 @@
 		{/if}
 	</div>
 
-	{#if canOpenInCider}
+	{#if canOpenInEditor}
 		<a
-			class="chip cider"
+			class="chip editor"
 			href={run.cider_url}
 			target="_blank"
 			rel="noopener"
-			title={`Open ${run.workspace_alias} in Cider · ${run.workspace}`}
+			title={`Open ${run.workspace_alias} · ${run.workspace}`}
 		>
-			<CiderIcon size={12} />
+			<EditorIcon size={12} />
 			<span class="chip-text">{run.workspace_name || run.workspace}</span>
 			<ArrowSquareOutIcon size={10} weight="bold" />
 		</a>
@@ -386,9 +403,11 @@
 		</span>
 	{/if}
 	{#if run.llm}
+		<!-- Short label in the chip, full spec in the tooltip: specs run to 120+
+		     chars and the chip is a glance target, not a reference. -->
 		<span class="chip" title="Model: {run.llm}">
 			<CubeIcon size={12} weight="bold" />
-			<span class="chip-text">{run.llm}</span>
+			<span class="chip-text">{run.llm_name || run.llm}</span>
 		</span>
 	{/if}
 
@@ -446,12 +465,20 @@
 						<button
 							class="item"
 							onclick={openNameWorkspace}
-							title="Attach a CitC alias to this anonymous workspace so it opens in Cider"
+							title="Name this workspace so it can be opened in an editor"
 						>
 							<TagIcon size={14} weight="bold" />
 							Name workspace…
 						</button>
 					{/if}
+					<button
+						class="item"
+						onclick={markUnread}
+						title="Put this run's badge back and return to the dashboard"
+					>
+						<EnvelopeIcon size={14} weight="regular" />
+						Mark as unread
+					</button>
 					<button class="item" onclick={toggleArchive}>
 						<ArchiveIcon size={14} weight={run.archived ? 'fill' : 'regular'} />
 						{run.archived ? 'Unarchive' : 'Archive'}
@@ -507,11 +534,11 @@
 	<!--
 		Modal lives OUTSIDE the .card flex row so its sizing doesn't influence
 		the row layout. Rendered only when the action is applicable so a row
-		with a non-CitC workspace pays no DOM cost. onattached refreshes the
-		parent's run list so the pill upgrades to a Cider link immediately,
+		on a backend without naming pays no DOM cost. onattached refreshes the
+		parent's run list so the pill upgrades to a link immediately,
 		in addition to whatever SSE workspace_alias signal arrives later.
 	-->
-	<NameWorkspaceModal
+	<WorkspaceNameModal
 		bind:open={nameWorkspaceOpen}
 		runId={run.run_id}
 		numericId={run.workspace_numeric_id}
@@ -681,19 +708,19 @@
 		text-overflow: ellipsis;
 		min-width: 0;
 	}
-	/* Cider variant: a clickable workspace pill (<a>) that opens the workspace
-	   in Cider. The CiderIcon brand mark already carries the amber identity,
+	/* Editor variant: a clickable workspace pill (<a>) that opens the workspace
+	   in its editor. The brand mark already carries the amber identity,
 	   so the chip chrome stays neutral (matches other chips); hover lights up
 	   the border + text to telegraph clickability. The trailing ↗ glyph is the
 	   click affordance cue — without it, the chip looks identical to the
 	   plain workspace chip until hover. Suppress the global a:hover underline
 	   since this is a metadata pill, not prose. */
-	a.chip.cider {
+	a.chip.editor {
 		text-decoration: none;
 		color: var(--text-dim);
 		cursor: pointer;
 	}
-	a.chip.cider:hover {
+	a.chip.editor:hover {
 		border-color: var(--accent-dim);
 		color: var(--text);
 		text-decoration: none;

@@ -19,10 +19,13 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	"amplio/internal/agent/critic"
 	"amplio/internal/config"
 	"amplio/internal/db"
+	"amplio/internal/llm"
 	"amplio/internal/workspace"
 )
 
@@ -53,11 +56,15 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			opts.Limit = min(n, maxRunsPage)
 		}
 	}
-	// `before` is the offset cursor from a prior page's next_cursor (a row count).
-	// Offset pagination over the newest-first ordering.
+	// `before` is the keyset cursor from a prior page's next_cursor: an opaque
+	// "<created_at RFC3339Nano>|<run_id>" token. Keyset (not offset) pagination is
+	// stable under concurrent run creation — no rows skipped or duplicated at a page
+	// boundary. A malformed cursor is ignored (falls back to the first page).
 	if v := q.Get("before"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			opts.Offset = n
+		if ts, rid, ok := strings.Cut(v, "|"); ok {
+			if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+				opts.Before, opts.BeforeRunID = t, rid
+			}
 		}
 	}
 	runs, hasMore, err := s.store.ListRunsWithSessions(r.Context(), opts)
@@ -69,11 +76,13 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, rw := range runs {
 		out = append(out, toRunSummary(rw))
 	}
-	// next_cursor is the running offset (rows consumed so far), fed back as
-	// ?before to fetch the following page. Empty when there's no more.
+	// next_cursor encodes the LAST returned run's (created_at, run_id) as the
+	// keyset anchor for the next page, fed back as ?before. Empty when there's no
+	// more. Opaque to the client (it round-trips the token unchanged).
 	var nextCursor string
-	if hasMore {
-		nextCursor = strconv.Itoa(opts.Offset + len(out))
+	if hasMore && len(runs) > 0 {
+		last := runs[len(runs)-1].Run
+		nextCursor = last.CreatedAt.Format(time.RFC3339Nano) + "|" + last.RunID
 	}
 	writeJSON(w, http.StatusOK, runsPage{Runs: out, HasMore: hasMore, NextCursor: nextCursor})
 }
@@ -113,6 +122,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		WorkspaceNumericID: wm.NumericID,
 		CiderURL:           wm.CiderURL,
 		LLM:                run.Config.LLM,
+		LLMName:            llm.ShortLabel(run.Config.LLM),
 		AgentType:          run.Config.AgentType,
 		// System tiers are a process-wide property (not per-run); surface the
 		// server's current defaults so the Overview still shows what the run's
@@ -189,7 +199,7 @@ func (s *Server) computeReportCoverage(ctx context.Context, runID string, sessio
 }
 
 // workspaceMeta holds the render-ready info the dashboard rows and run-detail
-// card need about a run's workspace: a cheap display name plus CitC-only
+// card need about a run's workspace: a cheap display name plus optional
 // fields that enable the Open-in-Cider link (named) and the Name-workspace
 // menu item (anonymous). Empty fields mean "not applicable" — non-CitC
 // backends carry only Kind+Name.
@@ -249,6 +259,25 @@ func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, reports)
 }
 
+// stepRange parses the optional inclusive from_step/to_step query pair shared
+// by the events and chat endpoints (the session-log viewer fetches one phase at
+// a time). Returns nil for an absent or unparsable bound, so a caller can treat
+// "neither present" as "no range requested".
+func stepRange(r *http.Request) (from, to *int) {
+	parse := func(key string) *int {
+		v := r.URL.Query().Get(key)
+		if v == "" {
+			return nil
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil
+		}
+		return &n
+	}
+	return parse("from_step"), parse("to_step")
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id, sid := r.PathValue("id"), r.PathValue("sid")
 	// All generations: this is a human-facing trajectory view, not the LLM's
@@ -265,6 +294,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(v); err == nil {
 			filter.StartStep = &n
 			filter.EndStep = &n
+		}
+	}
+	// from_step/to_step fetch an inclusive RANGE in one request — the session-log
+	// viewer's "expand all" over a whole phase, which would otherwise be one
+	// request per step. Either bound may be given alone (open-ended on the other
+	// side). Applied after step=N so an explicit single step still wins.
+	if from, to := stepRange(r); from != nil || to != nil {
+		if filter.StartStep == nil {
+			filter.StartStep = from
+		}
+		if filter.EndStep == nil {
+			filter.EndStep = to
 		}
 	}
 	recs, err := s.store.GetEvents(r.Context(), id, sid, filter)

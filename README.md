@@ -5,8 +5,9 @@
 
 - *Quick to [fork and hack](#getting-started)* for fast iteration. We aim at minimizing the time to implement new ideas (e.g., optimizer, training loss, RL algorithms, etc) by humans and AI agents.
 - *Minimal abstractions and dependencies* for a simple and self-contained codebase. Learn [Jax](https://jax.readthedocs.io/en/latest/index.html), and you are ready to read and hack the code.
-- *An environment for automated AI research* — An AI agent, which can itself be powered by an LLM served with *Simply*, can read the code, propose new ideas, run experiments, and iterate autonomously or under the guidance of human researchers. See [automated AI research with agents](#automated-ai-research-with-agents) for some simple examples. More on the way.
-- That's it, *simply* [get started](#getting-started) with hacking now :)
+- *An environment for automated AI research* An AI agent, which can itself be powered by an LLM served with *Simply*, can read the code, propose new ideas, run experiments, and iterate autonomously or under the guidance of human researchers. See [automated AI research with agents](#automated-ai-research-with-agents) for simple examples. 
+- *Agent harnesses for long horizon automated research* Besides the [minimal agent](simply/agent/) example, we recently added one fully featured agent harness named [Amplio](amplio/README.md) designed for long horizon runs suited for automated research with *Simply*.
+- That's it, *simply* [get started](#getting-started) now :)
 
 ## Getting started
 ### Example commands
@@ -25,7 +26,7 @@ export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
 #### Running on GKE with XPK
-Google Kubernetes Engine (GKE) is supported. See [GKE quick start](gcloud_quickstart.md#optional-running-on-gke-with-xpk) to run your first experiment on GKE, and [GKE section in the full GCloud guide](docs/gcloud.md#11-running-on-gke-with-xpk) for details.
+Google Kubernetes Engine (GKE) is supported. See [GKE quick start](gcloud_quickstart.md#optional-running-on-gke-with-xpk) to run your first experiment on GKE, and [GKE section in the full GCloud guide](docs/gcloud.md#running-on-gke-with-xpk) for details.
 
 #### Automated AI research with agents
 
@@ -55,7 +56,16 @@ python -m simply.agent.main \
 
 See the [agent README](simply/agent/README.md) for setup and configuration details.
 
-For a more full-featured, long-horizon agent harness, this repo also vendors [**Amplio**](amplio/README.md) under [`amplio/`](amplio/) — a standalone Go framework that runs an LLM in a loop with generic tools (shell, file edit, sub-agent spawn, inter-agent messaging), backed by a crash-resistant DB-first design and a web UI. It is a self-contained Go module with its own build (`cd amplio && make build`); see the [Amplio README](amplio/README.md) to get started.
+#### Long-horizon runs with Amplio
+
+[**Amplio**](amplio/README.md), vendored under [`amplio/`](amplio/), is a fully featured Go agent harness for long-horizon runs: generic tools (shell, file edit, sub-agent spawn, inter-agent messaging), DB-first persistence so a run resumes after a crash, and a web UI.
+
+```bash
+cd amplio && make build   # needs Go (see amplio/go.mod) and Node.js 22+
+./amplio serve            # prints a URL with an access token
+```
+
+`amplio serve` reads `system_llm_hq` / `system_llm_fast` from `<data-dir>/config.toml`; see the [Amplio README](amplio/README.md) for configuration, LLM providers, and headless runs.
 
 ## Dependencies
 
@@ -81,6 +91,17 @@ pip install .
 pip install ".[tfds]"       # for TensorFlow Datasets
 pip install ".[math-eval]"  # for simply/utils/math_eval.py
 pip install ".[dev]"        # for testing (pytest)
+```
+
+### Serving protos
+
+The serving stack (`simply/serving/`) talks gRPC, and its Python stubs are
+generated from `simply/serving/*.proto` rather than checked in. Generate them
+once after install:
+
+```bash
+pip install ".[serving]"
+python setup/gen_protos.py
 ```
 
 ## Setup Model Checkpoints and Datasets

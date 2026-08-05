@@ -73,15 +73,41 @@ type chatFeed struct {
 	Usage      *chatUsage   `json:"usage"`
 }
 
-// handleChat projects a chatbot session into the chat view: rolled-up phase
-// cards plus the live conversation bubbles (operator + chatbot, plus inbound
+// handleChat projects a session into the chat view: rolled-up phase cards plus
+// the live conversation bubbles (operator + chatbot, plus inbound
 // agent/environment messages), excluding tool-result bodies and other
 // non-conversational events.
+//
+// Two modes:
+//
+//   - LIVE (no range params): everything at or below the phase boundary is
+//     rolled into cards and omitted from the bubbles, so a long chat stays
+//     bounded. This is what the chat page renders.
+//   - RANGED (from_step/to_step): the read-only session-log viewer browsing ONE
+//     phase. No rollup, no cards (the client already has the phase index from
+//     the trajectory endpoint), and no usage — a historical slice has no
+//     "latest turn".
+//
+// The projection itself is identical in both modes and works for any session,
+// not just a chatbot: an autonomous agent's turns render as the same bubbles.
+// Tool results are pinned to their call's step (see docs/step_model.md), so a
+// range never splits a call from its result.
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id, sid := r.PathValue("id"), r.PathValue("sid")
 
-	boundary, cards := s.phaseState(r.Context(), id, sid)
-	recs, err := s.store.GetEvents(r.Context(), id, sid, db.EventFilter{})
+	from, to := stepRange(r)
+	ranged := from != nil || to != nil
+
+	boundary := -1 // ranged: nothing is rolled up, so nothing is skipped below
+	cards := []phaseCard{}
+	if !ranged {
+		var c []phaseCard
+		boundary, c = s.phaseState(r.Context(), id, sid)
+		if c != nil {
+			cards = c
+		}
+	}
+	recs, err := s.store.GetEvents(r.Context(), id, sid, db.EventFilter{StartStep: from, EndStep: to})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -162,9 +188,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	// Latest assistant turn's usage drives the status-bar token count.
+	// Latest assistant turn's usage drives the LIVE status-bar token count. A
+	// ranged (historical) slice has no "latest turn" to report, so it stays nil.
 	var usage *chatUsage
-	for i := len(recs) - 1; i >= 0; i-- {
+	for i := len(recs) - 1; !ranged && i >= 0; i-- {
 		a, ok := recs[i].Event.(*event.AssistantEvent)
 		if !ok {
 			continue

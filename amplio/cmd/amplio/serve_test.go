@@ -128,3 +128,19 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// TestLendAddr_Precedence: the lending listener follows the same flag > env >
+// config rule as --listen. It was config-only when introduced, which made it
+// the one address setting you could not set from a script.
+func TestLendAddr_Precedence(t *testing.T) {
+	for _, tc := range []struct{ flag, env, cfg, want string }{
+		{"", "", "", ""},                                             // absent everywhere = lending off
+		{"", "", "127.0.0.1:1", "127.0.0.1:1"},                       // config
+		{"", "127.0.0.1:2", "127.0.0.1:1", "127.0.0.1:2"},            // env beats config
+		{"127.0.0.1:3", "127.0.0.1:2", "127.0.0.1:1", "127.0.0.1:3"}, // flag beats both
+	} {
+		if got := addrFrom(tc.flag, tc.env, tc.cfg); got != tc.want {
+			t.Errorf("addrFrom(%q,%q,%q) = %q, want %q", tc.flag, tc.env, tc.cfg, got, tc.want)
+		}
+	}
+}

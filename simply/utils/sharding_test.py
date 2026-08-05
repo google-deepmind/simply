@@ -63,37 +63,37 @@ class ShardingTest(absltest.TestCase):
     with mock.patch.object(jax, 'process_count', return_value=3):
       with mock.patch.object(jax, 'process_index', return_value=0):
         global_pytree = sharding._local_pytrees_to_global(
-            abstract_pytree,
-            local_pytrees,
+            abstract_pytree,  # pyrefly: ignore[bad-argument-type]
+            local_pytrees,  # pyrefly: ignore[bad-argument-type]
             num_per_process=np.array([3, 2, 1]),
             global_batch_size=6,
         )
-        np.testing.assert_equal(global_pytree['a'], [1, 0, 1, 0, 0, 0])
+        np.testing.assert_equal(global_pytree['a'], [1, 0, 1, 0, 0, 0])  # pyrefly: ignore[bad-index, unsupported-operation]
         np.testing.assert_equal(
-            global_pytree['b'], [[1, 2], [3, 4], [5, 6], [0, 0], [0, 0], [0, 0]]
+            global_pytree['b'], [[1, 2], [3, 4], [5, 6], [0, 0], [0, 0], [0, 0]]  # pyrefly: ignore[bad-index, unsupported-operation]
         )
       with mock.patch.object(jax, 'process_index', return_value=1):
         global_pytree = sharding._local_pytrees_to_global(
-            abstract_pytree,
-            local_pytrees,
+            abstract_pytree,  # pyrefly: ignore[bad-argument-type]
+            local_pytrees,  # pyrefly: ignore[bad-argument-type]
             num_per_process=np.array([2, 3, 1]),
             global_batch_size=6,
         )
-        np.testing.assert_equal(global_pytree['a'], [0, 0, 1, 0, 1, 0])
+        np.testing.assert_equal(global_pytree['a'], [0, 0, 1, 0, 1, 0])  # pyrefly: ignore[bad-index, unsupported-operation]
         np.testing.assert_equal(
-            global_pytree['b'], [[0, 0], [0, 0], [1, 2], [3, 4], [5, 6], [0, 0]]
+            global_pytree['b'], [[0, 0], [0, 0], [1, 2], [3, 4], [5, 6], [0, 0]]  # pyrefly: ignore[bad-index, unsupported-operation]
         )
       with mock.patch.object(jax, 'process_index', return_value=2):
         # Truncating the end.
         global_pytree = sharding._local_pytrees_to_global(
-            abstract_pytree,
-            local_pytrees,
+            abstract_pytree,  # pyrefly: ignore[bad-argument-type]
+            local_pytrees,  # pyrefly: ignore[bad-argument-type]
             num_per_process=np.array([2, 3, 3]),
             global_batch_size=6,
         )
-        np.testing.assert_equal(global_pytree['a'], [0, 0, 0, 0, 0, 1])
+        np.testing.assert_equal(global_pytree['a'], [0, 0, 0, 0, 0, 1])  # pyrefly: ignore[bad-index, unsupported-operation]
         np.testing.assert_equal(
-            global_pytree['b'], [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [1, 2]]
+            global_pytree['b'], [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [1, 2]]  # pyrefly: ignore[bad-index, unsupported-operation]
         )
 
   def test_multihost_sharded(self):

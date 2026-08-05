@@ -15,7 +15,6 @@
 
 import dataclasses
 import json
-import os
 from typing import Sequence
 
 from absl import flags
@@ -27,12 +26,20 @@ from simply import rl_lib  # pylint: disable=unused-import
 from simply.utils import common
 from simply.utils import experiment_helper
 from simply.utils import pytree
+from simply.utils import sweep
 
 from absl import app
 
 
 _EXPERIMENT_CONFIG = flags.DEFINE_string(
     'experiment_config', None, 'Name of the experiment config.'
+)
+
+# TODO: Make this more user-friendly.
+_CONFIG_OVERLAY = flags.DEFINE_string(
+    'config_overlay',
+    '{}',
+    'Overlay to config, as nested JSON object.',
 )
 
 _SHARDING_CONFIG = flags.DEFINE_string(
@@ -155,9 +162,13 @@ def load_experiment_config():
     config = pytree.load(config_dict)
   else:
     config = config_lib.ExperimentConfigRegistry.get_config(
-        _EXPERIMENT_CONFIG.value
+        _EXPERIMENT_CONFIG.value  # pyrefly: ignore[bad-argument-type]
     )
     execute_code_patch(config)
+
+  # Apply any mods to the config.
+  config = sweep.overlay(config, json.loads(_CONFIG_OVERLAY.value))
+
   config = override_mesh_and_sharding(config)
   return config, _EXPERIMENT_DIR.value
 
@@ -178,14 +189,9 @@ def main(argv: Sequence[str]) -> None:
   run_experiment_fn(config=config, experiment_dir=experiment_dir)
 
 
-def _set_xla_dump_to_flag():
-  """Sets --xla_dump_to flag in environment."""
-  if experiment_helper.is_primary_task():
-    if dump_dir := os.getenv('XLA_DUMP_TO'):
-      xla_flags = os.getenv('XLA_FLAGS', '') + f'--xla_dump_to={dump_dir} '
-      os.environ['XLA_FLAGS'] = xla_flags
-
+# TODO: Remove this once full refactor is done.
+_set_xla_dump_to_flag = experiment_helper.set_env_based_flags
 
 if __name__ == '__main__':
-  _set_xla_dump_to_flag()
+  experiment_helper.set_env_based_flags()
   app.run(main)

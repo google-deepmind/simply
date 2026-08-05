@@ -33,9 +33,9 @@ class OptimizerTest(absltest.TestCase):
         actual: jax.typing.ArrayLike, expected: jax.typing.ArrayLike, path: str
     ):
       if hasattr(actual, 'tolist'):
-        actual = actual.tolist()
+        actual = actual.tolist()  # pyrefly: ignore[bad-assignment]
       if hasattr(expected, 'tolist'):
-        expected = expected.tolist()
+        expected = expected.tolist()  # pyrefly: ignore[bad-assignment]
       self.assertAlmostEqual(
           actual, expected, delta=delta, msg=f'Mismatch at {path}'
       )
@@ -46,7 +46,13 @@ class OptimizerTest(absltest.TestCase):
 
   def test_dump(self):
     js = pytree.dump(opt_lib.SGD())
-    self.assertEqual(js, {'__dataclass__': 'Optimizer:SGD'})
+    # `skip_updates_grad_nans` is a field on the base `Optimizer` dataclass
+    # (default False; opt-in NaN-skip wrapper around `apply`); it shows up
+    # in the dumped shape of every subclass.
+    self.assertEqual(
+        js,
+        {'__dataclass__': 'Optimizer:SGD', 'skip_updates_grad_nans': False},
+    )
 
   def test_init_step(self):
     step = opt_lib.get_init_steps()
@@ -87,6 +93,31 @@ class OptimizerTest(absltest.TestCase):
     self.assert_almost_equal(
         state, {'params': {'a': 1.0}, 'm': {'a': 0.04004}, 'steps': 0}
     )
+
+  def test_apply_with_nan_skip_reverts_state_on_nan_grad(self):
+    """NaN-containing grad: ``apply_with_nan_skip`` is a no-op.
+
+    The post-step ``m`` / ``v`` / ``params`` equal their pre-step values,
+    the returned update is exactly zero, and the ``nan_skips`` counter
+    bumps by 1. Exercises Adam (non-trivial m, v leaves) with the
+    skipper opted in.
+    """
+    opt = opt_lib.Adam(skip_updates_grad_nans=True)
+    state = opt.init({'a': jnp.array(1.0)})
+    # Run one clean step first so m / v are non-zero (makes the revert
+    # check non-trivial) and the ``nan_skips`` counter is materialised.
+    _, state = opt.apply_with_nan_skip(state, {'a': jnp.array(2.0)})
+    pre_m = float(state['m']['a'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    pre_v = float(state['v']['a'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    pre_params = float(state['params']['a'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    pre_skips = int(state['nan_skips'])  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    # Now a bad-grad step.
+    upd, new_state = opt.apply_with_nan_skip(state, {'a': jnp.array(jnp.nan)})
+    self.assertEqual(float(upd['a']), 0.0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    self.assertEqual(float(new_state['m']['a']), pre_m)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    self.assertEqual(float(new_state['v']['a']), pre_v)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    self.assertEqual(float(new_state['params']['a']), pre_params)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
+    self.assertEqual(int(new_state['nan_skips']), pre_skips + 1)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
 
   def test_schedule_backward_compatibility_constant(self):
 
