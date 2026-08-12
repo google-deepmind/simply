@@ -31,9 +31,10 @@ Defined in `utils/ragged_paged_attention.py`.
 *   **Role**: Manages the physical KV cache memory.
 *   **Structure**:
     *   `pages`: A large pre-allocated tensor storing all KV blocks
-        `[total_num_pages, page_size, n_kv_heads * 2, head_dim]`.
+        `[total_num_pages, page_size, num_kv_heads * 2 // kv_packing,
+        kv_packing, padded_per_head_dim]`.
     *   `page_indices`: Maps logical sequence positions to physical page indices
-        `[batch_size, max_num_pages_per_seq]`.
+        `[batch_size, max_num_pages_per_seq_per_shard]`.
     *   `available_page_indices`: A stack of free page indices.
 *   **Key Operations**:
     *   `allocate`: Assigns new pages to sequences that need more space.
@@ -59,7 +60,8 @@ Defined in `utils/ragged_paged_attention.py`.
 
 ### 3. `Batcher` & `SimplyService` (Orchestration)
 
-Defined in `serving/page_server.py`.
+`Batcher` is defined in `serving/page_batcher.py`, `SimplyService` in
+`serving/page_server.py`.
 
 *   **Role**: Handles the server loop, gRPC interface, and coordination between
     the model and the RPA state.
@@ -152,3 +154,118 @@ After each step, the `Batcher` checks for completion.
     *   Physical pages are returned to `available_page_indices`.
     *   The batch slot is marked as padding (`is_pad_seq=True`), making it
         available for a new request.
+
+## Sliding windows: holes, breakpoints and prefix caching
+
+A windowed layer's paged KV cache is deliberately **incomplete**, and anything
+that reads `pages` directly (prefix caching, disaggregated prefill) has to know
+the rule.
+
+### What the kernel writes back
+
+Newly issued KV is written into `pages` from the query block that runs the
+*last* query of the pass (`bq_idx == num_bq - 1`), and only over the BKV blocks
+that block visits. With `sliding_window` narrower than what a pass issues, the
+sliding-window skip starts *above* the first BKV block holding new KV, so the
+KV under it is computed, window-masked and then dropped -- a **hole** inside
+`kv_lens`.
+
+That is intentional and cheap. The only KV a later query can legitimately read
+is the window of the pass boundary, and the write-back block always covers it:
+
+> After a pass that ends at `kv_len == P`, the paged cache is correct over
+> `[P - window_size, P)`.
+
+Everything below the hole is out of window for every query that will ever run,
+so it is score-masked; the kernel additionally **zeroes V** for those keys
+(`flash_attention_step1_qk_softmax`) so that a never-written page holding
+uninitialised `NaN` cannot leak into the output via `0 * NaN = NaN` in the PV
+matmul. Global layers (`window_size is None`) have no skip and therefore no
+holes.
+
+### Pass boundaries and per-token validity
+
+A pass boundary is the only position at which a windowed layer's KV says
+anything trustworthy, and what it says is an EXTENT rather than a yes/no.
+
+*   `DecodeState.chunk_written_mask(chunk_idx, position)` returns, per token,
+    which of a chunk's KV is real when captured at `position`:
+    `[max(chunk_start, position - window_size), min(chunk_end, position))`.
+    A global layer is the same rule with an infinite window, so nothing here
+    special-cases the two kinds. It is what `written` carries in
+    `DecodeState.extract_chunk`.
+*   Captures of the same chunk taken at different boundaries cover different
+    tokens and **union** (`rpa.merge_chunk_trees`), per leaf and per token.
+    Nothing is overwritten, so the outcome does not depend on which prompt
+    ran first, and a chunk that no single pass can capture whole (any
+    `window < chunk`) can still become whole by accumulation. A capture that
+    adds nothing is skipped before the extract is even issued.
+*   Whether a position can be resumed from is **whether the cache holds a
+    resume point there**, meaning "a pass ended here", and reading it needs no
+    window arithmetic: at a pass boundary the writer has captured every chunk
+    the window touches, so coverage holds by construction, and eviction that
+    only ever truncates AT a resume point, plus union-only merging, mean it
+    cannot be lost afterwards. A node keeps its resume points in
+    `PrefixNode.resumables`, a sorted sparse list of `(position, key)` --
+    PRESENCE IS THE BIT, so there is no disabled-but-present state to test
+    for. `PrefixNode.deepest_resumable(limit)` is the one query (a `bisect`
+    over a handful of entries), and `PrefixNode.resumable_positions` lists
+    them.
+*   The batcher snapshots after **every** prefill pass. Passes are *not*
+    aligned to the chunk grid: a boundary lands wherever the scheduler's
+    token budget ran out.
+*   `Batcher._maybe_snapshot_prefix_cache` therefore walks FORWARD from a
+    persistent per-slot token frontier, building one `ChunkTile(tree, start,
+    end)` per chunk the slot has newly crossed -- the last of them ending AT
+    `position`, mid-chunk -- and handing the run to `PrefixCache.store_tiles`,
+    which navigates, creates what is missing, fills, and marks `position` as
+    a resume point. So the next prompt sharing the prefix resumes there rather
+    than at the chunk boundary below it. Offload (HBM->host) happens in the
+    batcher, via `rpa.offload_chunk_tree`, before the tile is handed over. One
+    capture per chunk is enough for every later boundary of that slot, because
+    `p >= p1` implies `p - W >= p1 - W`: the need only shrinks.
+*   Reading back is `PrefixCache.restore_chunk_tiles(tokens, start, end)`,
+    which returns the tiles to inject for the deepest resume point at or below
+    `end`; the caller `rpa.onload_chunk_tree`s each one and issues
+    `DecodeState.inject_chunk(slot_id, payload, start, end)`. That signature
+    is the whole contract: absolute token positions, the slot gains exactly
+    `end - start` tokens, and the payload is the chunk `start` falls in.
+*   The cache indexes those positions in a path-compressed (radix) trie over
+    **tokens** -- an edge is a run of tokens, a node exists at a branch point
+    or where a store split one, and children are keyed by the first token of
+    their edge. There is no hashing: a descent is a dict lookup plus one
+    vectorised edge comparison per node. Payloads stay chunk-granular, with
+    one at every chunk boundary below a stored position, because a restore
+    injects every chunk along the path.
+
+### Eviction
+
+The cache is capped in host RAM (`PrefixCache.max_bytes`) and `evict()` trims
+to it. What it ranks is **resume points, not nodes**: `PrefixCache.lru` is an
+`OrderedDict` keyed per resume point, whose value is the token prefix that
+ends there -- so the node to reclaim from is DERIVED (`navigate_to_known`) when
+the time comes and never stored, and a split or a fold leaves nothing stale.
+
+One rule, applied to whatever the order hands over, coldest first: the popped
+resume point stops being one. What that gives back depends on where it sat.
+
+*   If it was its node's deepest, the tokens above the next resume point down
+    are unreachable, and the node is cut back to that one -- or dropped whole
+    when there is none. Cuts therefore land ON a resume point, which is what
+    keeps every surviving prefix whole and restorable.
+*   If a hotter resume point sits above it, popping frees nothing yet; the
+    entry leaves the order all the same, so the loop always makes progress.
+    The consequence is worth knowing: a prompt whose deepest stop stays hot
+    has its shallow stops spent for nothing, and then goes WHOLE when the
+    deepest is finally reached.
+
+A chunk straddling a node boundary is ONE buffer shared by every node whose
+interval touches it, so freeing is by reachability, not by position -- when the
+keeper hands its straddler to a child, the walk goes straight up the ancestors
+that still end in that chunk and repoints them, and only then is the buffer
+really gone.
+
+Injected chunks that are *not* trustable (a windowed layer's older chunks) are
+stored as `ShapeDtypeStruct` placeholders and re-injected as uninitialised
+buffers; `release_for_window` evicts them before they can feed into attention,
+and the V mask makes any leftover harmless.

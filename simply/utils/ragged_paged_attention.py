@@ -307,21 +307,32 @@ class DecodeState:
     """Inject / extract granularity in tokens (`num_shards * page_size`)."""
     return self.num_shards * self.page_size
 
-  @property
-  def min_num_chunks_for_window(self) -> int:
-    """Smallest #chunks that fully cover this layer's sliding window.
+  def chunk_written_mask(
+      self,
+      chunk_idx: jax.typing.ArrayLike,
+      position: jax.typing.ArrayLike,
+  ) -> jax.Array:
+    """Which tokens of chunk `chunk_idx` hold real KV at `position`.
 
-    For a windowed layer this is `ceil(window_size / chunk_size)` --
-    that many consecutive chunks (when freshly injected) saturate the
-    layer's resident window, so any older chunks injected behind them
-    are evicted by `release_for_window` before they can feed into
-    attention. For a global layer (`window_size is None`) this is `0`
-    -- a global layer's window is effectively infinite, so no
-    re-injection of older chunks is needed to displace stale tail KV.
+    Args:
+      chunk_idx: scalar i32 -- the *logical* (absolute) chunk index.
+      position: scalar i32 -- the slot's logical length. MUST be a pass
+        boundary; mid-pass the paged cache is not in a consistent state at all.
+
+    Returns:
+      `bool[chunk_size]`, token-major, aligned with the payload's axis 0.
     """
+    chunk_size = self.chunk_size
+    chunk_idx = jnp.asarray(chunk_idx, dtype=jnp.int32)
+    position = jnp.asarray(position, dtype=jnp.int32)
+    chunk_start = chunk_idx * chunk_size
+    token_pos = chunk_start + jnp.arange(chunk_size, dtype=jnp.int32)
+    hi = jnp.minimum(chunk_start + chunk_size, position)
     if self.window_size is None:
-      return 0
-    return rpa_kernel.cdiv(self.window_size, self.chunk_size)
+      lo = chunk_start
+    else:
+      lo = jnp.maximum(chunk_start, position - self.window_size)
+    return jnp.logical_and(token_pos >= lo, token_pos < hi)
 
   @property
   def num_kv_heads(self) -> int:
@@ -624,35 +635,40 @@ class DecodeState:
       self,
       slot_id: jax.typing.ArrayLike,
       pages_payload: jax.Array,
+      start: jax.typing.ArrayLike | None = None,
+      end: jax.typing.ArrayLike | None = None,
   ) -> Self:
-    """Writes `num_shards * page_size` tokens of pre-formed KV for `slot_id`.
+    """Writes tokens `[start, end)` of one chunk of pre-formed KV for `slot_id`.
 
-    The payload is token-major: shape `(num_shards * page_size,
-    full_heads, kv_packing, head_dim)`. The leading dim is sharded
-    along the seq axis, so each seq-shard sees its own `page_size`
-    tokens (== one page) of KV.
+    THE RANGE IS THE WHOLE CONTRACT, and it is in ABSOLUTE token positions:
+    `start` is where the slot stands, `end` is where it lands, and the
+    payload is the chunk `start` falls in. Everything else is read off it:
 
-    Implementation:
-      1. `allocate(q_lens)` reserves `num_shards` pages for
-         `slot_id` (one per shard; advances `kv_lens` and updates
-         `page_indices`).
-      2. A `shard_map` performs one `.at[].set()` (== DUS) per
-         shard, writing that shard's page into its local `pages`
-         buffer at the shard-local column the precondition below pins
-         down. DUS has zero HLO temp scratch (vs. ~2x pages_bytes for
-         the equivalent batched scatter), keeping the inject program's
-         HBM footprint negligible.
-
-    Pre-condition: `kv_lens[slot_id]` (pre-call) is a multiple of
-    `num_shards * page_size` so every shard's freshly-allocated
-    column lines up.
+      * the slot gains exactly `end - start` tokens -- no `kv_lens` remainder
+        to reason about, and no difference between an append and a rewrite;
+      * the page written is `start`'s chunk, translated from the logical grid
+        to the physical one by whatever the window has evicted -- the same
+        translation :meth:`extract_chunk` does in reverse;
+      * only the tokens INSIDE the range are written. What lies below `start`
+        in that page is what the slot computed ITSELF, and it stays: a
+        mid-chunk restore no longer overwrites live KV with a cached copy of
+        it, which also means a payload with holes down there (a windowed
+        capture) can no longer damage anything.
 
     Args:
       slot_id: scalar i32 — the batch slot to inject into.
       pages_payload: `[num_shards * page_size, full_heads, kv_packing,
-        head_dim]` — the pre-paged KV bytes to insert, in token-major
-        order. Sharded `(seq, head, None, None)` so each shard
-        contributes only the `page_size` tokens (one page) it owns.
+        head_dim]` — the pre-paged KV bytes to insert, in token-major order
+        over the WHOLE chunk `start` falls in. Sharded `(seq, head, None,
+        None)` so each shard contributes only the `page_size` tokens (one
+        page) it owns.
+      start: scalar i32 — first token position to write; MUST be the slot's
+        logical length, since that is what makes it the boundary between what
+        the slot has and what the payload brings. `None` (default) means the
+        slot's current frontier, `kv_lens`.
+      end: scalar i32 — one past the last token position to write, and the
+        slot's new length. Must lie inside `start`'s chunk, since that is the
+        chunk the payload holds. `None` (default) means that chunk's end.
 
     Returns:
       Updated decode state.
@@ -667,35 +683,29 @@ class DecodeState:
       )
     chunk_size = self.num_shards * self.page_size
     bs = self.kv_lens.shape[0]
-    # Recycle any pages that have fallen outside the sliding window
-    # *before* allocating this chunk, mirroring the decode path
-    # (`self.release_for_window().allocate(q.lens)` in
-    # `update_decode_state_and_compute_attn`). Doing it here keeps
-    # `inject_chunk` self-contained: a cached prefix longer than the
-    # window can be injected chunk-by-chunk without the page pool ever
-    # overflowing, and callers don't have to remember to release. It
-    # also compacts `page_indices`, so `kv_lens`, `base_col`, and
-    # `allocate` below all operate on the same (post-release) layout.
-    # No-op when `window_size is None` (all-global model).
     released = self.release_for_window()
-    # Round `kv_lens` up to the next chunk boundary and append one chunk:
-    # the chunk just injected ends at `(kv_lens // chunk_size + 1) *
-    # chunk_size`. (When `kv_lens` is already chunk-aligned — the
-    # precondition — this is exactly `kv_lens + chunk_size`.)
-    after_len = (released.kv_lens[slot_id] // chunk_size + 1) * chunk_size
-    num_inject_tokens = after_len - released.kv_lens[slot_id]
-    q_lens = (
-        jnp.zeros(bs, dtype=jnp.int32).at[slot_id].set(num_inject_tokens)
+    kv_len = released.kv_lens[slot_id]
+    start_int = (
+        kv_len if start is None else jnp.asarray(start, dtype=jnp.int32)
     )
+    chunk_start = (start_int // chunk_size) * chunk_size
+    end_int = (
+        chunk_start + chunk_size
+        if end is None
+        else jnp.asarray(end, dtype=jnp.int32)
+    )
+    q_lens = jnp.zeros(bs, dtype=jnp.int32).at[slot_id].set(end_int - start_int)
     new_state = released.allocate(q_lens)
-    # Exploit the precondition that the post-release `kv_lens[slot_id]`
-    # is a multiple of `num_shards * page_size`: `allocate` therefore
-    # wrote into exactly one local column on each shard — the SAME
-    # column index on every shard, namely `base_col`. Each shard's
-    # DUS target is the shard-local page id at that column, read
-    # directly from the (post-release, compacted) `page_indices` with
-    # no global-id math.
-    base_col = released.kv_lens[slot_id] // chunk_size
+    # LOGICAL -> PHYSICAL. `start_int` counts every token the slot has ever
+    # held; `kv_len` counts the ones still resident. The difference is what
+    # `release_for_window` has dropped -- always whole chunks -- so taking it
+    # off the logical chunk start gives the column this page lives in.
+    # (:meth:`extract_chunk` maps a logical chunk index the same way.)
+    base_col = (chunk_start - (start_int - kv_len)) // chunk_size
+    # Where the range falls INSIDE the chunk: offsets `[lo, hi)` of the
+    # payload's token axis, which is the chunk's own grid.
+    lo = start_int - chunk_start
+    hi = end_int - chunk_start
     pages_spec = js.PartitionSpec(
         self.seq_partition, None, self.head_partition, None, None
     )
@@ -714,21 +724,47 @@ class DecodeState:
             payload_spec,         # pages_payload (page_size tokens per shard)
             js.PartitionSpec(),   # page_indices (replicated)
             js.PartitionSpec(),   # base_col (replicated scalar)
+            js.PartitionSpec(),   # lo (replicated scalar)
+            js.PartitionSpec(),   # hi (replicated scalar)
         ),
         out_specs=pages_spec,
         check_vma=False,
     )
-    def _scatter_local(local_pages, local_payload, page_indices, base_col):
+    def _scatter_local(
+        local_pages, local_payload, page_indices, base_col, lo, hi
+    ):
       # `local_payload` has shape (page_size, full_heads, kvp, hd) —
       # exactly one page's worth, matching `local_pages`' per-page
       # shape (which is `local_pages.shape[1:]`).
-      # `.at[].set()` with a single dynamic index lowers to DUS —
-      # zero HLO temp scratch.
       local_pid = page_indices[slot_id, base_col]
-      return local_pages.at[local_pid].set(local_payload)
+      # WHICH OF THIS SHARD'S TOKENS THE RANGE COVERS. The chunk is split
+      # token-major, so shard `s` holds its tokens `[s * page_size, (s + 1) *
+      # page_size)`; a shard entirely outside `[lo, hi)` keeps its page as it
+      # stands. Selecting rather than slicing keeps the shapes static (both
+      # bounds are traced), and costs one page read against the DUS.
+      shard_id = (
+          0
+          if self.seq_partition is None
+          else jax.lax.axis_index(self.seq_partition)
+      )
+      offsets = shard_id * self.page_size + jnp.arange(
+          self.page_size, dtype=jnp.int32
+      )
+      inside = jnp.logical_and(offsets >= lo, offsets < hi)
+      merged = jnp.where(
+          inside.reshape((-1,) + (1,) * (local_payload.ndim - 1)),
+          local_payload,
+          local_pages[local_pid],
+      )
+      return local_pages.at[local_pid].set(merged)
 
     new_pages = _scatter_local(
-        new_state.pages, pages_payload, new_state.page_indices, base_col
+        new_state.pages,
+        pages_payload,
+        new_state.page_indices,
+        base_col,
+        lo,
+        hi,
     )
     return dataclasses.replace(new_state, pages=new_pages)
 
@@ -757,13 +793,18 @@ class DecodeState:
         base_col = chunk_idx - (position - kv_lens) // chunk_size
 
     For an all-global layer `kv_lens == position`, so `base_col ==
-    chunk_idx`. A request for an evicted chunk has `base_col < 0`; the
-    returned entry has `available=False` in that case and the payload
-    bytes are unspecified (the shard_map reads physical column
-    `base_col` anyway, which is past the start of `page_indices` and
-    yields stale page ids). Callers must check `available` before
-    relying on the bytes, or call :meth:`SnapshotChunkLeaf.offload` which
-    drops the bytes when `available=False`.
+    chunk_idx`. A request for an evicted chunk reads physical column
+    `base_col < 0`, which is past the start of `page_indices` and yields
+    stale page ids, so its payload bytes are unspecified -- but its mask is
+    empty, so nothing points at them.
+
+    **Validity (windowed layers).** Residency is necessary but not
+    sufficient: the kernel only writes newly issued KV back for the BKV
+    blocks the LAST query block visits, so a pass issuing more than
+    `window_size` tokens leaves HOLES below `position - window_size`. What
+    is real is therefore the per-token mask of :meth:`chunk_written_mask`,
+    and `position` MUST be a pass boundary -- mid-pass the paged cache is
+    not in a consistent state at all.
 
     Implementation: a `shard_map` performs one `page_indices` lookup
     + one `dynamic_slice` (= DUS-read) per shard, returning the page
@@ -774,23 +815,26 @@ class DecodeState:
     Args:
       slot_id: scalar i32 — the batch slot to read from.
       chunk_idx: scalar i32 — the *logical* (absolute) chunk index.
-      position: scalar i32 — the slot's logical length (number of tokens
-        seen so far), used to recover the evicted-chunk offset.
+      position: scalar i32 — the slot's logical length (number of tokens seen so
+        far), used to recover the evicted-chunk offset.
 
     Returns:
       A :class:`SnapshotChunkLeaf` with `payload` shape
       `[num_shards * page_size, full_heads, kv_packing, head_dim]`
       sharded `(seq, head, None, None)` — same shape and sharding as
-      the `pages_payload` argument of :meth:`inject_chunk` — and
-      `available` a scalar `bool` array that is `True` iff the
-      requested chunk is still resident in this layer's window
-      (`base_col >= 0`).
+      the `pages_payload` argument of :meth:`inject_chunk` — and `written` the
+      per-token mask of :meth:`chunk_written_mask`.
     """
     evicted_chunks = (
         jnp.asarray(position, dtype=jnp.int32) - self.kv_lens[slot_id]
     ) // self.chunk_size
     base_col = jnp.asarray(chunk_idx, dtype=jnp.int32) - evicted_chunks
-    available = base_col >= 0
+    # No residency term here (`base_col >= 0`): `written` is purely
+    # positional, and that is sound because the resident region always
+    # CONTAINS the window -- `release_for_window` frees whole chunk-aligned
+    # columns and never one inside it, so a non-empty mask implies the chunk
+    # is still there. `ResidencyGuardTest` is what holds that up.
+    written = self.chunk_written_mask(chunk_idx, position)
     pages_spec = js.PartitionSpec(
         self.seq_partition, None, self.head_partition, None, None
     )
@@ -816,7 +860,7 @@ class DecodeState:
       return local_pages[local_pid]
 
     payload = _gather_local(self.pages, self.page_indices, base_col)
-    return SnapshotChunkLeaf(payload=payload, available=available)
+    return SnapshotChunkLeaf(payload=payload, written=written)
 
   @property
   def page_manage_key(self) -> Hashable:
@@ -1144,77 +1188,77 @@ class DecodeState:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SnapshotChunkLeaf:
-  """One chunk's KV payload for one DecodeState leaf, with availability flag.
+  """One chunk's KV for one DecodeState leaf, with a PER-TOKEN written mask.
 
   Returned by :meth:`DecodeState.extract_chunk` (one per leaf) and
-  :meth:`SamplingState.extract_chunk` (a pytree, one leaf per
-  DecodeState leaf). The :meth:`offload` / :meth:`onload` pair converts
-  between this carrier form and the bare payload representation the
-  host-RAM prefix cache stores.
+  :meth:`SamplingState.extract_chunk` (a pytree, one leaf per DecodeState
+  leaf). :meth:`offload` converts one leaf to the host-resident
+  :class:`StoredChunkLeaf` form the prefix cache keeps;
+  :func:`offload_chunk_tree`
+  converts a whole tree of them. :meth:`onload` converts a stored payload back.
 
   Fields
     payload: the chunk's KV bytes — a `jax.Array` of shape
-      `[num_shards * page_size, full_heads, kv_packing, head_dim]`
-      sharded `(seq, head, None, None)`. Always concrete-on-device
-      when produced by `extract_chunk` (even when `available=False`,
-      the bytes are garbage but the shape/sharding are real, which is
-      what `offload` uses to build the abstract form).
-    available: a scalar `bool` array. `True` iff the requested chunk
-      is still resident in this layer's sliding window
-      (`base_col >= 0` in :meth:`DecodeState.extract_chunk`).
-      Aliased to `False` for chunks evicted by `release_for_window`.
+      `[num_shards * page_size, full_heads, kv_packing, head_dim]` sharded
+      `(seq, head, None, None)`. Token-major: axis 0 lines up with `written`.
+      Always concrete on device, even where `written` is `False` (the bytes are
+      garbage there, but the shape / sharding are what `offload` needs).
+    written: `bool[num_shards * page_size]` -- which tokens of this chunk hold
+      real KV in `payload`.
   """
 
   payload: jax.Array
-  available: jax.Array
+  written: jax.Array
 
-  def offload(self) -> jax.Array | jax.ShapeDtypeStruct:
-    """Returns the offloaded payload only (no `available` bit).
+  def offload(self) -> 'StoredChunkLeaf':
+    """Returns a host-resident copy of this leaf (inverse of :meth:`onload`).
 
-    * `available=True`  — moves `payload` HBM->host via
-      `jax.device_put` to the same sharding but with `memory_kind`
-      switched to host memory (`pinned_host`, falling back to
-      `unpinned_host` on platforms without pinned host memory). The
-      shard layout is preserved exactly, so every host copies only
-      its own addressable shard — host-local, no collective op.
-    * `available=False` — returns a `jax.ShapeDtypeStruct` describing
-      `payload`'s shape / dtype / sharding (the bytes would be
-      garbage — stale post-eviction HBM — so we don't pay to copy or
-      store them). :meth:`onload` materialises an uninitialised
-      buffer of this shape on the inject path.
-
-    Host-side branching on `available` forces a device->host transfer
-    of the (scalar) bool, so this must NOT be called inside a
-    jit-trace.
+    * any written token — moves `payload` HBM->host via `jax.device_put` to the
+      same sharding with `memory_kind` switched to host memory (`pinned_host`,
+      falling back to `unpinned_host`). The shard layout is preserved exactly,
+      so every host copies only its own addressable shard — host-local, no
+      collective op.
+    * no written token — stores a `jax.ShapeDtypeStruct` instead of the bytes
+      (they are all garbage, so we do not pay to copy or keep them).
+      :meth:`onload` materialises an uninitialised buffer of that shape.
     """
-    if not bool(self.available):
-      return jax.ShapeDtypeStruct(
-          self.payload.shape,
-          self.payload.dtype,
-          sharding=self.payload.sharding,
+    written = np.asarray(self.written, dtype=bool)
+    assert written.shape == (self.payload.shape[0],), (
+        f'mask {written.shape} does not match the payload token axis'
+        f' {self.payload.shape[0]}'
+    )
+    if not written.any():
+      return StoredChunkLeaf(
+          payload=jax.ShapeDtypeStruct(
+              self.payload.shape,
+              self.payload.dtype,
+              sharding=self.payload.sharding,
+          ),
+          written=written,
       )
     src_sharding = self.payload.sharding
     try:
       host_sharding = src_sharding.with_memory_kind('pinned_host')
     except ValueError:
       host_sharding = src_sharding.with_memory_kind('unpinned_host')
-    return jax.device_put(self.payload, host_sharding)
+    return StoredChunkLeaf(
+        payload=jax.device_put(self.payload, host_sharding), written=written
+    )
 
   @staticmethod
   def onload(payload: jax.Array | jax.ShapeDtypeStruct) -> jax.Array:
     """Returns the on-device payload (inverse of :meth:`offload`).
 
     Args:
-      payload: The payload to onload. Can be either:
-        * A host-resident `jax.Array`: moves it host->HBM via `jax.device_put`
-          to the same sharding with `memory_kind` switched to `device`.
-        * A `jax.ShapeDtypeStruct` (offload-time `available=False`):
-          materializes a fresh `jax.lax.empty` buffer of the described
-          shape/dtype, placed on the described sharding. The bytes are
-          uninitialized; safe ONLY when the caller's lookup rule guarantees a
-          real tail of `min_num_chunks_for_window` complete chunks follows, so
-          `release_for_window` evicts these pages before they can feed into
-          attention.
+      payload: The payload to onload. Can be either: * A host-resident
+        `jax.Array`: moves it host->HBM via `jax.device_put` to the same
+        sharding with `memory_kind` switched to `device`. * A
+        `jax.ShapeDtypeStruct` (nothing written at offload time): materializes a
+        fresh `jax.lax.empty` buffer of the described shape/dtype, placed on the
+        described sharding. The bytes are uninitialized; safe because a restore
+        only ever resumes where the accumulated masks cover what the resuming
+        query reads, and `release_for_window` evicts the rest before it can feed
+        into attention.
     """
     if isinstance(payload, jax.ShapeDtypeStruct):
       return jax.device_put(
@@ -1224,6 +1268,172 @@ class SnapshotChunkLeaf:
     return jax.device_put(
         payload, payload.sharding.with_memory_kind('device')
     )
+
+
+def _merge_host_arrays(
+    old: jax.Array, new: jax.Array, add: np.ndarray
+) -> jax.Array:
+  """Returns `where(add, new, old)` without leaving host memory.
+
+  Both inputs are host-resident with the same (host `memory_kind`) sharding.
+  Rebuilding shard by shard keeps every byte on the host: a shard with nothing
+  to add is REUSED as-is, and a shard that does gain tokens is merged in numpy
+  and put back into the same single-device host sharding. Measured on a TPU
+  host at the production chunk shape, this costs ~1 ms per touched shard and
+  ~0 for the rest; a device round-trip would be two collectives plus a
+  compute.
+
+  Args:
+    old: the accumulated payload.
+    new: the fresh capture.
+    add: `bool[chunk_size]` -- tokens `new` contributes (already masked to what
+      `old` was missing).
+
+  Returns:
+    A host-resident array with `old`'s shape, sharding and memory kind.
+  """
+  broadcast = (slice(None),) + (None,) * (old.ndim - 1)
+  out_shards = []
+  for shard_old, shard_new in zip(
+      old.addressable_shards, new.addressable_shards
+  ):
+    token_slice = shard_old.index[0]
+    lo = token_slice.start or 0
+    hi = token_slice.stop if token_slice.stop is not None else old.shape[0]
+    segment = add[lo:hi]
+    if not segment.any():
+      out_shards.append(shard_old.data)  # untouched: no copy at all
+      continue
+    merged = np.where(
+        segment[broadcast],
+        np.asarray(shard_new.data),
+        np.asarray(shard_old.data),
+    )
+    out_shards.append(jax.device_put(merged, shard_old.data.sharding))
+  return jax.make_array_from_single_device_arrays(
+      old.shape, old.sharding, out_shards
+  )
+
+
+@dataclasses.dataclass(frozen=True)
+class StoredChunkLeaf:
+  """One chunk's KV for one leaf, host-resident, with its written mask.
+
+  Deliberately carries NO window: the mask is an absolute per-token fact,
+  while a window belongs to the model about to read it back
+  (`test_a_stored_leaf_carries_no_window`).
+  """
+
+  payload: jax.Array | jax.ShapeDtypeStruct
+  written: np.ndarray
+
+  @property
+  def nbytes(self) -> int:
+    """Host RAM held by this leaf (a placeholder holds none)."""
+    return self.payload.nbytes if isinstance(self.payload, jax.Array) else 0
+
+  @property
+  def is_full(self) -> bool:
+    """Whether every token of the chunk is written."""
+    return bool(self.written.all())
+
+  def covers(self, lo: int, hi: int) -> bool:
+    """Whether tokens `[lo, hi)` (chunk-relative) are all written.
+
+    Args:
+      lo: first token index into the chunk.
+      hi: one past the last token index; `hi <= lo` is vacuously covered.
+
+    Returns:
+      Whether every token in the range is written.
+    """
+    if hi <= lo:
+      return True
+    return bool(self.written[lo:hi].all())
+
+  def merge(self, new: Self) -> Self:
+    """Unions two captures of the same chunk for the same leaf."""
+    add = np.logical_and(new.written, np.logical_not(self.written))
+    if not add.any():
+      return self
+    if not self.written.any():
+      return new  # nothing to preserve: take the new capture whole
+    merged_written = np.logical_or(self.written, new.written)
+    if not isinstance(new.payload, jax.Array):
+      raise TypeError(
+          f'Expected new.payload to be a jax.Array when add.any() is True, got'
+          f' {type(new.payload).__name__}'
+      )
+    if not isinstance(self.payload, jax.Array):
+      raise TypeError(
+          f'Expected self.payload to be a jax.Array when self.written.any() is'
+          f' True, got {type(self.payload).__name__}'
+      )
+    return dataclasses.replace(
+        self,
+        payload=_merge_host_arrays(self.payload, new.payload, add),
+        written=merged_written,
+    )
+
+
+def merge_chunk_trees(
+    old_tree: common.PyTree, new_tree: common.PyTree
+) -> common.PyTree:
+  """Leaf-wise :meth:`StoredChunkLeaf.merge` over two stored chunk trees.
+
+  Args:
+    old_tree: the stored tree.
+    new_tree: the freshly offloaded tree.
+
+  Returns:
+    The merged stored tree.
+  """
+  is_leaf = lambda x: isinstance(x, StoredChunkLeaf)
+  old_leaves = jax.tree_util.tree_leaves(old_tree, is_leaf=is_leaf)
+  new_leaves = jax.tree_util.tree_leaves(new_tree, is_leaf=is_leaf)
+  merged_leaves = [
+      old_leaf.merge(new_leaf)
+      for old_leaf, new_leaf in zip(old_leaves, new_leaves, strict=True)
+  ]
+  structure = jax.tree_util.tree_structure(old_tree, is_leaf=is_leaf)
+  return jax.tree_util.tree_unflatten(structure, merged_leaves)
+
+
+def stored_tree_nbytes(stored_tree: common.PyTree) -> int:
+  """Returns the host RAM a stored chunk tree holds."""
+  is_leaf = lambda x: isinstance(x, StoredChunkLeaf)
+  return sum(
+      leaf.nbytes
+      for leaf in jax.tree_util.tree_leaves(stored_tree, is_leaf=is_leaf)
+  )
+
+
+def onload_chunk_tree(stored_tree: common.PyTree) -> common.PyTree:
+  """Returns the on-device payload tree for `inject_chunk`."""
+  is_leaf = lambda x: isinstance(x, StoredChunkLeaf)
+  return jax.tree_util.tree_map(
+      lambda leaf: SnapshotChunkLeaf.onload(leaf.payload),
+      stored_tree,
+      is_leaf=is_leaf,
+  )
+
+
+def offload_chunk_tree(leaf_tree: common.PyTree) -> common.PyTree:
+  """Offloads a whole `SnapshotChunkLeaf` tree to host RAM.
+
+  Args:
+    leaf_tree: a pytree of :class:`SnapshotChunkLeaf` (HBM-resident), e.g. the
+      result of :meth:`SamplingState.extract_chunk`.
+
+  Returns:
+    The same tree shape with each leaf replaced by a :class:`StoredChunkLeaf`.
+  """
+  is_leaf = lambda x: isinstance(x, SnapshotChunkLeaf)
+  return jax.tree_util.tree_map(
+      lambda leaf: leaf.offload(),
+      leaf_tree,
+      is_leaf=is_leaf,
+  )
 
 
 @jax.tree_util.register_dataclass
@@ -1331,23 +1541,6 @@ class SamplingState:
     return self.num_shards * self.page_size
 
   @functools.cached_property
-  def min_num_chunks_for_window(self) -> int:
-    """Largest `DecodeState.min_num_chunks_for_window` across all leaves.
-
-    Reduces with `max` (not `reduce_same`): different layers may have
-    different `window_size`s in a mixed model (e.g. global + windowed),
-    and what matters for the prefix-cache's lookup rule is the
-    *deepest* windowed tail any layer needs to be fully covered. A
-    layer with no sliding window contributes `0` to the max.
-    Returns `0` if every layer is global (no windowed coverage
-    requirement).
-    """
-    per_leaf = DecodeState.attrs_from_tree(
-        self.decode_state, ['min_num_chunks_for_window']
-    )['min_num_chunks_for_window']
-    return max(per_leaf) if per_leaf else 0
-
-  @functools.cached_property
   def is_pad_seq(self) -> jax.Array:
     """This sequence is a padding sequence, in [batch, 1]."""
     return self.input_lens == 0
@@ -1451,6 +1644,14 @@ class SamplingState:
     `lens - input_lens >= max_decode_steps` rather than `reached_eos`).
     Derived per-slot from `~self.reached_eos`, which is shape `[batch]`.
 
+    PROMPT REGION OF `logprobs` / `scores`. Only the DECODED positions
+    (`>= input_len`) are meaningful. Prefill runs with `skip_logits=True` and
+    writes zeros below that; a prefix-cache restore
+    (:meth:`inject_chunk`) writes nothing at all, so with caching on those
+    positions hold whatever `jax.lax.empty` left -- possibly NaN. Callers
+    that feed these arrays anywhere numeric (e.g. an RL trainer's per-token
+    logprobs) must slice or mask the prompt region rather than assume zeros.
+
     Args:
       mask: Boolean per-slot mask selecting which slots to materialise. Shape
         `[batch]`; typically `completed_mask` from the batcher.
@@ -1490,6 +1691,82 @@ class SamplingState:
         sampling_state, rank=sampling_state.rank_inv_indices
     )
 
+  @jax.named_call
+  def inject_chunk(
+      self,
+      slot_id: jax.typing.ArrayLike,
+      payload: common.PyTree,
+      start: jax.typing.ArrayLike | None = None,
+      end: jax.typing.ArrayLike | None = None,
+  ) -> Self:
+    """Writes one cached chunk of KV for `slot_id` and advances `position`.
+
+    The write counterpart of :meth:`extract_chunk`, and the whole body of the
+    page batcher's inject program. Each DecodeState leaf gets its own
+    payload (`[num_shards * page_size, full_heads, kv_packing, head_dim]`,
+    sharded `(seq, head, None, None)`) written by
+    :meth:`DecodeState.inject_chunk`, which is self-contained: it releases
+    sliding-window pages *before* allocating the chunk (mirroring the decode
+    path), so a cached prefix longer than the window can be injected chunk by
+    chunk without the page pool ever overflowing. Only `kv_lens` / `pages`
+    are windowed; `position` tracks the true logical length and is advanced
+    here.
+
+    `position` is *set* to `end` -- the range says where the slot lands, so
+    there is nothing to add up and nothing to round. `position` is also what
+    `start` must be: the leaves are windowed to different lengths, and the
+    logical position is the one thing they agree on, so it is the frame the
+    range is expressed in and each leaf translates it to its own columns.
+
+    Args:
+      slot_id: scalar i32 -- the batch slot to inject into.
+      payload: pytree with the same structure as `self.decode_state`, each
+        DecodeState leaf replaced by that leaf's chunk payload (the `onload`-ed
+        form of what :meth:`extract_chunk` produced).
+      start: scalar i32 -- first token position to write; MUST be the slot's
+        `position`, which is the default when `None`.
+      end: scalar i32 -- one past the last token position to write, and the
+        slot's new `position`. `None` (default) means the end of `start`'s
+        chunk.
+
+    Returns:
+      The updated `SamplingState`. `token_logprobs` / `token_scores` are NOT
+      written for the restored span: unlike the prefill pass this replaces
+      (which zeroes them via `skip_logits=True`), the injected positions keep
+      whatever uninitialised bytes the buffers held. Positions below
+      `input_len` are therefore UNDEFINED once anything has been injected --
+      see :meth:`get`.
+    """
+    chunk_size = self.chunk_size
+    start_int = (
+        self.position[slot_id]
+        if start is None
+        else jnp.asarray(start, dtype=jnp.int32)
+    )
+    end_int = (
+        (start_int // chunk_size + 1) * chunk_size
+        if end is None
+        else jnp.asarray(end, dtype=jnp.int32)
+    )
+    is_leaf = lambda x: isinstance(x, DecodeState)
+    new_decode_state = jax.tree_util.tree_map(
+        lambda ds, p: ds.inject_chunk(slot_id, p, start_int, end_int),
+        self.decode_state,
+        payload,
+        is_leaf=is_leaf,
+    )
+    new_position = self.position.at[slot_id].set(end_int)
+    # DELIBERATELY not touching `token_logprobs` / `token_scores`: those slots
+    # are meaningful for DECODED tokens only, and writing them here would cost
+    # two `jnp.where`s over the whole `[batch, max_seq_len]` f32 buffers on
+    # every inject dispatch. See :meth:`get` for the contract this hands to
+    # callers.
+    return dataclasses.replace(
+        self,
+        decode_state=new_decode_state,
+        position=new_position,
+    )
+
   def extract_chunk(self, slot_id: int, chunk_idx: int) -> common.PyTree:
     """Extracts the `chunk_idx`-th *logical* chunk of KV for `slot_id`.
 
@@ -1502,30 +1779,22 @@ class SamplingState:
     `page_indices` column (accounting for sliding-window eviction) inside
     :meth:`DecodeState.extract_chunk`, using `self.position[slot_id]` (the
     logical length) which the windowed `DecodeState` no longer carries.
-    A leaf reports `available=False` for chunks evicted out of its
-    sliding window; callers MUST treat the corresponding payload bytes
-    as unspecified (or call :meth:`SnapshotChunkLeaf.offload` which drops
-    them).
 
     The caller is expected to only request chunks whose KV has been
-    computed (`chunk_idx < position // chunk_size`); requesting a
-    chunk past that frontier returns uninitialised bytes regardless of
-    `available`.
+    computed (`chunk_idx < position // chunk_size`); a chunk past that
+    frontier returns uninitialised bytes with an all-false mask.
 
     Args:
       slot_id: scalar i32 — the batch slot.
       chunk_idx: scalar i32 — the *logical* chunk index.
 
     Returns:
-      A pytree with the same structure as `self.decode_state`, with
-      each DecodeState leaf replaced by the leaf's
+      A pytree with the same structure as `self.decode_state`, with each
+      DecodeState leaf replaced by that leaf's
       :meth:`DecodeState.extract_chunk` result (a
-      :class:`SnapshotChunkLeaf`). No top-level reduction is performed;
-      callers can AND-reduce the per-leaf `available`s host-side to
-      decide whether to cache the chunk (see
-      :meth:`SnapshotChunkLeaf.offload`). The corresponding input tokens
-      are not returned: callers already hold them host-side and use
-      them as the cache key.
+      :class:`SnapshotChunkLeaf`: payload plus its per-token `written` mask).
+      The input tokens are not returned: callers already hold them host-side,
+      and the cache indexes on them.
 
     Raises:
       TypeError: if any leaf in `decode_state` is not a `DecodeState`.
@@ -1550,7 +1819,15 @@ class SamplingState:
   @jax.jit(static_argnames=('capacity', 'prefill'))
   @jax.named_call
   def issue_lens(self, capacity: int, prefill: bool = False) -> jax.Array:
-    """Clamps the `prefill`-selected desired issue lens to `capacity`."""
+    """Clamps the `prefill`-selected desired issue lens to `capacity`.
+
+    Args:
+      capacity: total number of tokens the pass may issue across all slots.
+      prefill: select the prefill-flavoured desired issue lens.
+
+    Returns:
+      Per-slot token counts for this pass, `i32[batch]`.
+    """
     desired_issue_lens = self.desired_issue_lens(prefill)
     sorted_desired_issue_lens = desired_issue_lens[self.rank_indices]
 
@@ -1689,9 +1966,27 @@ class SamplingState:
       prefill: bool = False,
       skip_logits: bool = False,
   ) -> Self:
-    """Executes a mixed step (prefill+decode)."""
+    """Executes a mixed step (prefill+decode).
+
+    Args:
+      forward_fn: the model's forward function.
+      params: the model parameters pytree.
+      extra_inputs: extra inputs threaded into `forward_fn`.
+      max_num_issue_tokens: upper bound on tokens issued by this pass.
+      temperature: sampling temperature for the issued token.
+      top_k: sampling top-k for the issued token (`-1` disables).
+      top_p: sampling top-p for the issued token.
+      scoring_temperature: temperature used for the returned token scores.
+      scoring_top_k: top-k used for the returned token scores (`-1` disables).
+      scoring_top_p: top-p used for the returned token scores.
+      prefill: whether this is a prefill pass (as opposed to pure decode).
+      skip_logits: skip the logits computation; only written with `prefill`.
+
+    Returns:
+      The updated `SamplingState`.
+    """
     if skip_logits and not prefill:
-      raise ValueError('skip_logits is only valid for prefill')
+      raise ValueError('skip_logits is only written for prefill')
     # User should guarantee self.is_continuable is True.
     # logits: [batch_size, 1, vocab_size]
     ragged_issue_tokens = self.ragged_issue_tokens(

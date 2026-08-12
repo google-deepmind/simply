@@ -245,7 +245,7 @@ class EmbeddingLinearTest(parameterized.TestCase):
     params = embedding_linear.init(prng_key)
     self.assertIn('w', params)  # pyrefly: ignore[bad-argument-type]
     self.assertNotIn('embed', params)  # pyrefly: ignore[bad-argument-type]
-    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
+    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
 
   def test_embedding_linear_untied_embedding(self):
     embedding_linear = module.EmbeddingLinear(
@@ -255,8 +255,8 @@ class EmbeddingLinearTest(parameterized.TestCase):
     params = embedding_linear.init(prng_key)
     self.assertIn('w', params)  # pyrefly: ignore[bad-argument-type]
     self.assertIn('embed', params)  # pyrefly: ignore[bad-argument-type]
-    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
-    self.assertEqual(params['embed'].shape, (10, 4))  # pyrefly: ignore[bad-index, unsupported-operation]
+    self.assertEqual(params['w'].shape, (10, 4))  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
+    self.assertEqual(params['embed'].shape, (10, 4))  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
 
   @parameterized.parameters(True, False)
   def test_embedding_linear_embed(self, use_lookup):

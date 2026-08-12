@@ -13,16 +13,15 @@
 # limitations under the License.
 """Batcher for the Simply gRPC server."""
 
-# pyrefly: ignore-all-errors
-
 import asyncio
-from collections.abc import Callable, MutableSequence
+from collections.abc import Callable
 import dataclasses
 import functools
+import math
 import queue
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 
 from absl import logging
 import grpc
@@ -46,8 +45,6 @@ from simply.utils import tokenization
 
 
 PyTree = core_common.PyTree
-
-
 SimplyServiceResponse = serving_common.SimplyServiceResponse
 
 
@@ -57,7 +54,9 @@ class Batcher:
 
   config: config_lib.BaseExperimentConfig
   lm_format: lm_format_lib.LMFormat
-  state: PyTree = dataclasses.field(default_factory=dict)
+  # A MAPPING, not a bare `PyTree`: everything here is `state['params']` /
+  # `state['sampling_state']`, which a `PyTree` union cannot be indexed into.
+  state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
   max_queue_size: int = 4096
   max_queue_timeout: float = 1.0  # seconds
@@ -85,14 +84,12 @@ class Batcher:
   max_num_issue_tokens: int = 0
 
   # ----- Prefix cache configuration -----
-  # When True, the batcher consults a KV prefix cache on each push and
-  # writes back snapshots of in-flight sequences after every device
-  # round trip. The cache is held in **host (CPU) RAM** in-process
-  # (offloaded from HBM) -- NOT persisted to disk. The cache key for
-  # the k-th chunk is a deterministic hash of the first
-  # `(k + 1) * chunk_size` input tokens, so different prompts that share
-  # a prefix share their first KV chunks. False (default) disables the
-  # prefix cache entirely.
+  # When True, the batcher restores the deepest cached prefix into every
+  # prefilling slot and snapshots what each prefill pass made real. The
+  # cache is held in **host (CPU) RAM** in-process (offloaded from HBM) --
+  # NOT persisted to disk -- and is indexed by the prompt TOKENS in a
+  # radix trie, so prompts that share a prefix share its KV chunks. False
+  # (default) disables the prefix cache entirely.
   enable_prefix_caching: bool = False
 
   @functools.cached_property
@@ -117,7 +114,7 @@ class Batcher:
     )
 
   @functools.cached_property
-  def abstract_model_state(self) -> PyTree:
+  def abstract_model_state(self) -> dict[str, Any]:
     """Abstract model state with full-precision (bf16) params.
 
     Used as the load target for the checkpoint (which is stored bf16).
@@ -135,7 +132,7 @@ class Batcher:
       params = self.model.quantize(params)
       return {'params': params}
 
-    return core_common.eval_abstract_output(_init_fn)
+    return cast(dict[str, Any], core_common.eval_abstract_output(_init_fn))
 
   @property
   def sampling_state(self) -> rpa.SamplingState:
@@ -146,12 +143,6 @@ class Batcher:
 
   def update_params(self, params: PyTree):
     self.state['params'] = params
-
-  def clear_prefix_cache(self) -> None:
-    """Retires the KV prefix cache; no-op when caching is disabled."""
-    cache = self.prefix_cache
-    if cache is not None:
-      cache.clear()
 
   def update_params_from_checkpoint_path(self, ckpt_path: str):
     """Updates the model params from a checkpoint path."""
@@ -252,7 +243,7 @@ class Batcher:
       until_fn = lambda state: jnp.array(False)
 
     return sampling_state.continue_decode(
-        forward_fn=self.decode_model.apply,
+        forward_fn=self.decode_model.apply,  # pyrefly: ignore[bad-argument-type]
         until_fn=until_fn,
         params=params,
         max_num_issue_tokens=self.config.batch_size,
@@ -267,67 +258,35 @@ class Batcher:
       sampling_state: rpa.SamplingState,
       slot_id: int,
       payload: PyTree,
+      start: int,
+      end: int,
   ) -> rpa.SamplingState:
     """Pure inject function for one num_shards-page chunk.
 
-    Writes exactly `num_shards` cached KV pages — one per
-    seq-shard — into the live `decode_state.pages` tensor for
-    `slot_id` by delegating to :meth:`DecodeState.inject_chunk` per
-    layer. Has no decode body; the caller is expected to issue a
-    subsequent decode dispatch.
-
-    Multi-page cache hits are drained as multiple consecutive calls;
-    each call appends `num_shards * page_size` tokens worth of KV and
-    advances `kv_lens` accordingly. `position` is *set* to the end of
-    the chunk just injected — the next chunk boundary at or after the
-    current position, `(position // chunk + 1) * chunk` — so it is
-    robust to the caller's starting position and to chunk granularity
-    (no partial-add drift).
+    Thin wrapper around :meth:`rpa.SamplingState.inject_chunk`, which writes
+    exactly `num_shards` cached KV pages -- one per seq-shard -- into the
+    live `decode_state.pages` tensor for `slot_id` (per layer) and advances
+    `position` to the end of the injected chunk. Has no decode body; the
+    caller is expected to issue a subsequent decode dispatch. Multi-chunk
+    cache hits are drained as multiple consecutive calls.
 
     Args:
       sampling_state: the current sampling state (donated).
       slot_id: i32[] scalar (replicated) — the batch slot to inject into.
-      payload: pytree with the same structure as
-        `sampling_state.decode_state` but each DecodeState leaf is
-        replaced by a bf16/f32 `[num_shards * page_size, full_heads,
-        kv_packing, head_dim]` array sharded `(seq, head, None, None)`
-        — the token-major KV bytes for the page that DecodeState owns.
+      payload: pytree with the same structure as `sampling_state.decode_state`
+        but each DecodeState leaf is replaced by a bf16/f32 `[num_shards *
+        page_size, full_heads, kv_packing, head_dim]` array sharded `(seq, head,
+        None, None)` — the token-major KV bytes for the page that DecodeState
+        owns.
+      start: i32[] scalar (replicated) — start token position to inject.
+      end: i32[] scalar (replicated) — end token position to inject.
 
     Returns:
       The updated `SamplingState` with the chunk's KV injected for
-      `slot_id` and its `position` advanced to the covered-prefix length.
+      `slot_id` and its `position` advanced to `end`.
     """
-    assert (cache := self.prefix_cache) is not None
-    is_leaf = lambda x: isinstance(x, rpa.DecodeState)
-    # `inject_chunk` is self-contained: it releases sliding-window pages
-    # *before* allocating each chunk (mirroring the decode path), so a
-    # cached prefix longer than the window can be injected chunk-by-chunk
-    # without the page pool ever overflowing. `position` tracks the true
-    # logical length and is advanced separately below; only `kv_lens` /
-    # `pages` are windowed — exactly the decode-loop invariant
-    # (`update_decode_state_and_compute_attn`).
-    new_decode_state = jax.tree_util.tree_map(
-        lambda ds, p: ds.inject_chunk(slot_id, p),
-        sampling_state.decode_state,
-        payload,
-        is_leaf=is_leaf,
-    )
-    chunk_size = cache.chunk_size
-    # Set position to the end of the chunk just injected rather than
-    # adding, so it can't drift if the starting position is not chunk-
-    # aligned. The chunk index is inferred from the current position
-    # (`position // num_inject_tokens`); the covered prefix after this
-    # inject is the next chunk boundary, `(chunk_idx + 1) *
-    # num_inject_tokens`.
-    chunk_idx = sampling_state.position[slot_id] // chunk_size
-    new_position = sampling_state.position.at[slot_id].set(
-        (chunk_idx + 1) * chunk_size
-    )
-    return dataclasses.replace(
-        sampling_state,
-        decode_state=new_decode_state,
-        position=new_position,
-    )
+    assert self.prefix_cache is not None
+    return sampling_state.inject_chunk(slot_id, payload, start, end)
 
   def init_sampling_state(self, prng_key: jax.Array) -> rpa.SamplingState:
     """Initializes sampling state."""
@@ -351,15 +310,18 @@ class Batcher:
     )
 
   @functools.cached_property
-  def abstract_sampling_state(self) -> PyTree:
-    return core_common.eval_abstract_output(
-        self.init_sampling_state, jax.random.key(0)
+  def abstract_sampling_state(self) -> rpa.SamplingState:
+    return cast(
+        rpa.SamplingState,
+        core_common.eval_abstract_output(
+            self.init_sampling_state, jax.random.key(0)
+        ),
     )
 
   def set_mesh(self) -> jax.sharding.set_mesh:
     """Sets the mesh for the current process."""
     return sharding.set_mesh(
-        self.config.mesh_shape,
+        self.config.mesh_shape,  # pyrefly: ignore[bad-argument-type]
         axis_names=self.config.sharding_config.mesh_axis_names,
     )
 
@@ -400,7 +362,7 @@ class Batcher:
     """
     max_num_issue_tokens = self.max_num_issue_tokens or self.config.batch_size
     return sampling_state.mixed_step(
-        forward_fn=self.model.apply,
+        forward_fn=self.model.apply,  # pyrefly: ignore[bad-argument-type]
         params=params,
         extra_inputs=None,
         max_num_issue_tokens=max_num_issue_tokens,
@@ -463,13 +425,12 @@ class Batcher:
   @functools.cached_property
   def compiled_inject_chunk_fn(
       self,
-  ) -> Callable[[rpa.SamplingState, int, PyTree], rpa.SamplingState]:
+  ) -> Callable[[rpa.SamplingState, int, PyTree, int, int], rpa.SamplingState]:
     """Returns the compiled inject-only program.
 
-    The returned callable has signature `(sampling_state, pending) ->
-    sampling_state`; `sampling_state` is donated. Has no decode
-    body and always injects exactly `num_shards` pages (one per
-    seq-shard) — multi-page cache hits are drained as multiple calls.
+    The returned callable has signature `(sampling_state, slot_id, payload,
+    start, end) -> sampling_state`; `sampling_state` is donated. See
+    :meth:`_inject_chunk_body`.
 
     HBM-wise, the inject program is tiny: pages aliases input -> output
     (donation fires); the prelude allocate + DUS + position update has
@@ -489,6 +450,8 @@ class Batcher:
               self.abstract_sampling_state,
               0,  # slot_id
               self.abstract_inject_payload,
+              0,  # start
+              0,  # end
           )
           .compile()
       )
@@ -507,7 +470,7 @@ class Batcher:
     Takes `(sampling_state, slot_id, chunk_idx)` and returns a pytree
     of :class:`rpa.SnapshotChunkLeaf` (one per DecodeState leaf), each with
     `payload` shape/sharding matching the inject side (see
-    :meth:`abstract_inject_payload`) and a scalar `available` bool.
+    :meth:`abstract_inject_payload`) and its per-token `written` mask.
     The chunk size is fixed at `num_shards * page_size` and inferred
     internally by `extract_chunk` from the first DecodeState leaf.
     """
@@ -565,7 +528,7 @@ class Batcher:
   ) -> Callable[[rpa.SamplingState, jax.typing.ArrayLike], rpa.SamplingState]:
     """Compiled release function."""
     if jax.config.jax_disable_jit:
-      return rpa.SamplingState.release
+      return rpa.SamplingState.release  # pyrefly: ignore[bad-return]
     logging.info('Compiling release function...')
     time_start = time.time()
     with self.set_mesh():
@@ -592,172 +555,133 @@ class Batcher:
         max_bytes=300 * 1024**3,  # 300 GiB host-RAM cap.
     )
 
-  def _maybe_inject_prefix_cache(self) -> list[int]:
-    """Looks up the prefix cache and injects any hit for prefilling slots.
-
-    Scans every active slot (those with `~is_pad_seq`). For each slot,
-    asks the cache how deep a prefix is fully restorable — see
-    :meth:`PrefixCache.longest_restorable_prefix`, which enforces both "every
-    chunk in `[0, k)` is present" and "every chunk in `[k -
-    min_num_chunks_for_window, k)` is complete (every leaf payload
-    present)." Then tree-maps :meth:`rpa.SnapshotChunkLeaf.onload`
-    over each restored chunk to onload real bytes HBM-ward and
-    materialise uninitialised buffers in their place for any
-    `ShapeDtypeStruct` leaves (the leaf was unavailable at extract
-    time), and injects via the AOT-compiled inject program.
-
-    All hosts run this method in lockstep over identical state, so the
-    per-process caches stay in sync.
+  def _maybe_restore_from_prefix_cache(self) -> np.ndarray:
+    """Restores the deepest cached prefix into every prefilling slot.
 
     Returns:
-      A length-`batch_size` list `num_cached_chunks` with the number of
-      chunks injected for each slot (0 for free slots, decoding or
-      non-chunk-aligned slots, and prefilling slots with no cache hit).
+      Number of tokens restored from the prefix caching.
     """
     batch_size = self.sampling_state.batch_size
-    num_cached_chunks = [0] * batch_size
     if (cache := self.prefix_cache) is None:
-      return num_cached_chunks
-    # One host pull of `position`, `input_lens`, `tokens`.
-    positions = np.asarray(self.sampling_state.position)
+      return np.zeros(batch_size, dtype=np.int32)
+    time_start = time.time()
+    positions = np.asarray(self.sampling_state.position).copy()
     input_lens = np.asarray(self.sampling_state.input_lens)
     tokens = np.asarray(self.sampling_state.tokens)
-    min_num_chunks_for_window = (
-        self.abstract_sampling_state.min_num_chunks_for_window
-    )
-    time_start = time.time()
-    total_dispatches = 0
+    n_dispatches = 0
+
     for slot_id in range(batch_size):
       if (input_len := input_lens[slot_id]) == 0:
-        # Free slot: `position` is undefined, so there is nothing to inject.
         continue
       if (position := positions[slot_id]) >= input_len - 1:
         continue
-      slot_tokens = tokens[slot_id]
-      start_chunk_idx = position // cache.chunk_size
-      max_chunks = int(input_len // cache.chunk_size)
-      best_k = cache.longest_restorable_prefix(
-          slot_tokens, max_chunks, start_chunk_idx, min_num_chunks_for_window
-      )
-      logging.info(
-          'prefix_cache: slot=%d hit=%d/%d chunks (start=%d, input_tokens=%d)',
-          slot_id,
-          best_k - start_chunk_idx,
-          max_chunks,
-          start_chunk_idx,
-          int(input_len),
-      )
-      # Inject chunks `[start_chunk_idx, best_k)` in order.
-      # TODO: Avoid O(C^2) hashing.
-      for chunk_idx in range(start_chunk_idx, best_k):
-        token_chunks = slot_tokens[: (chunk_idx + 1) * cache.chunk_size]
-        stored = cache.restore(token_chunks)
-        assert stored is not None, (
-            f'longest_restorable_prefix returned {best_k} but chunk {chunk_idx}'
-            ' missing'
-        )
-        payload = jax.tree_util.tree_map(rpa.SnapshotChunkLeaf.onload, stored)
+      # Prefill covers `[0, input_len - 1)` -- the last prompt token is
+      # consumed by the first decode step -- so a restore may never move the
+      # slot past that.
+      for tile in cache.restore_chunk_tiles(
+          tokens[slot_id], position, input_len - 1
+      ):
+        payload = rpa.onload_chunk_tree(tile.tree)
         self.state['sampling_state'] = self.compiled_inject_chunk_fn(
-            self.sampling_state, slot_id, payload
+            self.sampling_state, slot_id, payload, tile.start, tile.end
         )
-        total_dispatches += 1
-      num_cached_chunks[slot_id] = best_k
+        n_dispatches += 1
     logging.info(
-        'Injected prefix cache: %d total chunk dispatches in %.2fs',
-        total_dispatches,
+        'Restored from prefix cache: %d total chunk dispatches in %.2fs',
+        n_dispatches,
         time.time() - time_start,
     )
-    return num_cached_chunks
+    after = np.asarray(self.sampling_state.position)
+    return after - positions
 
-  def _maybe_snapshot_prefix_cache(
-      self, num_cached_chunks: MutableSequence[int]
-  ) -> None:
-    """Snapshots the PROMPT PREFIX of every slot that just finished prefill.
+  def _maybe_evict_prefix_cache(self) -> int:
+    """Trims the prefix cache to its byte budget. Returns bytes freed.
 
-    For each active slot (those with `~is_pad_seq`), computes the
-    number of chunks now fully represented in the on-device KV and
-    snapshots any chunks past `num_cached_chunks[slot_id]`. Updates
-    `num_cached_chunks` in place so the next snapshot pass only walks
-    newly-ready chunks.
+    MUST only run with no slot mid-prompt; see the call site.
 
-    Per-chunk reads use :meth:`SamplingState.extract_chunk` via the AOT-
-    compiled :attr:`compiled_extract_chunk_fn` so the read uses the
-    same `shard_map`-based per-shard DMA as the inject path. The
-    program returns a pytree of :class:`rpa.SnapshotChunkLeaf` (one per
-    DecodeState leaf); each leaf's `available` bool is `True` iff
-    that layer's KV for this chunk is still resident
-    (`base_col >= 0`). The batcher hands the tree straight to
-    :meth:`PrefixCache.snapshot`, which calls
-    :meth:`SnapshotChunkLeaf.offload` per leaf — returning the
-    host-resident payload for available leaves and just a
-    `ShapeDtypeStruct` for unavailable ones (no payload bytes stored,
-    saving host RAM).
-
-    Only the PROMPT prefix is cached, and only once per sequence -- right after
-    it finishes prefill (`position == input_len - 1`, before any decode).
-    Decode-generated KV (`position > input_len - 1`) is deliberately NOT cached.
-
-    Args:
-      num_cached_chunks: per-slot count of chunks already cached; updated in
-        place so each pass only snapshots newly-ready chunks.
+    Returns:
+      Host bytes freed, `0` when there is no cache or it already fits.
     """
     if (cache := self.prefix_cache) is None:
-      return
-    is_pad_seq = np.asarray(self.sampling_state.is_pad_seq)
-    active_slots = [i for i, pad in enumerate(is_pad_seq) if not pad]
-    if not active_slots:
-      return
-    tokens = np.asarray(self.sampling_state.tokens)
+      return 0
+    time_start = time.time()
+    freed = cache.evict()
+    if freed:
+      logging.info(
+          'prefix_cache: freed %d MiB in %.2fs; %d MiB held',
+          freed >> 20,
+          time.time() - time_start,
+          cache.nbytes >> 20,
+      )
+    return freed
+
+  def _maybe_snapshot_prefix_cache(self, previous: np.ndarray) -> np.ndarray:
+    """Caches what the prefill pass just made ready, `[previous, position)`.
+
+    Args:
+      previous: per-slot position BEFORE the prefill pass -- where the cache
+        already reaches, so the range this pass added is `[previous,
+        position)`.
+
+    Returns:
+      Prompt tokens newly cached per slot, as an `int64` array of length
+      `batch_size` -- for the response's accounting. It reports what it
+      STORED rather than a position delta, because a prefill pass moves the
+      position of every slot it touches, including the ones skipped here.
+    """
+    written = np.zeros(self.sampling_state.batch_size, dtype=np.int32)
+    if (cache := self.prefix_cache) is None:
+      return written
+    time_start = time.time()
     positions = np.asarray(self.sampling_state.position)
     input_lens = np.asarray(self.sampling_state.input_lens)
+    tokens = np.asarray(self.sampling_state.tokens)
     chunk_size = cache.chunk_size
-    # Snapshot only chunks whose KV has actually been COMPUTED so far,
-    # i.e. logical chunks in `[num_cached_chunks, ready_chunks)` where
-    # `ready_chunks = position // chunk_size`. We only reach the per-slot body
-    # at `position == input_len - 1`, so this is exactly the prompt prefix.
-    #
-    # `position` is how far the slot has been prefilled/decoded; chunks
-    # beyond it have NOT been processed yet, so their pages are
-    # uninitialized/stale -- snapshotting them would cache garbage KV.
-    # `extract_chunk` maps the logical index to the correct physical
-    # column per layer via `position`, and per-leaf gating inside
-    # `SnapshotChunkLeaf.offload` substitutes a `ShapeDtypeStruct`
-    # (zero-byte placeholder) for any layer whose chunk has already
-    # been evicted by `release_for_window`.
-    time_start = time.time()
-    n_dispatched = 0
-    for slot_id in active_slots:
-      # Snapshot a slot's prompt prefix exactly once -- right when it finishes
-      # prefill (`position == input_len - 1`, before any decode).
-      if positions[slot_id] != input_lens[slot_id] - 1:
+    n_dispatches = 0
+    for slot_id in range(self.sampling_state.batch_size):
+      if input_lens[slot_id] == 0:
         continue
-      ready_chunks = int(positions[slot_id]) // chunk_size
-      already = num_cached_chunks[slot_id]
-      if ready_chunks <= already:
+      position = positions[slot_id]
+      # Prompt prefix only: stop caching once the slot starts decoding.
+      if position > input_lens[slot_id] - 1 or position <= 0:
         continue
-      slot_tokens = tokens[slot_id]
-      for chunk_idx in range(already, ready_chunks):
-        token_chunks = slot_tokens[: (chunk_idx + 1) * cache.chunk_size]
-        # Skip the (collective) extract+offload when the stored entry
-        # is already fully complete (every leaf has a payload) — no
-        # extract result could improve it. Partial entries may be
-        # filled in by the new snapshot (per-leaf first-writer-wins
-        # inside `PrefixCache.snapshot`).
-        if cache.is_complete(token_chunks):
-          continue
-        entry_tree = self.compiled_extract_chunk_fn(
-            self.sampling_state, slot_id, chunk_idx
+      start = previous[slot_id]
+      if start >= position:
+        continue
+      tiles = []
+      for chunk_idx in range(
+          start // chunk_size, math.ceil(position / chunk_size)
+      ):
+        chunk_start = chunk_idx * chunk_size
+        tiles.append(
+            prefix_cache_lib.ChunkTile(
+                rpa.offload_chunk_tree(
+                    self.compiled_extract_chunk_fn(
+                        self.sampling_state, slot_id, chunk_idx
+                    )
+                ),
+                max(chunk_start, start),
+                min(chunk_start + chunk_size, position),
+            )
         )
-        cache.snapshot(token_chunks, entry_tree)
-        n_dispatched += 1
-      # Advance the per-slot watermark so the next pass only walks newly
-      # ready chunks (and never re-reaches an evicted one).
-      num_cached_chunks[slot_id] = ready_chunks
+        n_dispatches += 1
+      # STORE. The pass's end is the resume point; a refusal stops the run
+      # short and says so. Nothing is claimed on the cache's behalf either
+      # way, so nothing is now false: the next pass covers the same ground.
+      slot_tokens = tokens[slot_id]
+      reached = cache.store_tiles(slot_tokens, tiles)
+      written[slot_id] = reached - start
+      if reached < position:
+        raise ValueError(
+            'Prefix cache refused to store tiles for slot %d from %d to %d'
+            % (slot_id, start, position)
+        )
     logging.info(
         'Cached %d prefix chunks in %.2fs.',
-        n_dispatched,
+        n_dispatches,
         time.time() - time_start,
     )
+    return written
 
   def _maybe_pause(
       self,
@@ -804,15 +728,18 @@ class Batcher:
     # Per-slot state.
     #   `batch[i]`: `(request, future)` for the active request, or
     #     `None` when the slot is free.
-    #   `num_cached_chunks[i]`: number of `num_shards * page_size`-
-    #     token chunks of this slot's prefix that are present in the
-    #     prefix cache. Returned by :meth:`_maybe_inject_prefix_cache`
-    #     each pre-decode pass and bumped by
-    #     :meth:`_maybe_snapshot_prefix_cache` after each decode call.
+    #   There is NO cursor: a slot's device position IS how much of its
+    #     prefix the cache holds, because a snapshot pass caches exactly
+    #     what the prefill pass computed -- and where it does not (a store
+    #     the cache refused), the next pass finds out by asking rather than
+    #     by being told, so nothing here has to remember.
     # Prompt tokens themselves live in `self.sampling_state.tokens`
     # and are read on demand by the inject / snapshot passes.
     batch_size = self.sampling_state.batch_size
-    batch = [None] * batch_size  # List of [(request, future) or None]
+    # One slot per batch index: the request that owns it, or None.
+    batch: list[tuple[Any, Any] | None] = [None] * batch_size
+    cache_read_tokens = np.zeros(batch_size, dtype=np.int64)
+    cache_write_tokens = np.zeros(batch_size, dtype=np.int64)
     while True:
       if sharding.sum_across_hosts(stop_event.is_set()):
         return
@@ -834,30 +761,41 @@ class Batcher:
           request, future, input_tokens = item
 
       input_len = len(input_tokens)
-      n = int(sharding.sum_across_hosts(input_len))
+      n = int(sharding.sum_across_hosts(input_len))  # pyrefly: ignore[bad-argument-type]
       if n > 0:
         input_tokens = np.pad(
             input_tokens, (0, self.sampling_state.max_seq_len - input_len)
         )
-        input_tokens = sharding.sum_across_hosts(input_tokens)
+        input_tokens = sharding.sum_across_hosts(input_tokens)  # pyrefly: ignore[bad-argument-type]
         self.state['sampling_state'], slot_id = self.compiled_push_fn(
-            self.sampling_state, input_tokens, n, self.max_decode_steps
+            self.sampling_state, input_tokens, n, self.max_decode_steps  # pyrefly: ignore[bad-argument-type]
         )
         slot_id = int(slot_id)
         batch[slot_id] = (request, future)
+        cache_read_tokens[slot_id] = 0
+        cache_write_tokens[slot_id] = 0
         continue  # Filled a slot -- try to fill more before prefill/decode.
 
       if not any(batch):
         continue  # Nothing to do; loop back to the stop check.
 
       if bool(self.sampling_state.any_prefilling):
-        num_cached_chunks = self._maybe_inject_prefix_cache()
-        logging.info('Running chunked prefill step...')
-        self.state['sampling_state'] = self.compiled_prefill_fn(
-            self.sampling_state, self.state['params']
-        )
-        self._maybe_snapshot_prefix_cache(num_cached_chunks)
+        cache_read_tokens += self._maybe_restore_from_prefix_cache()
+        if bool(self.sampling_state.any_prefilling):
+          logging.info('Running chunked prefill step...')
+          before = np.asarray(self.sampling_state.position)
+          self.state['sampling_state'] = self.compiled_prefill_fn(
+              self.sampling_state, self.state['params']
+          )
+          cache_write_tokens += self._maybe_snapshot_prefix_cache(before)
+
         continue  # Admit + prefill more before decoding.
+      # NOTHING IS MID-PROMPT HERE, and that is the whole reason the cache is
+      # trimmed at this exact point: every slot is past its prefill, so none
+      # of them needs the trie to still hold what it held. A slot part-way
+      # through its prompt is the one reader that does, and while one exists
+      # the loop never reaches this line.
+      self._maybe_evict_prefix_cache()
       # Nothing needs prefill -> one baseline decode pass over the full batch.
       logging.info('Running decode function...')
       self.state['sampling_state'] = self.compiled_decode_fn(
@@ -912,7 +850,7 @@ class Batcher:
             if future is not None and future.cancelled():
               logging.info('Future is cancelled.')
               is_cancelled[i] = True
-      is_cancelled = np.astype(sharding.sum_across_hosts(is_cancelled), np.bool)
+      is_cancelled = np.astype(sharding.sum_across_hosts(is_cancelled), np.bool)  # pyrefly: ignore[no-matching-overload, bad-argument-type]
 
       logging.info('is_cancelled=%s', is_cancelled)
       logging.info('Releasing sampling state...')
@@ -923,8 +861,8 @@ class Batcher:
         )
 
       if experiment_helper.is_primary_task():
-        for seq in completed_seqs:
-          seq = {key: value for key, value in seq.items()}
+        for completed in completed_seqs:
+          seq: dict[str, Any] = dict(completed)
           seq['output_text'] = sampling_lib.chunks_as_text(
               self.input_processor.decode(
                   seq['tokens'][seq['input_len'] :].tolist()
@@ -937,7 +875,11 @@ class Batcher:
             output_messages = parser(text_to_parse)
             seq['output_messages'] = output_messages
           index = seq.pop('index')
+          # Per-response prefix-cache attribution (0 when caching is off).
+          seq['n_cache_read_tokens'] = int(cache_read_tokens[index])
+          seq['n_cache_write_tokens'] = int(cache_write_tokens[index])
           if entry := batch[index]:
+
             _, future = entry
             if not future.cancelled():
               logging.info('Setting future result.')
@@ -951,9 +893,6 @@ class Batcher:
 
       for index in np.flatnonzero(should_release_mask):
         batch[index] = None
-
-      if self.prefix_cache is not None and logging.vlog_is_on(1):
-        logging.vlog(1, 'prefix_cache.stats=%s', self.prefix_cache.stats())
 
   def thread(
       self,

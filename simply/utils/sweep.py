@@ -143,7 +143,7 @@ def zipit(*sweeps: Sweep):
 def _prefix(path: str, *sweeps: Sweep, **fixed):
   """Prefix a sweep with a path."""
   if fixed:
-    sweeps = [[fixed], *sweeps]
+    sweeps = [[fixed], *sweeps]  # pyrefly: ignore[bad-assignment]
 
   return map(lambda x: {path: x}, prod(*sweeps))
 
@@ -181,7 +181,7 @@ def overlay_from(root: T, updates, *, strict=True) -> T:
       return new
 
   new_fields = set(updates.keys())
-  old_fields = {f.name for f in dataclasses.fields(root)}
+  old_fields = {f.name for f in dataclasses.fields(root)}  # pyrefly: ignore[bad-argument-type]
   if strict and not new_fields.issubset(old_fields):
     raise ValueError(
         f"New fields {new_fields - old_fields} not found in root"
@@ -191,7 +191,7 @@ def overlay_from(root: T, updates, *, strict=True) -> T:
   new_vals = {
       k: _update(getattr(root, k), updates[k]) for k in old_fields & new_fields
   }
-  return dataclasses.replace(root, **new_vals)
+  return dataclasses.replace(root, **new_vals)  # pyrefly: ignore[bad-specialization]
 
 
 def eval_sweep(

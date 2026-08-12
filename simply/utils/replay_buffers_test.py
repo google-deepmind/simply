@@ -71,8 +71,8 @@ class ReplayBuffersTest(absltest.TestCase):
         values = np.empty((num_samples, batch_size), dtype=np.int64)
         for i in range(num_samples):
           batch = buffer.sample(batch_size, replace=replace)
-          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, unsupported-operation]
-          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, unsupported-operation]
+          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
+          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
 
         probs = np.bincount(values.flatten()) / (num_samples * batch_size)
         self.assertEqual(probs.size, capacity)
@@ -94,9 +94,9 @@ class ReplayBuffersTest(absltest.TestCase):
       indices = []
       for i, batch in enumerate(buffer.iterator(batch_size, shuffle=True)):
         self.assertEqual(
-            batch["x"].shape, (min(batch_size, capacity - i * batch_size), 1)  # pyrefly: ignore[bad-index, unsupported-operation]
+            batch["x"].shape, (min(batch_size, capacity - i * batch_size), 1)  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
         )
-        indices.extend(batch["x"].flatten().tolist())  # pyrefly: ignore[bad-index, unsupported-operation]
+        indices.extend(batch["x"].flatten().tolist())  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
       self.assertCountEqual(indices, range(capacity))
 
   def test_prioritized_replay_buffer(self):
@@ -187,11 +187,11 @@ class ReplayBuffersTest(absltest.TestCase):
 
         for i in range(num_samples):
           batch, indices, weights = buffer.sample(batch_size, replace=replace)
-          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, unsupported-operation]
+          self.assertEqual(batch["x"].shape, (batch_size, 1))  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
           self.assertEqual(indices.shape, (batch_size,))
           self.assertEqual(weights.shape, (batch_size,))
 
-          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, unsupported-operation]
+          values[i, :] = batch["x"].flatten()  # pyrefly: ignore[bad-index, missing-attribute, unsupported-operation]
           np.testing.assert_allclose(
               weights, np.min(priorities[:capacity]) / priorities[indices]
           )

@@ -70,25 +70,25 @@ def reshard_or_quantize_expert_weight(
   if quant_key in flatten_target_abstract_state:
     quant_abstract = flatten_target_abstract_state[quant_key]
     scale_abstract = flatten_target_abstract_state[f'{target_key}/scale']
-    n_blocks = scale_abstract.shape[1]
+    n_blocks = scale_abstract.shape[1]  # pyrefly: ignore[missing-attribute]
     # block_size=0 means per-channel (n_blocks==1); else k // n_blocks.
     k = v.shape[1]
     block_size = 0 if n_blocks == 1 else k // n_blocks
     quant, scale = quant_lib.quantize_moe_weight(
         v,
         block_size=block_size,
-        quant_dtype=quant_abstract.dtype,
+        quant_dtype=quant_abstract.dtype,  # pyrefly: ignore[missing-attribute]
         calibrate=calibrate,
     )
     quant = sharding_lib.with_sharding_constraint(
-        quant, quant_abstract.sharding
+        quant, quant_abstract.sharding  # pyrefly: ignore[missing-attribute]
     )
     scale = sharding_lib.with_sharding_constraint(
-        scale, scale_abstract.sharding
+        scale, scale_abstract.sharding  # pyrefly: ignore[missing-attribute]
     )
     return {'quant_array': quant, 'scale': scale}
   return sharding_lib.with_sharding_constraint(
-      v, flatten_target_abstract_state[target_key].sharding
+      v, flatten_target_abstract_state[target_key].sharding  # pyrefly: ignore[missing-attribute]
   )
 
 
@@ -198,8 +198,8 @@ class V2Format(CheckpointFormat):
             flatten_target_abstract_state,
             calibrate=self.ffn_weight_calibrate,
         )
-        transformed_state[f'{k}/quant_array'] = quantized['quant_array']
-        transformed_state[f'{k}/scale'] = quantized['scale']
+        transformed_state[f'{k}/quant_array'] = quantized['quant_array']  # pyrefly: ignore[bad-index, unsupported-operation]
+        transformed_state[f'{k}/scale'] = quantized['scale']  # pyrefly: ignore[bad-index, unsupported-operation]
         n_quantized += 1
       else:
         # Optimizer state (`m` / `v` / `steps`) and any other source leaf the
@@ -415,7 +415,7 @@ class Qwen2Format(CheckpointFormat):
       self, stored_state: PyTree, target_abstract_state: PyTree = None
   ) -> PyTree:
     flatten_stored_state = ocp.tree.to_flat_dict(stored_state, sep='/')
-    per_head_dim = pytree.tree_value(
+    per_head_dim = pytree.tree_value(  # pyrefly: ignore[missing-attribute]
         target_abstract_state, 'params/block_0/attn/q_proj/w'
     ).shape[-1]
     transformed_state = {}
@@ -599,7 +599,7 @@ def resolve_checkpoint_handler_from_json(
   if pytree.tree_is_mapping(handler_in_json):
     return ocp.CompositeCheckpointHandler(**{  # pyrefly: ignore[bad-argument-type]
         k: resolve_checkpoint_handler_from_json(v, restore_concurrent_gb)
-        for k, v in handler_in_json.items()
+        for k, v in handler_in_json.items()  # pyrefly: ignore[missing-attribute]
     })
   raise ValueError(f'Unsupported checkpoint handler: {handler_in_json}')
 
@@ -700,7 +700,7 @@ def load_checkpoint_from_path(
   # single MoE/embedding shard can be large in bf16. This limit is a per-host
   # concurrency knob (not raw HBM), so over-provisioning is safe.
   handler = resolve_checkpoint_handler_from_path(
-      ckpt_path, restore_concurrent_gb=300
+      ckpt_path, restore_concurrent_gb=100
   )
   start_time = time.time()
   with ocp.Checkpointer(handler) as checkpointer:
@@ -751,7 +751,7 @@ def load_checkpoint_from_path(
         )
         try:
           value = pytree.tree_value(state, path)
-          if value.shape != abstract.shape:
+          if value.shape != abstract.shape:  # pyrefly: ignore[missing-attribute]
             raise ValueError(
                 f'Shape mismatch for {path}: restored is {value.shape} while '
                 f'target is {abstract.shape}'
@@ -764,7 +764,7 @@ def load_checkpoint_from_path(
           )
           if not isinstance(value, jax.core.Tracer) and value is not new_value:
             logging.info('Deleting old value at path=%s', path)
-            value.delete()
+            value.delete()  # pyrefly: ignore[missing-attribute]
           return new_value
         except KeyError as e:
           logging.warning(

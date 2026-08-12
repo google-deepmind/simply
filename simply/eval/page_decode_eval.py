@@ -421,6 +421,12 @@ def main(argv: Sequence[str]) -> None:
                 input_len=input_len,
                 output_len=len(lm_response['tokens']) - input_len,
                 correct=example_to_save['correct'],
+                # Per-response prefix-cache attribution, in prompt tokens.
+                # `.get` because the agentic (in-sandbox) path synthesizes
+                # `lm_response` from the sandbox result and carries no
+                # per-turn numbers -- those live on the S2 `turn` records.
+                n_cache_read_tokens=lm_response.get('n_cache_read_tokens', 0),
+                n_cache_write_tokens=lm_response.get('n_cache_write_tokens', 0),
             )
           json.dump(pytree.dump(example_to_save), f)
           f.write('\n')

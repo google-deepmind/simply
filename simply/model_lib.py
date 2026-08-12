@@ -936,7 +936,7 @@ class MoEFeedForward(FeedForward):
                        f' {self.ep_capacity_factor=}')
 
     load = ffn_extra_output['load']  # pyrefly: ignore[bad-index, unsupported-operation]
-    pipeline_metrics = ffn_extra_output.get('metrics', {})
+    pipeline_metrics = ffn_extra_output.get('metrics', {})  # pyrefly: ignore[missing-attribute]
     router_entropy = - jnp.sum(router_probs * jnp.where(
         router_probs > 0, jnp.log(router_probs), 0.0), axis=-1)
     extra_output['metric'].update(pipeline_metrics)
@@ -2114,7 +2114,7 @@ class Attention(module.SimplyModule):
     # just-projected k, v. This allows shared layers to reuse the
     # (pre-rmsnorm) k, v computed by a previous unshared layer.
     if extra_inputs is not None:
-      _kv_override = extra_inputs.get('kv_override')
+      _kv_override = extra_inputs.get('kv_override')  # pyrefly: ignore[missing-attribute]
       if _kv_override is not None:
         k, v = _kv_override
 
@@ -2155,7 +2155,7 @@ class Attention(module.SimplyModule):
     else:
       if (
           extra_inputs
-          and (prefill_position := extra_inputs.get('prefill_position'))
+          and (prefill_position := extra_inputs.get('prefill_position'))  # pyrefly: ignore[missing-attribute]
           is not None
       ):
         decode_state = decode_state or {}
@@ -2163,7 +2163,7 @@ class Attention(module.SimplyModule):
 
       update_kv_cache = True
       if extra_inputs is not None:
-        update_kv_cache = extra_inputs.get('update_kv_cache', True)
+        update_kv_cache = extra_inputs.get('update_kv_cache', True)  # pyrefly: ignore[missing-attribute]
 
       k, v, kv_segment_positions, kv_segment_ids, decode_state = (
           updated_decode_state(
@@ -3007,6 +3007,7 @@ class TransformerLM(module.SimplyModule):
         continue
       if any(missing_keys):
         raise ValueError(
+            # pyrefly: ignore[missing-attribute]
             f'Incomplete extra_inputs keys, got {extra_inputs.keys()}, expected'
             f' {input_encoder.extra_input_keys}'
         )
@@ -3915,7 +3916,7 @@ def run_experiment(
           # grad_accum factor (and let a config understate its compute budget).
           _grad_accum = max(1, int(config.grad_accum_steps))
           train_flops_per_step = (
-              float(_ca.get('flops', float('nan')))
+              float(_ca.get('flops', float('nan')))  # pyrefly: ignore[missing-attribute]
               * jax.device_count()
               * _grad_accum
           )
@@ -3983,8 +3984,8 @@ def run_experiment(
         images, scalars = pytree.filter_tree(
             flat_log, lambda k, _: 'image' in k
         )
-        images = {k: v for k, v in images.items() if v is not None}
-        scalars = {k: v for k, v in scalars.items() if v is not None}
+        images = {k: v for k, v in images.items() if v is not None}  # pyrefly: ignore[missing-attribute]
+        scalars = {k: v for k, v in scalars.items() if v is not None}  # pyrefly: ignore[missing-attribute]
         metrics_dict.update(scalars)
         # Images don't get aggregated so get temporally subsampled.
         helper.write_images(steps, images)
@@ -4113,13 +4114,18 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   )
   if ckpt_mngr and (latest_step := ckpt_mngr.latest_step()) is not None:
     # Continue training from lastest ckpt.
-    abstract_state = common.eval_abstract_output(init_state_fn)
+    # Trace-only (`jax.eval_shape`), not `common.eval_abstract_output`'s full
+    # `.lower().compile()`: compiling the no-arg `init_state_fn` buffer-assigns
+    # the whole unsharded optimizer state, which OOMs for large sharded MoE
+    # models even though the donated train step fits.
+    abstract_state = jax.eval_shape(init_state_fn)
     state = ckpt_lib.load_checkpoint_from_dir(
         ckpt_dir, abstract_state, latest_step
     )
   elif config.init_ckpt_dir:
     if config.init_ckpt_opt_state:
-      abstract_state = common.eval_abstract_output(init_state_fn)
+      # Trace-only abstract state (see resume branch) to avoid the compile OOM.
+      abstract_state = jax.eval_shape(init_state_fn)
     else:
       # Only initialize params from a given external ckpt.
       abstract_state = {
@@ -4261,10 +4267,10 @@ def run_eval(
       # the common binary-weight case it is identical to masking. (C4 packing
       # zero-weights some non-pad tokens; counting their bytes would deflate bpb
       # and break cross-vocab comparability.)
-      targets = eval_batch['decoder_target_tokens']
-      loss_weights = eval_batch.get('decoder_loss_weights', None)
+      targets = eval_batch['decoder_target_tokens']  # pyrefly: ignore[bad-index, unsupported-operation]
+      loss_weights = eval_batch.get('decoder_loss_weights', None)  # pyrefly: ignore[missing-attribute]
       if loss_weights is None:
-        byte_weight = (targets != 0).astype(jnp.float32)
+        byte_weight = (targets != 0).astype(jnp.float32)  # pyrefly: ignore[missing-attribute]
       else:
         byte_weight = loss_weights.astype(jnp.float32)
       batch_bytes = jnp.sum(token_bytes_jax[targets] * byte_weight)
@@ -5247,7 +5253,7 @@ def quantize_tfm_params(params, symmetric=False):
     return params
   quant_params = {}
   for key in params:  # pyrefly: ignore[not-iterable]
-    if key.startswith('block'):
+    if key.startswith('block'):  # pyrefly: ignore[missing-attribute]
       quant_params[key] = quantize_tfm_params(
           params[key], symmetric=symmetric  # pyrefly: ignore[bad-index, unsupported-operation]
       )
@@ -5268,10 +5274,10 @@ def quantize_tfm_params(params, symmetric=False):
         )
       quant_params[key] = subparams
     elif (
-        key.startswith('embed_linear')
-        or key.startswith('final_ln')
-        or key.startswith('pre_ln')
-        or key.startswith('post_ln')
+        key.startswith('embed_linear')  # pyrefly: ignore[missing-attribute]
+        or key.startswith('final_ln')  # pyrefly: ignore[missing-attribute]
+        or key.startswith('pre_ln')  # pyrefly: ignore[missing-attribute]
+        or key.startswith('post_ln')  # pyrefly: ignore[missing-attribute]
     ):
       # Leave the embedding linear and layer norm layer unquantized.
       quant_params[key] = params[key]  # pyrefly: ignore[bad-index, unsupported-operation]

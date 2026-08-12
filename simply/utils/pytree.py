@@ -109,7 +109,7 @@ def set_tree_value(
         raise ValueError(f'Path item {item} does not match subtree: {tree}')
       if i + 1 == len(path):
         tree[item.key] = value  # pyrefly: ignore[unsupported-operation]
-      elif tree.get(item.key) is None:
+      elif tree.get(item.key) is None:  # pyrefly: ignore[missing-attribute]
         tree[item.key] = construct_tree_with_path_value(path[i + 1 :], value)  # pyrefly: ignore[unsupported-operation]
         break
       else:
@@ -118,7 +118,7 @@ def set_tree_value(
       if not isinstance(item, jax.tree_util.SequenceKey):
         raise ValueError(f'Path item {item} does not match subtree: {tree}')
       if item.idx >= len(tree):  # pyrefly: ignore[bad-argument-type]
-        tree.extend([None] * (item.idx + 1 - len(tree)))  # pyrefly: ignore[bad-argument-type]
+        tree.extend([None] * (item.idx + 1 - len(tree)))  # pyrefly: ignore[bad-argument-type, missing-attribute]
       if i + 1 == len(path):
         tree[item.idx] = value  # pyrefly: ignore[unsupported-operation]
       elif tree[item.idx] is None:  # pyrefly: ignore[bad-index, unsupported-operation]
@@ -402,13 +402,13 @@ def concatenate_pytrees(trees: Sequence[PyTree]) -> PyTree:
 
   if tree_is_mapping(first_tree):
     concatenated = {}
-    keys = set(first_tree.keys())
+    keys = set(first_tree.keys())  # pyrefly: ignore[missing-attribute]
     for tree in trees:
       if not tree_is_mapping(tree):
         raise ValueError(f'Expect tree to be Mapping: {tree}')
-      if set(tree.keys()) != keys:
+      if set(tree.keys()) != keys:  # pyrefly: ignore[missing-attribute]
         raise ValueError(
-            f'Expect tree keys to be {keys}, but got {tree.keys()} instead.'
+            f'Expect tree keys to be {keys}, but got {tree.keys()} instead.'  # pyrefly: ignore[missing-attribute]
         )
     for key in keys:
       subtrees = [tree[key] for tree in trees]  # pyrefly: ignore[bad-index, unsupported-operation]
@@ -461,7 +461,7 @@ def trim_none(tree: PyTree) -> PyTree:
     return None
   if tree_is_mapping(tree):
     trimmed_tree = {}
-    for k, v in tree.items():
+    for k, v in tree.items():  # pyrefly: ignore[missing-attribute]
       v = trim_none(v)
       if v is not None:
         trimmed_tree[k] = v

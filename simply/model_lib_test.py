@@ -1461,8 +1461,8 @@ class MoETest(parameterized.TestCase):
         activation_dtype=activation_dtype,
     )
     simple_moe_output = simple_moe_fn(params, inputs, inputs_mask=inputs_mask)
-    self.assertEqual(moe_output.shape, simple_moe_output.shape)
-    self.assertEqual(moe_output.dtype, simple_moe_output.dtype)
+    self.assertEqual(moe_output.shape, simple_moe_output.shape)  # pyrefly: ignore[missing-attribute]
+    self.assertEqual(moe_output.dtype, simple_moe_output.dtype)  # pyrefly: ignore[missing-attribute]
     np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
         moe_output, simple_moe_output, rtol=1e-2, atol=1e-2)
 

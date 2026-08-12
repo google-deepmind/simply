@@ -76,7 +76,7 @@ def _read_run_scripts(
 def main(argv):
   del argv
 
-  src_dir = epath.Path(_SRC_DIR.value)
+  src_dir = epath.Path(_SRC_DIR.value)  # pyrefly: ignore[bad-argument-type]
   parquet_path = src_dir / 'SWE-bench_Pro/data/test-00000-of-00001.parquet'
   run_scripts_dir = src_dir / 'SWE-bench_Pro-os/run_scripts'
 
@@ -117,7 +117,7 @@ def main(argv):
     item['run_scripts'] = run_scripts  # {run_script.sh: ..., parser.py: ...}
     out_rows.append(item)
 
-  out_path = epath.Path(_OUT.value)
+  out_path = epath.Path(_OUT.value)  # pyrefly: ignore[bad-argument-type]
   logging.info('writing %d rows to %s', len(out_rows), out_path)
   with out_path.open('w') as f:
     json.dump(

@@ -145,7 +145,7 @@ class ByteVocabTest(absltest.TestCase):
 
   def test_decode_skips_specials(self):
     ids = [self.vocab.bos_id] + self.vocab.encode('hi') + [self.vocab.eos_id]
-    self.assertEqual(self.vocab.decode(ids), 'hi')
+    self.assertEqual(self.vocab.decode(ids), 'hi')  # pyrefly: ignore[bad-argument-type]
 
   def test_ids_within_vocab_size(self):
     ids = self.vocab.encode('the quick brown fox \u00e9')

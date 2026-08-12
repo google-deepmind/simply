@@ -272,7 +272,7 @@ class ExperimentHelper:
     scalars = common.get_raw_arrays(scalars)
     if filter_nonscalars:
       filtered_scalars = {}
-      for k, v in scalars.items():
+      for k, v in scalars.items():  # pyrefly: ignore[missing-attribute]
         if (converted_v := convert_to_scalar(v)) is not None:
           filtered_scalars[k] = converted_v
         else:

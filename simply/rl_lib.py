@@ -575,11 +575,11 @@ def create_train_batch(
   )
   logging.info(
       'Created global batch with structure %s',
-      global_train_batch.tree_structure(),
+      global_train_batch.tree_structure(),  # pyrefly: ignore[missing-attribute]
   )
 
   if normalize_reward_method:
-    global_train_batch = global_train_batch.normalize_reward(
+    global_train_batch = global_train_batch.normalize_reward(  # pyrefly: ignore[missing-attribute]
         RewardNormalizerRegistry.get_instance(normalize_reward_method)
     )
 

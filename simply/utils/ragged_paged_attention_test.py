@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyrefly: ignore-all-errors
 import dataclasses
 import functools
 import math
@@ -29,6 +28,7 @@ from simply.utils import ragged_paged_attention as rpa
 from simply.utils import sampling_lib
 from simply.utils import sharding
 
+# pyrefly: ignore[code]
 
 RaggedArray = common.RaggedArray
 
@@ -169,7 +169,7 @@ class DecodeStateTest(parameterized.TestCase):
         ds.local_num_pages, jnp.sum(page_indices >= 0, axis=-1)
     )
     new_kv_shape = (jnp.sum(q_lens), n_kv_heads * 2, per_head_dim)
-    new_kv = jnp.reshape(jnp.arange(np.prod(new_kv_shape)) * -1, new_kv_shape)
+    new_kv = jnp.reshape(jnp.arange(np.prod(new_kv_shape)) * -1, new_kv_shape)  # pyrefly: ignore[no-matching-overload]
     ds = jax.jit(ds.insert)(new_kv[:, 0::2], new_kv[:, 1::2], q_lens)
     np.testing.assert_array_equal(
         ds.pages[..., :per_head_dim],
@@ -296,13 +296,13 @@ class DecodeStateTest(parameterized.TestCase):
     np.testing.assert_array_equal(
         np.asarray(entry_b.payload), np.asarray(payload_b)
     )
-    # Both chunks are resident (no sliding-window eviction); `available`
-    # should be True.
-    self.assertTrue(bool(entry_a.available))
-    self.assertTrue(bool(entry_b.available))
+    # Both chunks are resident (no sliding-window eviction) and this is a
+    # global layer, so every token of both is written.
+    self.assertTrue(bool(np.asarray(entry_a.written).all()))
+    self.assertTrue(bool(np.asarray(entry_b.written).all()))
 
-  def test_extract_chunk_reports_unavailable_for_evicted_chunk(self):
-    """A sliding-window layer reports `available=False` for an evicted chunk."""
+  def test_extract_chunk_reports_nothing_valid_for_an_evicted_chunk(self):
+    """A sliding-window layer reports an empty mask for an evicted chunk."""
     sharding.set_mesh(
         [jax.device_count(), 1, 1, 1],
         axis_names=('replica', 'data', 'seq', 'model'),
@@ -341,11 +341,11 @@ class DecodeStateTest(parameterized.TestCase):
     # Chunk 1 (the tail) is still resident; chunk 0 has been evicted.
     entry_b = extract(ds3, jnp.int32(1), jnp.int32(1), position)
     entry_a = extract(ds3, jnp.int32(1), jnp.int32(0), position)
-    self.assertTrue(bool(entry_b.available))
+    self.assertTrue(bool(np.asarray(entry_b.written).any()))
     np.testing.assert_array_equal(
         np.asarray(entry_b.payload), np.asarray(payload_b)
     )
-    self.assertFalse(bool(entry_a.available))
+    self.assertFalse(bool(np.asarray(entry_a.written).any()))
 
   def test_inject_chunk_rejects_bad_shape(self):
     sharding.set_mesh(
@@ -433,7 +433,7 @@ class DecodeStateTest(parameterized.TestCase):
       q = jnp.reshape(ragged_q.row(i), (-1, n_q_heads, per_head_dim))
       k = updated_ragged_kv.row(i)[:, 0::2]
       v = updated_ragged_kv.row(i)[:, 1::2]
-      o = qkv_attn(q, k, v)
+      o = qkv_attn(q, k, v)  # pyrefly: ignore[bad-argument-type]
       expected_attn_out_list.append(o)
 
     config = rpa.DecodeStateConfig(
@@ -525,6 +525,183 @@ class DecodeStateTest(parameterized.TestCase):
     )
 
 
+class ResidencyGuardTest(parameterized.TestCase):
+  """The window mask ALONE is a sufficient written extent signal -- proved here.
+
+  `extract_chunk` reports `chunk_written_mask(chunk_idx, position)` and nothing
+  else: written extent is purely positional, with no residency term. That is
+  only
+  correct because the resident region always CONTAINS the window, so a chunk
+  the mask marks is a chunk still in the pages. This test is what holds that
+  up; it is load-bearing for `extract_chunk`, not documentation.
+
+  The argument, checked exhaustively below: `release_for_window` frees
+  `floor(floor(max(kv_lens - W, 0) / page_size) / num_shards)` pages per
+  shard, i.e. a whole number of CHUNKS, and never more than `kv_lens - W`
+  tokens -- so the resident region is chunk-aligned and always contains
+  `[position - W, position)`. A non-empty mask needs `chunk_end > position -
+  W`, and with both quantities on the chunk grid that forces `chunk_idx >=
+  evicted_chunks`, i.e. the chunk is resident.
+
+  `test_the_host_model_matches_release_for_window` is what makes the rest
+  trustworthy: the proof reasons about a host model of the release formula,
+  so that model is first checked against the real device code.
+  """
+
+  def _released(
+      self, kv_lens: int, window: int | None, page_size: int, shards: int
+  ) -> int:
+    """Host model of `release_for_window`'s per-call release, in tokens.
+
+    Args:
+      kv_lens: the layer's resident length before the call.
+      window: the sliding window, or `None` for a global layer.
+      page_size: tokens per page.
+      shards: seq-partition shard count.
+
+    Returns:
+      How many tokens the call frees.
+    """
+    if window is None:
+      return 0
+    return (max(kv_lens - window, 0) // page_size // shards) * (
+        page_size * shards
+    )
+
+  def test_the_host_model_matches_release_for_window(self):
+    # The proof below reasons about `release_for_window` through the formula
+    # above, so first check the formula IS what the device code does. If this
+    # ever fails, the sweep that follows is proving something about a model
+    # that no longer matches reality -- and `extract_chunk` has no second
+    # mechanism to fall back on.
+    sharding.set_mesh(
+        [jax.device_count(), 1, 1, 1],
+        axis_names=('replica', 'data', 'seq', 'model'),
+    )
+    page_size = 2
+    config = rpa.DecodeStateConfig(
+        total_num_pages=32,
+        page_size=page_size,
+        n_kv_heads=1,
+        per_head_dim=2,
+        batch_size=1,
+        dtype='float32',
+        max_seq_len=64,
+        window_size=3 * page_size,
+    )
+    ds = config.init()
+    release = jax.jit(rpa.DecodeState.release_for_window)
+    for kv_len in range(0, 8 * ds.chunk_size, ds.page_size):
+      state = dataclasses.replace(ds, kv_lens=jnp.full_like(ds.kv_lens, kv_len))
+      got = int(np.asarray(release(state).kv_lens)[0])
+      want = kv_len - self._released(
+          kv_len, config.window_size, page_size, ds.num_shards
+      )
+      self.assertEqual(got, want, f'kv_lens={kv_len}')
+
+  @parameterized.named_parameters(
+      dict(testcase_name='page2', page_size=2),
+      dict(testcase_name='page3', page_size=3),
+  )
+  def test_a_non_empty_mask_implies_the_chunk_is_resident(self, page_size):
+    # `extract_chunk` depends on this directly: it publishes the mask as-is,
+    # so a mask marking an evicted chunk would hand out recycled pages.
+    sharding.set_mesh(
+        [jax.device_count(), 1, 1, 1],
+        axis_names=('replica', 'data', 'seq', 'model'),
+    )
+    base = dict(
+        total_num_pages=64,
+        page_size=page_size,
+        n_kv_heads=1,
+        per_head_dim=2,
+        batch_size=1,
+        dtype='float32',
+        max_seq_len=128,
+    )
+    probe = rpa.DecodeStateConfig(**base, window_size=None).init()
+    chunk = probe.chunk_size
+    shards = probe.num_shards
+    windows = [None, 1, 2, chunk - 1, chunk, chunk + 1, 2 * chunk, 3 * chunk]
+    positions = list(range(1, 6 * chunk + 2))
+    chunk_ids = list(range(0, 8))
+    checked = tight = evicting = 0
+    for window in windows:
+      ds = rpa.DecodeStateConfig(**base, window_size=window).init()
+      masks = jax.jit(
+          jax.vmap(
+              jax.vmap(ds.chunk_written_mask, in_axes=(0, None)),
+              in_axes=(None, 0),
+          )
+      )(jnp.asarray(chunk_ids), jnp.asarray(positions))
+      masks = np.asarray(masks)  # [position, chunk_idx, chunk]
+      for p_i, position in enumerate(positions):
+        # Every resident length this position can be in: `kv_lens` only ever
+        # drops by whole chunks, and `release_for_window` never frees inside
+        # the window -- enumerate ALL states satisfying that, which is a
+        # superset of what any pass schedule can reach.
+        reachable = [
+            position - evicted * chunk
+            for evicted in range(position // chunk + 1)
+            if window is None
+            and evicted == 0
+            or window is not None
+            and position - evicted * chunk >= min(position, window)
+        ]
+        for kv_len in reachable:
+          evicted_chunks = (position - kv_len) // chunk
+          for c_i, chunk_idx in enumerate(chunk_ids):
+            if not masks[p_i, c_i].any():
+              continue
+            checked += 1
+            evicting += evicted_chunks > 0
+            # The tight case: the mask is non-empty for the chunk sitting
+            # exactly at the eviction frontier, where "one more evicted
+            # chunk" would break the implication.
+            tight += chunk_idx == evicted_chunks and evicted_chunks > 0
+            self.assertGreaterEqual(
+                chunk_idx - evicted_chunks,
+                0,
+                f'a non-empty mask on an EVICTED chunk: window={window},'
+                f' position={position}, kv_lens={kv_len},'
+                f' chunk_idx={chunk_idx}, shards={shards}',
+            )
+    # The sweep is exhaustive over the reachable states, but assert it
+    # actually reached the ones that make the implication non-trivial rather
+    # than trusting a raw count.
+    self.assertGreater(checked, 100, 'the sweep checked almost nothing')
+    self.assertGreater(evicting, 20, 'no state with an eviction was reached')
+    self.assertGreater(tight, 5, 'the eviction frontier was never exercised')
+
+  def test_the_schedules_a_real_slot_walks_stay_inside_that_set(self):
+    # The sweep above enumerates a superset of reachable `(position,
+    # kv_lens)` states. This checks the recurrence really stays in it, for
+    # pass schedules including ones that end just after an eviction.
+    page_size, shards = 2, 4
+    chunk = page_size * shards
+    for window in (None, 1, chunk - 1, chunk, chunk + 1, 2 * chunk):
+      for step in (1, 2, chunk // 2, chunk, chunk + 1, 2 * chunk + 3):
+        position = kv_len = 0
+        while position < 6 * chunk:
+          kv_len -= self._released(kv_len, window, page_size, shards)
+          take = min(step, 6 * chunk - position)
+          position += take
+          kv_len += take
+          self.assertEqual(
+              (position - kv_len) % chunk,
+              0,
+              f'eviction went off the chunk grid: window={window},'
+              f' step={step}, position={position}, kv_lens={kv_len}',
+          )
+          if window is not None:
+            self.assertGreaterEqual(
+                kv_len,
+                min(position, window),
+                f'the window was evicted: window={window}, step={step},'
+                f' position={position}, kv_lens={kv_len}',
+            )
+
+
 class SamplingStateTest(parameterized.TestCase):
 
   def test_push_and_release(self):
@@ -533,7 +710,7 @@ class SamplingStateTest(parameterized.TestCase):
         max_total_num_tokens=16,
         prng_key=jax.random.key(0),
         eos_ids=jnp.array([100]),
-        decode_state=rpa.DecodeStateConfig(
+        decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
             total_num_pages=6,
             page_size=3,
             n_kv_heads=1,
@@ -583,7 +760,7 @@ class SamplingStateTest(parameterized.TestCase):
         max_total_num_tokens=8,
         prng_key=jax.random.key(0),
         eos_ids=jnp.array([100]),
-        decode_state=rpa.DecodeStateConfig(
+        decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
             total_num_pages=6,
             page_size=3,
             n_kv_heads=1,
@@ -681,7 +858,7 @@ class SamplingStateTest(parameterized.TestCase):
         max_total_num_tokens=max_seq_len * 100,
         prng_key=jax.random.key(0),
         eos_ids=jnp.array([100]),
-        decode_state=rpa.DecodeStateConfig(
+        decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
             total_num_pages=6,
             page_size=3,
             n_kv_heads=n_kv_heads,
@@ -727,18 +904,18 @@ class SamplingStateTest(parameterized.TestCase):
         ragged: bool = True,
     ) -> tuple[jax.Array, common.PyTree]:
       del segment_ids
-      emb = jnp.take(params['emb'], tokens, axis=0)
+      emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       emb *= jnp.cos(segment_positions)[:, :, None]
-      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
       if ragged:
         q = einops.rearrange(q, '1 l ... -> l ...')
         k = einops.rearrange(k, '1 l ... -> l ...')
         v = einops.rearrange(v, '1 l ... -> l ...')
         decode_state, attn_out = (
-            decode_state.update_decode_state_and_compute_attn(
-                q=RaggedArray(q, extra_inputs['lens']),
+            decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+                q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
                 k=k,
                 v=v,
             )
@@ -747,7 +924,7 @@ class SamplingStateTest(parameterized.TestCase):
       else:
         attn_out = qkv_attn(q, k, v)
       output = jnp.einsum(
-          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
       )
       return output, {'decode_state': decode_state}
 
@@ -791,16 +968,16 @@ class SamplingStateTest(parameterized.TestCase):
       np.testing.assert_array_equal(
           sampling_state.tokens[i][:input_len], tokens.row(i)
       )
-      length = len(outputs[i]['tokens'])
+      length = len(outputs[i]['tokens'])  # pyrefly: ignore[bad-argument-type]
 
-      np.testing.assert_allclose(
-          outputs[i]['logprobs'][input_len:length],
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          outputs[i]['logprobs'][input_len:length],  # pyrefly: ignore[bad-index]
           logprobs[i][input_len:length],
           rtol=5e-3,
           atol=1e-10,
       )
-      np.testing.assert_allclose(
-          outputs[i]['scores'][1:], logprobs[i][1:length], rtol=5e-3, atol=1e-10
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          outputs[i]['scores'][1:], logprobs[i][1:length], rtol=5e-3, atol=1e-10  # pyrefly: ignore[bad-index]
       )
 
   # NOTE: budget starts at 2 (not 1). A budget of 1 => a capacity-1 ragged-query
@@ -849,7 +1026,7 @@ class SamplingStateTest(parameterized.TestCase):
           max_total_num_tokens=max_seq_len * 100,
           prng_key=jax.random.key(0),
           eos_ids=jnp.array([100]),
-          decode_state=rpa.DecodeStateConfig(
+          decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
               total_num_pages=6,
               page_size=3,
               n_kv_heads=n_kv_heads,
@@ -895,24 +1072,24 @@ class SamplingStateTest(parameterized.TestCase):
         ragged: bool = True,
     ) -> tuple[jax.Array, common.PyTree]:
       del segment_ids, ragged
-      emb = jnp.take(params['emb'], tokens, axis=0)
+      emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       emb *= jnp.cos(segment_positions)[:, :, None]
-      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
       q = einops.rearrange(q, '1 l ... -> l ...')
       k = einops.rearrange(k, '1 l ... -> l ...')
       v = einops.rearrange(v, '1 l ... -> l ...')
       decode_state, attn_out = (
-          decode_state.update_decode_state_and_compute_attn(
-              q=RaggedArray(q, extra_inputs['lens']),
+          decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+              q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
               k=k,
               v=v,
           )
       )
       attn_out = einops.rearrange(attn_out, 'l ... -> 1 l ...')
       output = jnp.einsum(
-          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
       )
       return output, {'decode_state': decode_state}
 
@@ -957,9 +1134,9 @@ class SamplingStateTest(parameterized.TestCase):
       )
       # scores[0] is a documented dummy slot (uninitialized); skip it, as
       # `test_continue_decode` does.
-      np.testing.assert_allclose(
-          disagg_out[i]['scores'][1:],
-          mixed_out[i]['scores'][1:],
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          disagg_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
+          mixed_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
           rtol=5e-3,
           atol=1e-6,
       )
@@ -1007,7 +1184,7 @@ class SamplingStateTest(parameterized.TestCase):
           max_total_num_tokens=max_seq_len * 100,
           prng_key=jax.random.key(0),
           eos_ids=jnp.array([100]),
-          decode_state=rpa.DecodeStateConfig(
+          decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
               total_num_pages=6,
               page_size=3,
               n_kv_heads=n_kv_heads,
@@ -1053,24 +1230,24 @@ class SamplingStateTest(parameterized.TestCase):
         ragged: bool = True,
     ) -> tuple[jax.Array, common.PyTree]:
       del segment_ids, ragged
-      emb = jnp.take(params['emb'], tokens, axis=0)
+      emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       emb *= jnp.cos(segment_positions)[:, :, None]
-      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
       q = einops.rearrange(q, '1 l ... -> l ...')
       k = einops.rearrange(k, '1 l ... -> l ...')
       v = einops.rearrange(v, '1 l ... -> l ...')
       decode_state, attn_out = (
-          decode_state.update_decode_state_and_compute_attn(
-              q=RaggedArray(q, extra_inputs['lens']),
+          decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+              q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
               k=k,
               v=v,
           )
       )
       attn_out = einops.rearrange(attn_out, 'l ... -> 1 l ...')
       output = jnp.einsum(
-          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
       )
       return output, {'decode_state': decode_state}
 
@@ -1159,7 +1336,7 @@ class SamplingStateTest(parameterized.TestCase):
           max_total_num_tokens=max_seq_len * 100,
           prng_key=jax.random.key(0),
           eos_ids=jnp.array([100]),
-          decode_state=rpa.DecodeStateConfig(
+          decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
               total_num_pages=6,
               page_size=3,
               n_kv_heads=n_kv_heads,
@@ -1208,17 +1385,17 @@ class SamplingStateTest(parameterized.TestCase):
           ragged: bool = True,
       ) -> tuple[jax.Array, common.PyTree]:
         del segment_ids, ragged
-        emb = jnp.take(params['emb'], tokens, axis=0)
+        emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
         emb *= jnp.cos(segment_positions)[:, :, None]
-        q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-        k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-        v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+        q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+        k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+        v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
         q = einops.rearrange(q, '1 l ... -> l ...')
         k = einops.rearrange(k, '1 l ... -> l ...')
         v = einops.rearrange(v, '1 l ... -> l ...')
         decode_state, attn_out = (
-            decode_state.update_decode_state_and_compute_attn(
-                q=RaggedArray(q, extra_inputs['lens']),
+            decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+                q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
                 k=k,
                 v=v,
                 num_queries_per_block=num_queries_per_block,
@@ -1226,7 +1403,7 @@ class SamplingStateTest(parameterized.TestCase):
         )
         attn_out = einops.rearrange(attn_out, 'l ... -> 1 l ...')
         output = jnp.einsum(
-            'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+            'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
         )
         return output, {'decode_state': decode_state}
 
@@ -1265,9 +1442,9 @@ class SamplingStateTest(parameterized.TestCase):
           decode_out[i]['tokens'], mixed_out[i]['tokens']
       )
       # scores[0] is a documented dummy slot (uninitialized); skip it.
-      np.testing.assert_allclose(
-          decode_out[i]['scores'][1:],
-          mixed_out[i]['scores'][1:],
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          decode_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
+          mixed_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
           rtol=5e-3,
           atol=1e-6,
       )
@@ -1314,7 +1491,7 @@ class SamplingStateTest(parameterized.TestCase):
           max_total_num_tokens=max_seq_len * 100,
           prng_key=jax.random.key(0),
           eos_ids=jnp.array([100]),
-          decode_state=rpa.DecodeStateConfig(
+          decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
               total_num_pages=6,
               page_size=3,
               n_kv_heads=n_kv_heads,
@@ -1360,24 +1537,24 @@ class SamplingStateTest(parameterized.TestCase):
         ragged: bool = True,
     ) -> tuple[jax.Array, common.PyTree]:
       del segment_ids, ragged
-      emb = jnp.take(params['emb'], tokens, axis=0)
+      emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       emb *= jnp.cos(segment_positions)[:, :, None]
-      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
       q = einops.rearrange(q, '1 l ... -> l ...')
       k = einops.rearrange(k, '1 l ... -> l ...')
       v = einops.rearrange(v, '1 l ... -> l ...')
       decode_state, attn_out = (
-          decode_state.update_decode_state_and_compute_attn(
-              q=RaggedArray(q, extra_inputs['lens']),
+          decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+              q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
               k=k,
               v=v,
           )
       )
       attn_out = einops.rearrange(attn_out, 'l ... -> 1 l ...')
       output = jnp.einsum(
-          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
       )
       return output, {'decode_state': decode_state}
 
@@ -1416,9 +1593,9 @@ class SamplingStateTest(parameterized.TestCase):
           per_stage_out[i]['tokens'], default_out[i]['tokens']
       )
       # scores[0] is a documented dummy slot (uninitialized); skip it.
-      np.testing.assert_allclose(
-          per_stage_out[i]['scores'][1:],
-          default_out[i]['scores'][1:],
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          per_stage_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
+          default_out[i]['scores'][1:],  # pyrefly: ignore[bad-index]
           rtol=5e-3,
           atol=1e-6,
       )
@@ -1459,7 +1636,7 @@ class SamplingStateTest(parameterized.TestCase):
           max_total_num_tokens=max_seq_len * 100,
           prng_key=jax.random.key(0),
           eos_ids=jnp.array([100]),
-          decode_state=rpa.DecodeStateConfig(
+          decode_state=rpa.DecodeStateConfig(  # pyrefly: ignore[bad-argument-type]
               total_num_pages=6,
               page_size=3,
               n_kv_heads=n_kv_heads,
@@ -1505,24 +1682,24 @@ class SamplingStateTest(parameterized.TestCase):
         ragged: bool = True,
     ) -> tuple[jax.Array, common.PyTree]:
       del segment_ids, ragged
-      emb = jnp.take(params['emb'], tokens, axis=0)
+      emb = jnp.take(params['emb'], tokens, axis=0)  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
       emb *= jnp.cos(segment_positions)[:, :, None]
-      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])
-      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])
-      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])
+      q = jnp.einsum('...d,ndh->...nh', emb, params['q_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      k = jnp.einsum('...d,ndh->...nh', emb, params['k_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
+      v = jnp.einsum('...d,ndh->...nh', emb, params['v_proj'])  # pyrefly: ignore[bad-index, unsupported-operation]
       q = einops.rearrange(q, '1 l ... -> l ...')
       k = einops.rearrange(k, '1 l ... -> l ...')
       v = einops.rearrange(v, '1 l ... -> l ...')
       decode_state, attn_out = (
-          decode_state.update_decode_state_and_compute_attn(
-              q=RaggedArray(q, extra_inputs['lens']),
+          decode_state.update_decode_state_and_compute_attn(  # pyrefly: ignore[missing-attribute]
+              q=RaggedArray(q, extra_inputs['lens']),  # pyrefly: ignore[bad-argument-type, bad-index, unsupported-operation]
               k=k,
               v=v,
           )
       )
       attn_out = einops.rearrange(attn_out, 'l ... -> 1 l ...')
       output = jnp.einsum(
-          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)
+          'vd,...d->...v', params['emb'], jnp.mean(attn_out, axis=-2)  # pyrefly: ignore[bad-index, unsupported-operation]
       )
       return output, {'decode_state': decode_state}
 
@@ -1562,13 +1739,13 @@ class SamplingStateTest(parameterized.TestCase):
       np.testing.assert_array_equal(
           disagg_out[i]['tokens'], mixed_out[i]['tokens']
       )
-      input_len = int(mixed_out[i]['input_len'])
-      length = len(mixed_out[i]['tokens'])
+      input_len = int(mixed_out[i]['input_len'])  # pyrefly: ignore[bad-argument-type]
+      length = len(mixed_out[i]['tokens'])  # pyrefly: ignore[bad-argument-type]
       # Compare only the DECODE-position scores (>= input_len); prompt-position
       # scores are zero placeholders when prefill logits are skipped.
-      np.testing.assert_allclose(
-          disagg_out[i]['scores'][input_len:length],
-          mixed_out[i]['scores'][input_len:length],
+      np.testing.assert_allclose(  # pyrefly: ignore[no-matching-overload]
+          disagg_out[i]['scores'][input_len:length],  # pyrefly: ignore[bad-index]
+          mixed_out[i]['scores'][input_len:length],  # pyrefly: ignore[bad-index]
           rtol=5e-3,
           atol=1e-6,
       )
@@ -1642,7 +1819,7 @@ class DecodeBlockQRealisticShapeTest(parameterized.TestCase):
       q = jnp.reshape(ragged_q.row(i), (-1, n_q_heads, per_head_dim))
       k = updated_ragged_kv.row(i)[:, 0::2]
       v = updated_ragged_kv.row(i)[:, 1::2]
-      expected_attn_out_list.append(qkv_attn(q, k, v))
+      expected_attn_out_list.append(qkv_attn(q, k, v))  # pyrefly: ignore[bad-argument-type]
 
     config = rpa.DecodeStateConfig(
         total_num_pages=total_num_pages,
