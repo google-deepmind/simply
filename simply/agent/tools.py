@@ -133,7 +133,8 @@ class BashAction(Action):
 
   def to_llm(self) -> str:
     """Returns the string representation of the action for LLM consumption."""
-    return f'COMMAND:\n{self.command}\nTIMEOUT: {self.timeout:.2f}'
+    timeout = 'None' if self.timeout is None else f'{self.timeout:.2f}'
+    return f'COMMAND:\n{self.command}\nTIMEOUT: {timeout}'
 
   @classmethod
   def format_output(

@@ -22,6 +22,33 @@ from simply.agent import tools
 
 class BashToolTest(absltest.TestCase):
 
+  def test_execute_without_timeout(self):
+    tool = tools.BashTool(executor=env.execute_bash_locally)
+    with mock.patch.object(subprocess, 'run') as mock_run:
+      mock_run.return_value.stdout = ''
+      mock_run.return_value.stderr = ''
+      mock_run.return_value.returncode = 0
+
+      action, observation = tool.execute(
+          args_json='{"command": "sleep 10", "timeout": null}'
+      )
+
+    self.assertIsNotNone(action)
+    self.assertEqual(action.to_llm(), 'COMMAND:\nsleep 10\nTIMEOUT: None')
+    self.assertIn('RETURN CODE: 0', observation)
+    self.assertIsNone(action.timeout)
+    mock_run.assert_called_once_with(
+        'sleep 10',
+        shell=True,
+        check=False,
+        text=True,
+        encoding='utf-8',
+        errors='backslashreplace',
+        capture_output=True,
+        timeout=None,
+        cwd=None,
+    )
+
   def test_execute_success(self):
     tool = tools.BashTool(executor=env.execute_bash_locally)
     with mock.patch.object(subprocess, 'run') as mock_run:
