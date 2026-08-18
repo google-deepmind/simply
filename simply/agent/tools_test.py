@@ -33,7 +33,7 @@ class BashToolTest(absltest.TestCase):
           args_json='{"command": "sleep 10", "timeout": null}'
       )
 
-    self.assertIsNotNone(action)
+    assert isinstance(action, tools.BashAction)
     self.assertEqual(action.to_llm(), 'COMMAND:\nsleep 10\nTIMEOUT: None')
     self.assertIn('RETURN CODE: 0', observation)
     self.assertIsNone(action.timeout)
