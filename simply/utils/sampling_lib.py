@@ -432,11 +432,16 @@ def top_k_mask(logits: jax.Array, top_k: int) -> jax.Array:
 
 
 def top_p_mask(logits: jax.Array, top_p: float) -> jax.Array:
+  """Masks logits outside the nucleus, always keeping its top token."""
   probs = jax.nn.softmax(logits, axis=-1)
   indices = jnp.argsort(logits, axis=-1, descending=True)
   sorted_probs = jnp.take_along_axis(probs, indices, axis=-1)
   cumsum = jnp.cumulative_sum(sorted_probs, axis=-1, include_initial=True)
   mask = cumsum[..., :-1] < top_p
+  # A nucleus must contain at least one candidate. In particular, top_p=0
+  # should reduce to the highest-logit token instead of producing an empty
+  # mask whose fallback logits can select an unrelated vocabulary item.
+  mask = mask.at[..., 0].set(True)
   _, mask = jax.lax.sort_key_val(indices, mask, dimension=-1)
   return mask
 
@@ -456,7 +461,8 @@ def _fused_top_k_top_p_mask(
     top_p: Cumulative probability threshold within the top-k candidates.
 
   Returns:
-    Boolean mask of shape ``logits.shape``.
+    Boolean mask of shape ``logits.shape`` containing at least the
+    highest-logit token.
   """
   vocab_size = logits.shape[-1]
   k = max(min(top_k, vocab_size), 1)
@@ -465,6 +471,7 @@ def _fused_top_k_top_p_mask(
   probs = jax.nn.softmax(top_k_vals, axis=-1)
   cumsum = jnp.cumulative_sum(probs, axis=-1, include_initial=True)
   top_p_keep = cumsum[..., :-1] < top_p
+  top_p_keep = top_p_keep.at[..., 0].set(True)
   indicator = jax.nn.one_hot(top_k_indices, vocab_size, dtype=jnp.bool_)
   return jnp.any(indicator & top_p_keep[..., None], axis=-2)
 
