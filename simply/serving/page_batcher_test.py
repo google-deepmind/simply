@@ -28,7 +28,10 @@ model, a mesh or a TPU. Everything below the drivers lives in
 `prefix_cache_test`; everything above them needs real device work.
 """
 
+import contextlib
 import dataclasses
+from typing import Any
+from unittest import mock
 
 from absl.testing import absltest
 import jax.numpy as jnp
@@ -54,12 +57,33 @@ class _FakeSamplingState:
   is_pad_seq: np.ndarray
 
 
+@dataclasses.dataclass(frozen=True)
+class _FakeAbstractSamplingState:
+  chunk_size: int = CHUNK_SIZE
+
+
 def _make_batcher(enable_prefix_caching: bool) -> page_batcher.Batcher:
   """Builds a Batcher without touching the model/mesh."""
   return page_batcher.Batcher(
       config=config_lib.BaseExperimentConfig(),
       lm_format=lm_format_lib.Pretrain(),
       enable_prefix_caching=enable_prefix_caching,
+  )
+
+
+def _fake_abstract_sampling_state() -> contextlib.AbstractContextManager[Any]:
+  """Swaps the device-shaped state for the one field the cache reads off it.
+
+  Patches the CLASS attribute, so the `cached_property` descriptor itself is
+  replaced for the duration -- no writing into an instance's `__dict__`.
+
+  Returns:
+    A context manager holding the patch.
+  """
+  return mock.patch.object(
+      page_batcher.Batcher,
+      'abstract_sampling_state',
+      _FakeAbstractSamplingState(),
   )
 
 
@@ -127,6 +151,38 @@ class PrefixCacheWiringTest(absltest.TestCase):
   def test_disabled_has_no_cache(self):
     batcher = _make_batcher(enable_prefix_caching=False)
     self.assertIsNone(batcher.prefix_cache)
+
+  def test_prefix_cache_max_bytes_passed_to_cache(self):
+    batcher = page_batcher.Batcher(
+        config=config_lib.BaseExperimentConfig(),
+        lm_format=lm_format_lib.Pretrain(),
+        enable_prefix_caching=True,
+        prefix_cache_max_bytes=32 * 1024**3,
+    )
+    with _fake_abstract_sampling_state():
+      cache = batcher.prefix_cache
+    self.assertIsNotNone(cache)
+    self.assertEqual(cache.max_bytes, 32 * 1024**3)
+
+  def test_default_prefix_cache_max_bytes_is_derived_from_memory_budget(self):
+    # The default is derived from the memory ceiling, not a constant. Two
+    # things make the patch below the right one: the `default_factory` runs
+    # at CONSTRUCTION time, so it has to wrap the construction; and the
+    # factory captured the function object when the class was created, so the
+    # seam that actually moves the answer is the probe underneath it, not
+    # `default_max_bytes` itself. A 35 GiB ceiling yields a 7 GiB budget.
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=35 * 1024**3  # pylint: disable=protected-access
+    ):
+      batcher = _make_batcher(enable_prefix_caching=True)
+    self.assertEqual(batcher.prefix_cache_max_bytes, 7 * 1024**3)
+    with _fake_abstract_sampling_state():
+      cache = batcher.prefix_cache
+    self.assertIsNotNone(cache)
+    self.assertEqual(cache.max_bytes, 7 * 1024**3)
+    # The regression this guards: a budget nailed to a constant far above any
+    # real memory ceiling, so eviction could never fire.
+    self.assertNotEqual(cache.max_bytes, 300 * 1024**3)
 
   def test_the_drivers_are_no_ops_when_caching_is_disabled(self):
     # Both drivers run on every pass of the decode loop whether or not there
@@ -213,6 +269,47 @@ class PrefixCacheDriverTest(absltest.TestCase):
         reader._maybe_restore_from_prefix_cache(), [0]  # pylint: disable=protected-access
     )
     np.testing.assert_array_equal(_positions(reader), after)
+
+
+class PrefixCacheEvictionDriverTest(absltest.TestCase):
+  """The eviction driver, and above all what it SAYS.
+
+  The line it prints every pass is load-bearing: a cache whose budget sits
+  above the memory ceiling never evicts and, without this line, prints
+  nothing at all -- indistinguishable from a cache that is not there.
+  """
+
+  def test_holding_is_logged_even_when_nothing_is_evicted(self):
+    batcher = _prefilling_batcher(
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]], [8]
+    )
+    with self.assertLogs(level='INFO') as logs:
+      freed = batcher._maybe_evict_prefix_cache()  # pylint: disable=protected-access
+    self.assertEqual(freed, 0)
+    self.assertIn('prefix_cache: holding', '\n'.join(logs.output))
+
+  def test_a_cache_over_budget_evicts_and_says_what_it_freed(self):
+    batcher = _prefilling_batcher(
+        [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]], [8]
+    )
+    cache = batcher.prefix_cache
+    assert cache is not None
+    batcher._maybe_snapshot_prefix_cache(np.zeros(1, np.int64))  # pylint: disable=protected-access
+    self.assertGreater(cache.nbytes, 0)
+    # A budget below what is held is the only way to make eviction fire on a
+    # cache this small.
+    cache.max_bytes = 0
+    with self.assertLogs(level='INFO') as logs:
+      freed = batcher._maybe_evict_prefix_cache()  # pylint: disable=protected-access
+    self.assertGreater(freed, 0)
+    self.assertEqual(cache.nbytes, 0)
+    output = '\n'.join(logs.output)
+    self.assertIn('prefix_cache: holding', output)
+    self.assertIn('prefix_cache: freed', output)
+
+  def test_no_cache_evicts_nothing(self):
+    batcher = _make_batcher(enable_prefix_caching=False)
+    self.assertEqual(batcher._maybe_evict_prefix_cache(), 0)  # pylint: disable=protected-access
 
 
 if __name__ == '__main__':

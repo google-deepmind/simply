@@ -5,10 +5,11 @@ This script downloads models and datasets to the correct locations
 so that config_lib and data_lib can find them automatically.
 
 Usage:
-  ./setup_assets.sh                 # Download both models and datasets
-  ./setup_assets.sh --models-only   # Download only models
-  ./setup_assets.sh --datasets-only # Download only datasets
-  ./setup_assets.sh --help          # Show all options
+  python setup/setup_assets.py                 # Models + datasets (~10 GB)
+  python setup/setup_assets.py --vocabs-only   # Tokenizers only (~100 MB)
+  python setup/setup_assets.py --models-only   # Download only models
+  python setup/setup_assets.py --datasets-only # Download only datasets
+  python setup/setup_assets.py --help          # Show all options
 
 Default locations:
  - Models: ~/.cache/simply/models/
@@ -42,6 +43,11 @@ VOCABS_DIR = os.getenv('SIMPLY_VOCABS', os.path.expanduser('~/.cache/simply/voca
 # HuggingFace repositories
 MODELS_REPO = "unkindledmonkey/simply-models"
 DATASETS_REPO = "unkindledmonkey/simply-datasets"
+
+# Tokenizer files inside the models repo; enough to run training/eval configs
+# without pulling the multi-GB checkpoints.
+VOCAB_PATTERNS = ["*/tokenizer.model", "*/tokenizer.json",
+                  "*/tokenizer_config.json"]
 
 
 def reorganize_gemma_models(models_dir: str):
@@ -170,9 +176,11 @@ def setup_qwen_vocabs(models_dir: str, vocabs_dir: str):
 
 
 
-def download_models(models_dir: str, repo: str = MODELS_REPO):
-  """Download pretrained models from HuggingFace."""
-  print(f"Downloading models from {repo}...")
+def download_models(models_dir: str, vocabs_dir: str, repo: str = MODELS_REPO,
+                    vocabs_only: bool = False):
+  """Download pretrained models (or just their tokenizers) from HuggingFace."""
+  what = "tokenizers" if vocabs_only else "models"
+  print(f"Downloading {what} from {repo}...")
   print(f"Target directory: {models_dir}")
 
   Path(models_dir).mkdir(parents=True, exist_ok=True)
@@ -182,22 +190,23 @@ def download_models(models_dir: str, repo: str = MODELS_REPO):
       repo_id=repo,
       repo_type="model",
       local_dir=models_dir,
-      local_dir_use_symlinks=False,
+      allow_patterns=VOCAB_PATTERNS if vocabs_only else None,
     )
-    print(f"[OK] Models downloaded successfully to {models_dir}")
+    print(f"[OK] Downloaded {what} to {models_dir}")
 
-    # Reorganize Gemma model directories
-    print("\nReorganizing Gemma model directories...")
-    reorganize_gemma_models(models_dir)
+    if not vocabs_only:
+      # Reorganize Gemma model directories
+      print("\nReorganizing Gemma model directories...")
+      reorganize_gemma_models(models_dir)
 
     # Setup vocab files
     print("\nSetting up vocab files...")
-    setup_gemma_vocabs(models_dir, VOCABS_DIR)
-    setup_qwen_vocabs(models_dir, VOCABS_DIR)
+    setup_gemma_vocabs(models_dir, vocabs_dir)
+    setup_qwen_vocabs(models_dir, vocabs_dir)
 
     return True
   except Exception as e:
-    print(f"[ERROR] Failed to download models: {e}")
+    print(f"[ERROR] Failed to download {what}: {e}")
     return False
 
 
@@ -213,7 +222,6 @@ def download_datasets(datasets_dir: str, repo: str = DATASETS_REPO):
       repo_id=repo,
       repo_type="dataset",
       local_dir=datasets_dir,
-      local_dir_use_symlinks=False,
     )
     print(f"[OK] Datasets downloaded successfully to {datasets_dir}")
     return True
@@ -247,6 +255,11 @@ def main():
     help='Download only datasets'
   )
   parser.add_argument(
+    '--vocabs-only',
+    action='store_true',
+    help='Download only the tokenizers from the models repo (~100 MB)'
+  )
+  parser.add_argument(
     '--models-repo',
     default=MODELS_REPO,
     help=f'HuggingFace models repository (default: {MODELS_REPO})'
@@ -267,6 +280,11 @@ def main():
     help=f'Datasets directory (default: {DATASETS_DIR})'
   )
   parser.add_argument(
+    '--vocabs-dir',
+    default=VOCABS_DIR,
+    help=f'Vocabs directory (default: {VOCABS_DIR})'
+  )
+  parser.add_argument(
     '--force',
     action='store_true',
     help='Download even if directories already exist'
@@ -276,7 +294,7 @@ def main():
 
   # Determine what to download
   download_models_flag = not args.datasets_only
-  download_datasets_flag = not args.models_only
+  download_datasets_flag = not (args.models_only or args.vocabs_only)
 
   print("=" * 70)
   print("Simply Assets Download Script")
@@ -284,13 +302,15 @@ def main():
 
   success = True
 
-  # Download models
+  # Download models (or just their tokenizers)
   if download_models_flag:
-    if not args.force and check_existing(args.models_dir):
-      print(f"\n[WARNING] Models directory already exists: {args.models_dir}")
+    existing = args.vocabs_dir if args.vocabs_only else args.models_dir
+    if not args.force and check_existing(existing):
+      print(f"\n[WARNING] Directory already exists: {existing}")
       print("   Use --force to re-download")
     else:
-      if not download_models(args.models_dir, args.models_repo):
+      if not download_models(args.models_dir, args.vocabs_dir,
+                             args.models_repo, vocabs_only=args.vocabs_only):
         success = False
 
   # Download datasets
@@ -308,7 +328,7 @@ def main():
     print("\nDirectory structure:")
     print(f"  Models:   {args.models_dir}")
     print(f"  Datasets: {args.datasets_dir}")
-    print(f"  Vocabs:   {VOCABS_DIR} (created on first use)")
+    print(f"  Vocabs:   {args.vocabs_dir}")
     print("\nYou can now run experiments with:")
     print("  python -m simply.main --experiment_config <config_name> ...")
   else:

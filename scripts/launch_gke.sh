@@ -47,7 +47,7 @@ CONFIG=""
 PROFILE=false
 PROFILE_STEPS="3"
 PROFILE_WARMUP="5"
-NUM_TRAIN_STEPS=20
+NUM_TRAIN_STEPS=""  # empty: keep the config's num_train_steps
 SIMPLY_ARGS=""
 DRY_RUN=false
 
@@ -74,7 +74,7 @@ Options:
   --profile               Enable XProf trace collection
   --profile-warmup N      Steps before profiling starts (default: 5)
   --profile-steps N       Number of steps to profile (default: 3)
-  --train-steps N         Total training steps (default: 20)
+  --train-steps N         Override num_train_steps (default: config's)
   -n, --name NAME         Workload name (default: auto-generated)
   -z, --zone ZONE         GCP zone              (default: us-central1)
   -t, --tpu-type TYPE     TPU type              (default: v4-8)
@@ -184,7 +184,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage 0 ;;
         --)
-            shift; SIMPLY_ARGS="$*"; break ;;
+            # Re-quote so that values with spaces (e.g. a --config_overlay
+            # JSON object) survive the trip through the container shell.
+            shift; SIMPLY_ARGS="$(printf '%q ' "$@")"; break ;;
         -*)
             echo "Error: Unknown option: $1" >&2; usage 1 ;;
         *)
@@ -234,7 +236,12 @@ fi
 # ------------------------------------------
 # Build the Simply command
 # ------------------------------------------
-INSTALL_CMD="uv pip install --system --no-cache . 2>/dev/null"
+# The base image already has the dependencies; this installs Simply
+# itself from the source tree that XPK copies in via --script-dir.
+INSTALL_CMD="uv pip install --system --no-cache ."
+# Serving stubs are generated, not checked in; only the colocated async
+# RL loop needs them, so a failure here must not abort the workload.
+INSTALL_CMD="${INSTALL_CMD} && (python3 setup/gen_protos.py || true)"
 
 # Download vocab/tokenizer files that Simply needs at runtime.
 # Qwen3 tokenizer is fetched from HuggingFace into the default
@@ -244,6 +251,16 @@ VOCAB_SETUP="python3 -c \"import os; from huggingface_hub import hf_hub_download
 SIMPLY_CMD="python3 -u -m simply.main"
 SIMPLY_CMD="${SIMPLY_CMD} --experiment_config=${CONFIG}"
 SIMPLY_CMD="${SIMPLY_CMD} --alsologtostderr"
+
+if [ -n "${NUM_TRAIN_STEPS}" ]; then
+    # absl keeps only the last --config_overlay, so the two cannot be mixed.
+    if [[ "${SIMPLY_ARGS}" == *--config_overlay* ]]; then
+        echo "Error: --train-steps conflicts with --config_overlay;" \
+            "put num_train_steps in the overlay instead." >&2
+        exit 1
+    fi
+    SIMPLY_CMD="${SIMPLY_CMD} --config_overlay='{\"num_train_steps\": ${NUM_TRAIN_STEPS}}'"
+fi
 
 if [ -n "${SIMPLY_ARGS}" ]; then
     SIMPLY_CMD="${SIMPLY_CMD} ${SIMPLY_ARGS}"

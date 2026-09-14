@@ -68,12 +68,18 @@ tar --exclude='.git' --exclude='__pycache__' \
     -czf /tmp/simply.tar.gz .
 gcloud storage cp /tmp/simply.tar.gz $BUCKET/code/
 
-# Download model assets locally, then upload to GCS
-python setup/setup_assets.py
-gcloud storage cp -r ~/.cache/simply/models/GEMMA-2.0-2B-PT-ORBAX \
-    $BUCKET/models/
+# Download assets locally, then upload to GCS. `python
+# setup/setup_assets.py` (no flag) also pulls the ~10 GB of
+# checkpoints; `--vocabs-only` is enough for the `lm_test` run below.
+pip install ".[assets]"   # huggingface_hub, used by setup_assets.py
+python setup/setup_assets.py --vocabs-only
+python setup/setup_assets.py --datasets-only
 gcloud storage cp -r ~/.cache/simply/vocabs/ $BUCKET/vocabs/
 gcloud storage cp -r ~/.cache/simply/datasets/ $BUCKET/datasets/
+# For a config that fine-tunes from a checkpoint, e.g. Gemma 2B:
+# python setup/setup_assets.py --models-only
+# gcloud storage cp -r ~/.cache/simply/models/GEMMA-2.0-2B-PT-ORBAX \
+#     $BUCKET/models/
 ```
 
 ## Step 3: Create a TPU VM
@@ -106,16 +112,14 @@ sudo apt-get install -y software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
 
-# Create venv and install deps
-python3.12 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
 # Download code from GCS
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
+
+# Create venv and install deps (the `tpu` extra pulls jax[tpu])
+python3.12 -m venv /tmp/simply_venv
+source /tmp/simply_venv/bin/activate
 pip install ".[tpu,tfds,gcloud]"
 
 # Point Simply at GCS assets
@@ -143,6 +147,12 @@ python3 -m simply.main \
     --alsologtostderr
 ```
 
+`lm_test` trains a tiny transformer on TFDS `imdb_reviews`, which it
+downloads on first run -- the TPU VM needs outbound internet (external
+IP or the Cloud NAT from Step 1). To check the TPU is visible without
+any download, run `--experiment_config lm_smoke_test` first: same model
+on synthetic data and a byte vocab.
+
 ## Step 6: Clean Up
 
 ```bash
@@ -156,7 +166,7 @@ For GKE clusters with TPU node pools, you can use
 [XPK](https://github.com/AI-Hypercomputer/xpk) to launch Simply
 training workloads. This section walks through the full workflow.
 For advanced topics (details, profiling, troubleshooting), see the
-[full guide](docs/gcloud.md#11-running-on-gke-with-xpk).
+[full guide](docs/gcloud.md#running-on-gke-with-xpk).
 
 ### Prerequisites
 
@@ -195,19 +205,19 @@ docker build -f scripts/Dockerfile.simply \
 docker push gcr.io/$PROJECT/simply-jax-tpu:latest
 ```
 
-Use the launcher script to submit the workload via XPK. The
-`lm_test_gke_training` config is a small model designed for
-testing GKE training -- it uses no checkpoint and disables
-checkpoint saving, so no GCS asset upload is needed.
+Use the launcher script to submit the workload via XPK. `lm_test` is
+a tiny from-scratch model, and the overlay below disables checkpoint
+saving, so no GCS asset upload is needed.
 
 ```bash
 ./scripts/launch_gke.sh \
-    --config lm_test_gke_training \
+    --config lm_test \
     --project $PROJECT \
     --cluster $CLUSTER \
     --zone $ZONE \
     --tpu-type $TPUTYPE \
-    --image gcr.io/$PROJECT/simply-jax-tpu:latest
+    --image gcr.io/$PROJECT/simply-jax-tpu:latest \
+    -- --config_overlay '{"num_train_steps": 20, "should_save_ckpt": false}'
 ```
 
 The script packages the Simply source directory (via XPK's
@@ -242,6 +252,8 @@ See the [full guide](docs/gcloud.md) for:
 
 - **Multi-host TPU pods** (v5litepod-8/16) -- SSH key warmup,
   `--worker=all`, `jax.distributed.initialize()`
+- **Running on GPU** -- CUDA install, GPU VM creation, multi-GPU
+  sharding, TPU-only features to avoid
 - **Preemption handling** -- bastion VM with auto-retry loop
 - **Monitoring** -- TensorBoard, SSH probes, serial port logs
 - **Common gotchas** -- OOM fixes, SSH issues

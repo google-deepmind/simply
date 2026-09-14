@@ -28,6 +28,14 @@ from simply.utils import experiment_helper
 from simply.utils import pytree
 from simply.utils import sweep
 
+# Registers the colocated async RL train loop. It pulls in the gRPC serving
+# stack, so it is optional: a bare install without the generated stubs (see
+# setup/gen_protos.py) can still train and sample.
+try:
+  from simply import colocate_async_rl_lib  # pylint: disable=unused-import,g-import-not-at-top
+except ImportError as e:
+  logging.info('Colocated async RL is unavailable: %s', e)
+
 from absl import app
 
 

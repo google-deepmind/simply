@@ -13,86 +13,21 @@
 # limitations under the License.
 """KV prefix cache for the paged-attention batcher.
 
-The cache STORES at *chunk* granularity, where one chunk =
-`num_shards * page_size` tokens — the natural inject / extract
-granularity used by `DecodeState.inject_chunk` and
-`DecodeState.extract_chunk`. It INDEXES at token granularity, in a
-path-compressed (radix) TRIE over token sequences (:class:`PrefixNode`), so
-there is NO HASHING anywhere: no digest to collide, no key to keep in
-sync with the tokens, and two prompts that diverge at token 100 share
-exactly those 100 tokens. ONE NODE PER CHUNK PER PATH holds that chunk's
-payload, at whichever position inside it was stored first; a position
-inside the chunk takes its bytes from that payload and its right to be
-resumed from an entry in the node's `resumables`, so a pass boundary
-RECORDS A POSITION rather than making a node. Storage granularity is kept by an
-invariant: there is a PAYLOAD AT EVERY CHUNK below a stored position,
-because restoring a prefix of length `p` injects every chunk along the
-path, not just the one `p` falls in.
+Stores captured KV at *chunk* granularity -- one chunk is `num_shards *
+page_size` tokens, the unit `SamplingState.extract_chunk` and
+`inject_chunk` deal in -- and indexes it at token granularity in a
+path-compressed (radix) trie over token sequences (:class:`PrefixNode`), so
+two prompts share exactly the tokens they agree on and nothing is hashed.
+Storage is host RAM, in-process and host-local: each host holds only its own
+addressable shard, with no cross-host IO or barrier on the path.
 
-Each cache entry is a **pytree of** :class:`rpa.StoredChunkLeaf` (one
-per `DecodeState` leaf), i.e. the same shape as `decode_state` with
-each leaf carrying the chunk's KV bytes plus a PER-TOKEN WRITTEN MASK:
-which tokens of that chunk hold real KV for that layer. A capture taken
-at pass boundary `pos` is written over `[max(chunk_start, pos - W_leaf),
-min(chunk_end, pos))`, a global layer being `W = infinity`, so the
-global / windowed distinction is a VALUE and not a code path. That is
-computed by :meth:`rpa.DecodeState.chunk_written_mask` and is the one
-statement of this model; everything else points at it. Two captures of
-the same chunk taken at different pass boundaries cover different
-tokens and UNION (:func:`rpa.merge_chunk_trees`), so nothing is ever
-overwritten and the result never depends on which prompt ran first.
-Unwritten tokens are injected as an uninitialised buffer and evicted by
-`release_for_window` before they can feed into attention.
+A slot may only be captured or resumed at a *pass boundary*, the one position
+where a windowed layer's KV is trustworthy, so the cache records the
+positions where a prefill pass ended (:attr:`PrefixNode.resumables`) and
+eviction may only truncate at one of them. Captures of the same chunk taken
+at different boundaries union per token, so nothing is ever overwritten.
 
-BREAKPOINTS. With a sliding-window layer the paged KV cache is only
-correct *inside the window of a pass boundary*: the RPA kernel writes
-newly issued KV back from the query block that runs the pass's last
-query, so everything below `[kv_len - window_size, kv_len)` is
-computed, window-masked and dropped (a hole). A pass boundary is
-therefore a **breakpoint**, and it is the only position at which a
-slot's windowed KV can be captured -- or resumed. So the batcher
-snapshots after EVERY prefill pass, and whether a position can be resumed
-from is whether the cache HOLDS A RESUME POINT there, meaning "a pass
-ended here" (:attr:`PrefixNode.resumables`). The cache holds NO
-window state at all; the model owns the window.
-
-Passes do not end on the chunk grid, so most breakpoints are MID-CHUNK.
-Recording one is an entry in `resumables` on the node whose interval
-contains it -- a sorted sparse `list[tuple[position, key]]` where
-PRESENCE IS THE BIT, so there is no disabled-but-present state and no
-per-token mask to scan -- and a restore that resumes there injects
-`position - chunk_start` tokens of that chunk, derived from the
-geometry. Without those mid-chunk entries the deepest breakpoint another
-prompt could resume from would be `align_down(position, chunk_size)`,
-throwing away up to a whole chunk of prefill per pass.
-
-Storage is **host (CPU) RAM**, in-process. The offload is the CALLER's:
-the batcher tree-maps :meth:`SnapshotChunkLeaf.offload` (HBM->host
-`jax.device_put` to the same sharding with `memory_kind='pinned_host'`)
-via `rpa.offload_chunk_tree`, wraps the result in a :class:`ChunkTile`
-and hands the run to `store_tiles`, which hangs it on the trie nodes
-covering those tokens. `restore_chunk_tiles()` hands host-resident trees
-back as-is; the caller tree-maps :meth:`SnapshotChunkLeaf.onload` before
-feeding the payload back to `inject_chunk`.
-
-This is entirely **host-local**: each host stores (and restores) only
-its own addressable shard. There is NO file IO, NO Orbax, NO
-collective op and NO `sync_global_devices` barrier anywhere in the
-snapshot/restore path — the whole point of host offloading vs. the
-old synchronous multi-host on-disk checkpointer (which globally
-barrier-synced on every `save()` and was the source of both the
-latency and the multi-host barrier-desync crashes).
-
-Because the cache is per-process and never reads shared state, the
-save/skip dedup decision still derives from replicated in-memory state
-(the trie's shape): every host runs `snapshot`/`restore` in lockstep
-over identical tokens, so the structure evolves identically on every
-host. Note that the moves themselves (`device_put`) are host-local and
-do NOT need lockstep for correctness; the lockstep only matters for
-the surrounding `extract_chunk` / `inject_chunk` device programs.
-
-The cache does not persist across processes (it is RAM-only), so a
-fresh process starts cold.
+See `serving/ragged_paged_attention.md` for the design.
 """
 
 import bisect
@@ -115,39 +50,21 @@ StoredTree = Any
 
 @dataclasses.dataclass
 class ChunkHolder:
-  """One chunk's KV bytes, held as a STABLE IDENTITY.
+  """One chunk's KV, boxed so co-owners of a split share one buffer.
 
-  One field, deliberately. Merging is FUNCTIONAL -- `rpa.merge_chunk_trees`
-  returns a new pytree rather than mutating -- so the tree object changes
-  with every capture. This box is what several nodes can co-own across a
-  split and still all see the union: rebinding `tree` here reaches every one
-  of them, where a bare tree reference would leave the co-owners holding the
-  pre-merge version and quietly stop tokens propagating.
-
-  Its identity is also the question the structure keeps asking -- "the same
-  buffer, or two?" -- in `_compose` (dedupe co-owners rather than merge a
-  buffer with itself) and in `_consolidate` (did the two runs meet on one
-  buffer?). It is where a refcount goes when eviction needs one.
-
-  Chunk-shaped because that is the injection unit: `extract_chunk` /
-  `inject_chunk` deal in whole pages, one per sequence shard.
-
-  It says nothing about WHO owns which of its tokens. That is the owning
-  node's business and is not stored anywhere -- a node's interval already
-  says which of a chunk's tokens are its
-  (:meth:`PrefixCache._owned_mask`) -- which is why splitting an edge costs
-  no bytes: both sides go on sharing this object and simply own different
-  parts of it.
+  Merging is functional (`rpa.merge_chunk_trees` returns a new pytree), so
+  rebinding `tree` on this box is what lets every node that co-owns the chunk
+  see the union. Splitting an edge therefore costs no bytes: both sides go on
+  sharing this object and own different parts of it.
 
   Fields
     tree: the host-resident chunk tree (see `StoredTree`).
-    nbytes: host RAM behind `tree`, kept in step with it. What eviction
-      measures and what it frees are the same number, and it is per BUFFER,
-      so co-owners of a split count it once.
+    nbytes: host RAM behind `tree`, kept in step with it, per BUFFER, so
+      co-owners of a split count it once.
   """
 
   tree: StoredTree
-  nbytes: int = 0
+  nbytes: int = dataclasses.field(default=0, init=False)
 
   def __post_init__(self) -> None:
     self.nbytes = self._measure()
@@ -423,12 +340,80 @@ class ChunkTile:
     return jax.tree_util.tree_map(_clamp, self.tree, is_leaf=is_leaf)
 
 
+# Fraction of the process's memory budget the prefix cache is allowed to hold.
+_MEMORY_FRACTION = 0.2
+
+# Budget assumed when the memory ceiling cannot be determined. Deliberately
+# small: over-estimating the budget is what causes out-of-memory kills.
+_FALLBACK_MAX_BYTES = 16 * 1024**3
+
+# cgroups report "no limit" either as the string "max" (unparseable) or as a
+# sentinel near 2**63; anything at or above this is treated as unbounded.
+_UNBOUNDED_LIMIT_BYTES = 2**62
+
+# Ordered most- to least-specific: the limit enforced on the container, then
+# cgroup v2, then cgroup v1.
+_MEMORY_LIMIT_PATHS = (
+    '/proc/container/memory/limit',
+    '/sys/fs/cgroup/memory.max',
+    '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+)
+
+
+def _read_int_file(path: str) -> int | None:
+  """Returns the positive integer stored in `path`, or None if unreadable."""
+  try:
+    with open(path) as f:
+      value = int(f.read().strip())
+  except (OSError, ValueError):
+    return None
+  return value if value > 0 else None
+
+
+def _read_mem_total_bytes() -> int | None:
+  """Returns total machine memory from /proc/meminfo, or None if unreadable."""
+  try:
+    with open('/proc/meminfo') as f:
+      for line in f:
+        if line.startswith('MemTotal:'):
+          return int(line.split()[1]) * 1024
+  except (OSError, ValueError, IndexError):
+    return None
+  return None
+
+
+def memory_budget_bytes() -> int | None:
+  """Returns the memory ceiling this process runs under, or None if unknown."""
+  for path in _MEMORY_LIMIT_PATHS:
+    value = _read_int_file(path)
+    if value is not None and value < _UNBOUNDED_LIMIT_BYTES:
+      return value
+  return _read_mem_total_bytes()
+
+
+def default_max_bytes() -> int:
+  """Returns a conservative prefix-cache budget for the current process.
+
+  The budget is a small fraction of the memory ceiling the process actually
+  runs under, so it shrinks automatically on small containers. It is never
+  scaled up to a floor: returning more than the container has is exactly the
+  failure this guards against.
+  """
+  budget = memory_budget_bytes()
+  if budget is None:
+    return _FALLBACK_MAX_BYTES
+  return int(budget * _MEMORY_FRACTION)
+
+
 @dataclasses.dataclass(kw_only=True)
 class PrefixCache:
   """Prefix cache backed by host RAM."""
 
   chunk_size: int
-  max_bytes: int | None = None
+  # Eviction threshold. Defaults to a conservative fraction of the memory
+  # ceiling this process runs under; pass `None` to disable eviction entirely.
+  max_bytes: int | None = dataclasses.field(default_factory=default_max_bytes)
+  _nbytes: int = dataclasses.field(default=0, init=False)
 
   def __post_init__(self) -> None:
     if self.chunk_size <= 0:
@@ -446,15 +431,10 @@ class PrefixCache:
     """The RESUME POINTS, coldest first -- what eviction chooses between."""
     return collections.OrderedDict()
 
-  @functools.cached_property
-  def _nbytes(self) -> list[int]:
-    """Sequence holder for total host RAM bytes held by the cache."""
-    return [0]
-
   @property
   def nbytes(self) -> int:
     """Host RAM the cache holds."""
-    return self._nbytes[0]
+    return self._nbytes
 
   def mark_resumable(
       self, slot_tokens: np.ndarray, node: PrefixNode, position: int
@@ -490,7 +470,10 @@ class PrefixCache:
 
     Returns:
       The deepest position the cache holds for these tokens once the run is
-      done: the last tile's `end`, or where a refusal stopped it.
+      done -- the last tile's `end` -- or `0` for an empty run.
+
+    Raises:
+      ValueError: if a capture cannot be stored where the tiles say it goes.
     """
     if not tiles:
       return 0
@@ -518,14 +501,14 @@ class PrefixCache:
         if idx == len(node.holders):
           holder = ChunkHolder(tree=stored)
           node.holders.append(holder)
-          self._nbytes[0] += holder.nbytes
+          self._nbytes += holder.nbytes
         else:
           # A capture never overwrites what is stored: the two UNION per token,
           # in the buffer itself, so a chunk two nodes straddle is updated for
           # both of them at once.
           before_nbytes = node.holders[idx].nbytes
           node.holders[idx].merge(stored)
-          self._nbytes[0] += node.holders[idx].nbytes - before_nbytes
+          self._nbytes += node.holders[idx].nbytes - before_nbytes
         if node.end <= tile.end:
           node_idx += 1
         else:
@@ -553,9 +536,7 @@ class PrefixCache:
     """Returns what to inject to resume as deep as possible, or `[]`."""
     if end <= start:
       return []
-    sub, last_resumable = self.root.resumable_range(
-        slot_tokens, start, end
-    )
+    sub, last_resumable = self.root.resumable_range(slot_tokens, start, end)
     if sub:
       # Warm the stop this restore is about to use -- the one thing here the
       # order should rank on. `resumable_range` cuts `sub` at the node that
@@ -697,5 +678,5 @@ class PrefixCache:
         child.holders = keeper_holders + child.holders
         keeper.holders = []
         keeper.resumables = []
-    self._nbytes[0] -= freed
+    self._nbytes -= freed
     return freed

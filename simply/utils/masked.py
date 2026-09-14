@@ -24,7 +24,7 @@ _EPS = 1e-5
 
 
 def masked(
-    x: jax.Array, mask: jax.Array, padding_value: float = 0
+    x: Array, mask: Array, padding_value: float = 0
 ) -> jax.Array:
   return jnp.where(mask, x, jnp.astype(padding_value, x.dtype))
 
@@ -34,7 +34,7 @@ def masked_max(
     mask: Array,
     axis: int | Sequence[int] | None = None,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   return jnp.max(
       x,
       axis=axis,
@@ -49,7 +49,7 @@ def masked_min(
     mask: Array,
     axis: int | Sequence[int] | None = None,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   return jnp.min(
       x,
       axis=axis,
@@ -64,7 +64,7 @@ def masked_sum(
     mask: Array,
     axis: int | Sequence[int] | None = None,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   return jnp.sum(x, axis=axis, keepdims=keepdims, where=mask)
 
 
@@ -73,7 +73,7 @@ def masked_mean(
     mask: Array,
     axis: int | Sequence[int] | None = None,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   return jnp.sum(x, axis=axis, keepdims=keepdims, where=mask) / jnp.maximum(
       jnp.sum(mask.astype(x.dtype), axis=axis, keepdims=keepdims), _EPS
   )
@@ -85,7 +85,7 @@ def masked_var(
     axis: int | Sequence[int] | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   _, var = masked_mean_var(x, mask, axis=axis, ddof=ddof, keepdims=keepdims)
   return var
 
@@ -96,7 +96,7 @@ def masked_std(
     axis: int | Sequence[int] | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-) -> Array:
+) -> jax.Array:
   _, std = masked_mean_std(x, mask, axis=axis, ddof=ddof, keepdims=keepdims)
   return std
 
@@ -107,7 +107,7 @@ def masked_mean_var(
     axis: int | Sequence[int] | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-) -> tuple[Array, Array]:
+) -> tuple[jax.Array, jax.Array]:
   """Computes the mean and variance of a masked tensor."""
   mean = masked_mean(x, mask, axis=axis, keepdims=True)
   m2 = masked_sum(jnp.square(x - mean), mask, axis=axis, keepdims=keepdims)
@@ -123,6 +123,6 @@ def masked_mean_std(
     axis: int | Sequence[int] | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-) -> tuple[Array, Array]:
+) -> tuple[jax.Array, jax.Array]:
   mean, var = masked_mean_var(x, mask, axis=axis, ddof=ddof, keepdims=keepdims)
   return mean, jnp.sqrt(var)

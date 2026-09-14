@@ -309,6 +309,120 @@ class ZeroShotDeepSeekQwenR1CoTBoxed(ZeroShotBoxedInQuestionEvaluation):
 
 @EvaluationRegistry.register
 @dataclasses.dataclass(frozen=True)
+class ZeroShotGPQADeepSeekQwenR1CoTBoxed(ZeroShotDeepSeekQwenR1CoTBoxed):
+  """The ZeroShotDeepSeekQwenR1CoTBoxed for GPQA only."""
+  question_end: str = (  # no space at the beginning
+      r'Please reason step by step, and put your final answer within \boxed{}.'
+  )
+
+  def make_raw_question_and_answer(
+      self, example: Mapping[str, Any]
+  ) -> tuple[str, str]:  # pylint: disable=g-doc-args
+    """Returns the raw question and answer for the given example.
+
+    Logic borrowed from the GPQA data factory.
+    """
+    _NUM_ANSWERS = 4  # pylint: disable=invalid-name
+    sorting_seed = sum(map(ord, example['example_id']))
+    answer_order = np.random.default_rng(sorting_seed).permutation(_NUM_ANSWERS)
+    answers = [
+        example['correct_answer'],
+        example['incorrect_answer_1'],
+        example['incorrect_answer_2'],
+        example['incorrect_answer_3'],
+    ]
+    ordered_answers = [answers[i] for i in answer_order]
+    # Different from the GPQA data factory
+    # we don't add "Question:" to the beginning of the question because that is
+    # handled by input_marker here.
+    question_str = example['question']
+    question_str += '\n'
+    question_str += f'(A) {ordered_answers[0]}'
+    question_str += '\n'
+    question_str += f'(B) {ordered_answers[1]}'
+    question_str += '\n'
+    question_str += f'(C) {ordered_answers[2]}'
+    question_str += '\n'
+    question_str += f'(D) {ordered_answers[3]}'
+    question_str += '\n'
+    answer = ['A', 'B', 'C', 'D'][list(answer_order).index(0)]
+    return question_str, answer
+
+  def get_prompt(self, example: Mapping[str, Any]) -> str:
+    question, _ = self.make_raw_question_and_answer(example)
+    return super().get_prompt(dict(question=question))
+
+  def evaluate(
+      self, example: Mapping[str, Any], response: str
+  ) -> Mapping[str, Any]:
+    """Rates the response in for the given example."""
+    # Extract answer from \boxed{}. The answer not in \boxed{} is treated as
+    # incorrect.
+    response_answer = extract_boxed_answer(response)
+    expected_answer = maybe_remove_comma(
+        self.make_raw_question_and_answer(example)[1]
+    )
+    res = {}
+    if response_answer:
+      correct = match(response_answer, expected_answer)
+    else:
+      correct = False
+    res['correct'] = correct
+    res['reward'] = float(res['correct'])
+    return res
+
+
+@EvaluationRegistry.register
+@dataclasses.dataclass(frozen=True)
+class ZeroShotQualityCoTBoxed(ZeroShotDeepSeekQwenR1CoTBoxed):
+  """QuALITY long-context multiple-choice QA evaluation.
+
+  QuALITY (Question Answering with Long Input Texts, Yeah!) is a benchmark
+  requiring reading comprehension of long passages (~5k tokens). Each example
+  has an article, a question, and 4 answer choices (A/B/C/D).
+
+  This evaluation formats: article + question + choices, asks the model to
+  reason step-by-step, and checks the boxed answer against the gold label.
+
+  Paper: https://arxiv.org/abs/2112.08608
+  """
+
+  question_end: str = (  # no space at the beginning, matching GPQA style
+      r'Please reason step by step, and put your final answer within \boxed{}.'
+  )
+
+  def get_prompt(self, example: Mapping[str, Any]) -> str:
+    """Formats the article, question, and options into a single prompt."""
+    article = example['article']
+    question = example['question']
+    options = example['options']  # list of 4 strings
+    question_str = (
+        'Read the following article carefully and answer the question.\n\n'
+        f'{article}\n\n'
+        f'Question: {question}\n'
+    )
+    for label, opt in zip(['A', 'B', 'C', 'D'], options):
+      question_str += f'({label}) {opt}\n'
+    return super().get_prompt(dict(question=question_str))
+
+  def evaluate(
+      self, example: Mapping[str, Any], response: str
+  ) -> Mapping[str, Any]:
+    """Extracts boxed answer and compares to gold label (A/B/C/D)."""
+    response_answer = extract_boxed_answer(response)
+    expected_answer = example['gold_label']  # 'A', 'B', 'C', or 'D'
+    res = {}
+    if response_answer:
+      correct = match(response_answer, expected_answer)
+    else:
+      correct = False
+    res['correct'] = correct
+    res['reward'] = float(res['correct'])
+    return res
+
+
+@EvaluationRegistry.register
+@dataclasses.dataclass(frozen=True)
 class ZeroShotSystemCoTBoxed(ZeroShotDeepSeekQwenR1CoTBoxed):
   r"""0-shot that asks to reason step by step and put answer in \boxed{}.
 

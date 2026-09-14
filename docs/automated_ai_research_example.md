@@ -12,12 +12,14 @@ Below is an example prompt you can paste into your agent.
 It runs a small research study using the test
 config, which trains a tiny model on CPU in under a minute.
 Check the section below for running more meaningful tasks on google
-cloud (or locally if you have GPUs available).
+cloud, or [Running on GPU](gcloud.md#running-on-gpu) if you have GPUs
+available.
 
 ## Prerequisites
 
 ```bash
-pip install ".[tfds]"
+pip install ".[tfds,assets]"
+python setup/setup_assets.py --vocabs-only  # Qwen3 tokenizer
 ```
 
 The pretraining example uses IMDB reviews (auto-downloaded by TFDS).

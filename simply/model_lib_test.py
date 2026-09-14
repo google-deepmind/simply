@@ -19,7 +19,7 @@ import math
 import os
 import pathlib
 import tempfile
-from typing import cast
+from typing import Any, cast
 from unittest import mock
 
 from absl.testing import absltest
@@ -42,6 +42,20 @@ from simply.utils import tokenization
 
 
 jax.config.update('jax_threefry_partitionable', False)
+
+
+@dataclasses.dataclass(frozen=True)
+class _FakeBlockState:
+  """A non-mapping per-block decode state, as K3's registered dataclasses are."""
+
+  length: int
+
+
+@model_lib.pad_block_decode_state.register
+def _pad_fake_block_state(
+    state: _FakeBlockState, length_to_pad: int
+) -> _FakeBlockState:
+  return _FakeBlockState(max(state.length, length_to_pad))
 
 
 def lm_test():
@@ -573,7 +587,7 @@ class ModelLibTest(parameterized.TestCase):
     )
     # Add group and head axis.
     mask = jnp.expand_dims(mask, range(1, len(q.shape) - len(mask.shape) + 1))
-    output1, _ = model_lib.attn(q, k, v, mask, dtype=jnp.float32)
+    output1, _ = model_lib.attn(q, k, v, mask, dtype=jnp.float32)  # pyrefly: ignore[bad-argument-type]
     output2 = model_lib.chunked_local_attn(
         q, k, v, mask, window_size=window_size, dtype=jnp.float32  # pyrefly: ignore[bad-argument-type]
     )
@@ -629,6 +643,33 @@ class ModelLibTest(parameterized.TestCase):
     # This test would also fail on cpu for bfloat16, but works for
     # float16, float32 and int8.
     self.assertTrue(np.allclose(output_logits, target_logits, atol=1e-5))
+
+  def test_pad_decode_state_to_mapping_block(self):
+    """The `{'k': ..., 'v': ...}` path `TransformerLM` uses."""
+    decode_state: Any = {
+        'block_0': {
+            'k': np.zeros((2, 3, 1, 4)),
+            'segment_ids': np.ones((2, 3)),
+            'window_size=0': None,
+        },
+        'not_a_block': np.zeros((2, 3)),
+    }
+    padded = cast(Any, model_lib.pad_decode_state_to(decode_state, 5))
+    self.assertEqual(padded['block_0']['k'].shape, (2, 5, 1, 4))
+    self.assertEqual(padded['block_0']['segment_ids'].shape, (2, 5))
+    self.assertEqual(padded['not_a_block'].shape, (2, 3))
+
+  def test_pad_decode_state_to_dispatches_on_non_mapping_block(self):
+    with self.assertRaises(TypeError):
+      model_lib.pad_decode_state_to(cast(Any, {'block_0': object()}), 5)
+
+    padded = cast(
+        Any,
+        model_lib.pad_decode_state_to(
+            cast(Any, {'block_0': _FakeBlockState(3)}), 5
+        ),
+    )
+    self.assertEqual(padded['block_0'], _FakeBlockState(5))
 
   def test_tree_norm(self):
     tree = {'a': np.array([3, 4]), 'b': 3, 'c': [{'d': np.array([4])}]}
@@ -690,6 +731,69 @@ class ModelLibTest(parameterized.TestCase):
       self.assertEqual(so1.output_token_ids, so2.output_token_ids)  # pyrefly: ignore[missing-attribute]
       self.assertEqual(so1.input_token_scores, so2.input_token_scores)  # pyrefly: ignore[missing-attribute]
       self.assertEqual(so1.output_token_scores, so2.output_token_scores)  # pyrefly: ignore[missing-attribute]
+
+  def test_lm_interface_decode_buffer_multiple(self):
+    """Padding the decode buffers must not move a single sampled token."""
+    vocab = tokenization.TestVocab([str(i) for i in range(20)])
+    params = self.tfm_lm.init(jax.random.key(0))
+    # Batches whose longest prompt differs: without buffer padding each one
+    # decodes into a differently shaped buffer and recompiles `decode_fn`.
+    batches = [
+        ['1 2 3', '4 5 6 7 8'],
+        ['1 2', '3 4 5 6 7 8 9'],
+        ['1 2 3 4', '5'],
+        # Lands exactly on the buffer grid (end_position == padded end): must
+        # reuse the same program, not compile a second no-stop copy of it.
+        ['1 2 3 4 5 6 7 8', '1'],
+    ]
+
+    def run(decode_buffer_multiple):
+      sampling_params = model_lib.SamplingParams(
+          top_k=-1,
+          top_p=1.0,
+          temperature=1.0,
+          max_decode_steps=8,
+          intermediate_decode_steps=4,
+          prefill_size=8,
+          max_seq_len=64,
+          decode_buffer_multiple=decode_buffer_multiple,
+      )
+      lm_interface = model_lib.LMInterface(self.tfm_lm, params, vocab)
+      outputs = [
+          lm_interface.generate(
+              batch,
+              prng_key=jax.random.key(seed=25),
+              sampling_params=sampling_params,
+          )
+          for batch in batches
+      ]
+      # jit's compilation-cache size; not part of jax's typed public API.
+      cache_size = getattr(lm_interface.decode_fn, '_cache_size')
+      return outputs, cache_size()
+
+    exact_outputs, exact_compiles = run(0)
+    padded_outputs, padded_compiles = run(8)
+
+    n_compared = 0
+    for exact_batch, padded_batch in zip(exact_outputs, padded_outputs):
+      for exact_group, padded_group in zip(exact_batch, padded_batch):  # pyrefly: ignore[bad-argument-type]
+        for so1, so2 in zip(exact_group, padded_group):
+          n_compared += 1
+          # Exact: the decode loop runs the same steps off the same PRNG chain.
+          self.assertEqual(so1.input_token_ids, so2.input_token_ids)
+          self.assertEqual(so1.output_token_ids, so2.output_token_ids)
+          # Approximate: attention reduces over a longer (masked) axis, which
+          # is bit-exact on TPU but not on every backend.
+          np.testing.assert_allclose(
+              so1.output_token_scores, so2.output_token_scores, rtol=1e-5
+          )
+          np.testing.assert_allclose(
+              so1.output_token_logprobs, so2.output_token_logprobs, rtol=1e-5
+          )
+    self.assertEqual(n_compared, 2 * len(batches))  # every sequence compared
+    self.assertLess(padded_compiles, exact_compiles)
+    # With quantized buffer lengths, fewer distinct programs are compiled.
+    self.assertLessEqual(padded_compiles, 4)
 
   def test_lm_interface_generate_without_scoring(self):
     vocab = tokenization.TestVocab([str(i) for i in range(10)])
@@ -1230,6 +1334,7 @@ class ModelLibTest(parameterized.TestCase):
             dataset=data_lib.DatasetConfig(source='dummy'),
             should_save_ckpt=False,
             tb_log_interval=100,
+            profile_type='jax',
         )
 
         batch_size = config.batch_size

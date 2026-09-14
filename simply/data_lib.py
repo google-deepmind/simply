@@ -980,7 +980,7 @@ class SweBenchProSource:
   selected_test_files_to_run) are parsed into real lists via `_sbp_parse_list`
   (faithful representation of the raw cells, NOT env derivation).
 
-  All verification-env fields (sandbox image id, wrapped problem_statement,
+  All verification-env fields (xbox_image_id, wrapped problem_statement,
   test_cmd, golden_test_results) are derived on the fly by
   `SweBenchProEvaluation.enrich_example` in the eval; they are deliberately
   NOT set here.
@@ -1628,6 +1628,10 @@ def create_iter_dataset(
   # Resolve string shorthand via DatasetConfigRegistry.
   if isinstance(ds_config, str):
     ds_config = DatasetConfigRegistry.get_instance(ds_config)
+
+  # If the dataset config has a custom make_iterator method, use it.
+  if hasattr(ds_config, 'make_iterator'):
+    return ds_config.make_iterator(config, training)
 
   # Get config values.
   tokenizer_name = config.vocab_name

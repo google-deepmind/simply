@@ -22,6 +22,20 @@ from simply.agent import tools
 
 class BashToolTest(absltest.TestCase):
 
+  def test_execute_success(self):
+    tool = tools.BashTool(executor=env.execute_bash_locally)
+    with mock.patch.object(subprocess, 'run') as mock_run:
+      mock_run.return_value.stdout = 'hello'
+      mock_run.return_value.stderr = ''
+      mock_run.return_value.returncode = 0
+
+      action, observation = tool.execute(args_json='{"command": "echo hello"}')
+
+      self.assertIsNotNone(action)
+      self.assertIn('STDOUT:\nhello', observation)
+      self.assertIn('RETURN CODE: 0', observation)
+      mock_run.assert_called_once()
+
   def test_execute_without_timeout(self):
     tool = tools.BashTool(executor=env.execute_bash_locally)
     with mock.patch.object(subprocess, 'run') as mock_run:
@@ -48,20 +62,6 @@ class BashToolTest(absltest.TestCase):
         timeout=None,
         cwd=None,
     )
-
-  def test_execute_success(self):
-    tool = tools.BashTool(executor=env.execute_bash_locally)
-    with mock.patch.object(subprocess, 'run') as mock_run:
-      mock_run.return_value.stdout = 'hello'
-      mock_run.return_value.stderr = ''
-      mock_run.return_value.returncode = 0
-
-      action, observation = tool.execute(args_json='{"command": "echo hello"}')
-
-      self.assertIsNotNone(action)
-      self.assertIn('STDOUT:\nhello', observation)
-      self.assertIn('RETURN CODE: 0', observation)
-      mock_run.assert_called_once()
 
   def test_execute_timeout(self):
     tool = tools.BashTool(executor=env.execute_bash_locally)

@@ -62,6 +62,11 @@ def get_dtype_packing(dtype):
   return 32 // bits
 
 
+def is_traced(*arrays: jax.Array) -> bool:
+  """True if any array is a tracer, i.e. its value is unknown until runtime."""
+  return any(isinstance(x, jax.core.Tracer) for x in arrays)
+
+
 def next_power_of_2(x: int):
   assert x > 0
   if x == 1:
@@ -139,6 +144,22 @@ def ref_ragged_paged_attention(
     update_kv_cache: bool = True,
     save_residuals: bool = False,
 ):
+  """Reference ragged paged attention: plain XLA ops, no Pallas.
+
+  Mirrors `ragged_paged_attention`, and is what runs wherever the Pallas
+  kernel cannot (CPU, GPU). Every shape here is static and the per-sequence
+  loop is unrolled over `max_num_seqs`, so this is jittable: sequences past
+  `distribution[-1]`, query tokens outside a sequence's slice of `queries`
+  and KV slots past `kv_lens` are masked out instead of being sliced away.
+  That costs `O(max_num_seqs * max_num_tokens * pages_per_seq * page_size)`
+  attention entries -- fine for tests and small-scale serving, far from the
+  kernel's performance.
+
+  Returns `(out, kv_cache, lse)` with `out` and `lse` covering the full query
+  buffer (`[max_num_tokens, ...]`, zeros for padding tokens), like the kernel.
+  `kv_cache` is None unless `update_kv_cache`, `lse` None unless
+  `save_residuals`.
+  """
   if out_dtype is None:
     out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
 
@@ -171,9 +192,8 @@ def ref_ragged_paged_attention(
   merged_kv = merge_kv(keys, values)
   assert merged_kv.shape[-3:] == kv_cache.shape[-3:]
 
-  _, page_size, num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = (
-      kv_cache.shape
-  )
+  total_num_pages, page_size = kv_cache.shape[:2]
+  num_kv_heads_x2_per_kv_packing, kv_packing, head_dim = kv_cache.shape[2:]
   num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
   assert num_kv_heads_x2 % 2 == 0
   assert actual_num_q_heads % actual_num_kv_heads == 0
@@ -181,39 +201,65 @@ def ref_ragged_paged_attention(
   assert get_dtype_packing(kv_cache.dtype) == kv_packing
   assert num_kv_heads_x2 == align_to(actual_num_kv_heads * 2, kv_packing)
   actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+  max_num_tokens = queries.shape[0]
   max_num_seqs = kv_lens.shape[0]
   num_page_indices = page_indices.shape[0]
   assert num_page_indices % max_num_seqs == 0
-  outputs = []
-  logsumexps = []
+  pages_per_seq = page_indices.shape[1]
+  # A sequence's KV window is its whole page allocation, masked down to
+  # `kv_lens[i]`, so that the shape stays static.
+  window_len = pages_per_seq * page_size
 
-  for i in range(distribution[-1]):
+  token_ids = jnp.arange(max_num_tokens, dtype=jnp.int32)
+  kv_ids = jnp.arange(window_len, dtype=jnp.int32)
+  page_ids = jnp.arange(pages_per_seq, dtype=jnp.int32)
+  num_seqs = distribution[-1]
+
+  out = jnp.zeros(
+      (max_num_tokens, actual_num_q_heads, actual_head_dim), out_dtype
+  )
+  logsumexps = jnp.zeros((max_num_tokens, actual_num_q_heads), out_dtype)
+
+  for i in range(max_num_seqs):
     q_start = cu_q_lens[i]
     q_end = cu_q_lens[i + 1]
     q_len = q_end - q_start
-
     kv_len = kv_lens[i]
-    indices = page_indices[i, :cdiv(kv_len, page_size)]
-    q = queries[q_start:q_end, :, :actual_head_dim]
+    is_active = i < num_seqs
+    # Query tokens of sequence `i`, within the packed `queries` buffer.
+    is_row = is_active & (token_ids >= q_start) & (token_ids < q_end)
 
-    assert kv_len - q_len >= 0
-    gathered_kv = kv_cache[indices]
+    seq_pages = page_indices[i]
+    gathered_kv = kv_cache[jnp.clip(seq_pages, 0, total_num_pages - 1)]
     gathered_shape = gathered_kv.shape
     gathered_kv = gathered_kv.reshape(-1, *gathered_shape[-3:])
+
     if update_kv_cache:
-      gathered_kv = gathered_kv.at[kv_len - q_len : kv_len].set(
-          merged_kv[q_start:q_end]
+      # Window slot `s` holds query token `q_start + s - (kv_len - q_len)`.
+      src = jnp.clip(
+          q_start + kv_ids - (kv_len - q_len), 0, max_num_tokens - 1
       )
-      kv_cache = kv_cache.at[indices].set(gathered_kv.reshape(gathered_shape))
+      is_new = is_active & (kv_ids >= kv_len - q_len) & (kv_ids < kv_len)
+      gathered_kv = jnp.where(
+          is_new[:, None, None, None], merged_kv[src], gathered_kv
+      )
+      # Pages past `kv_len` belong to no one (the padding entries of
+      # `page_indices` repeat, and repeats in a scatter clobber each other):
+      # send them out of bounds, where `mode='drop'` discards them.
+      is_ours = is_active & (q_len > 0) & (page_ids < cdiv(kv_len, page_size))
+      kv_cache = kv_cache.at[
+          jnp.where(is_ours, seq_pages, total_num_pages)
+      ].set(gathered_kv.reshape(gathered_shape), mode="drop")
 
     kv = gathered_kv.reshape(-1, num_kv_heads_x2, head_dim)[
         :, : actual_num_kv_heads * 2, :
     ].reshape(-1, actual_num_kv_heads, head_dim * 2)
-    k = kv[:kv_len, :, :head_dim][:, :, :actual_head_dim]
-    v = kv[:kv_len, :, head_dim:][:, :, :actual_head_dim]
+    k = kv[:, :, :head_dim][:, :, :actual_head_dim]
+    v = kv[:, :, head_dim:][:, :, :actual_head_dim]
     k = jnp.repeat(k, actual_num_q_heads_per_kv_head, axis=1)
     v = jnp.repeat(v, actual_num_q_heads_per_kv_head, axis=1)
 
+    q = queries[:, :, :actual_head_dim]
     if q_scale is not None:
       q = q / q_scale
       if jnp.issubdtype(k.dtype, jnp.floating):
@@ -234,31 +280,29 @@ def ref_ragged_paged_attention(
     if soft_cap is not None:
       attn = soft_cap * jnp.tanh(attn / soft_cap)
 
+    # Position of each query token inside its own sequence.
+    q_span = (kv_len - q_len) + (token_ids - q_start)
+    mask = kv_ids[None, :] < kv_len
     if use_causal_mask:
-      q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
-          jnp.int32, attn.shape, 1
-      )
-      kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
-      mask = q_span >= kv_span
+      mask = mask & (q_span[:, None] >= kv_ids[None, :])
       if sliding_window is not None:
-        mask = jnp.logical_and(mask, q_span < kv_span + sliding_window)
-      attn = jnp.where(mask, attn, mask_value)
-    lse_i = jax.nn.logsumexp(attn, axis=-1).T  # [q_len, actual_num_q_heads]
+        mask = mask & (q_span[:, None] < kv_ids[None, :] + sliding_window)
+    attn = jnp.where(mask[None], attn, mask_value)
+    lse_i = jax.nn.logsumexp(attn, axis=-1).T  # [max_num_tokens, q_heads]
     attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
 
-    out = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
+    out_i = jnp.einsum("hqk,khd->qhd", attn, v).astype(out_dtype)
     if v_scale is not None:
-      out *= v_scale
+      out_i *= v_scale
 
-    outputs.append(out)
-    logsumexps.append(lse_i)
+    out = jnp.where(is_row[:, None, None], out_i, out)
+    logsumexps = jnp.where(is_row[:, None], lse_i, logsumexps)
 
-  result = jnp.concatenate(outputs, axis=0)
   if not update_kv_cache:
     kv_cache = None  # pyrefly: ignore[bad-assignment]
   if not save_residuals:
-    logsumexps = None
-  return result, kv_cache, logsumexps
+    logsumexps = None  # pyrefly: ignore[bad-assignment]
+  return out, kv_cache, logsumexps
 
 
 def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
@@ -1561,6 +1605,12 @@ def dynamic_validate_inputs(
   max_num_seqs = kv_lens.shape[0]
   assert page_indices.shape[0] == max_num_seqs
   pages_per_seq = page_indices.shape[1]
+
+  # Everything below reads array *values*, which do not exist while tracing
+  # (e.g. the reference implementation under `jit`); shapes and dtypes have
+  # already been checked by `static_validate_inputs`.
+  if is_traced(kv_lens, page_indices, cu_q_lens, distribution):
+    return
 
   i, j, k = distribution
   if not (i <= j <= k):

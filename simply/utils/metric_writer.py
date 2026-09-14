@@ -95,6 +95,19 @@ class TensorboardXMetricWriter(BaseMetricWriter):
     self._writer.close()
 
 
-def create_metric_writer(logdir: str, just_logging=False) -> BaseMetricWriter:
-  """Creates a metric writer based on the environment."""
+def create_metric_writer(
+    logdir: str, just_logging=False, write_to_datatable=None
+) -> BaseMetricWriter:
+  """Creates a metric writer based on the environment.
+
+  Args:
+    logdir: where to write TensorBoard event files.
+    just_logging: only log, do not write event files.
+    write_to_datatable: whether to add the Datatable sink, for backends that
+      have one. `None` keeps the backend's own default, which for CLU is to
+      add it when the user has Datatable access. Pass `False` to decline it.
+
+  Returns:
+    The metric writer for this environment.
+  """
   return TensorboardXMetricWriter(logdir, just_logging=just_logging)

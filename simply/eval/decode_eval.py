@@ -181,13 +181,19 @@ def main(argv: Sequence[str]) -> None:
       _EXPERIMENT_CONFIG.value
   )
 
+  # The mesh must be built from the sharding the model will actually run with:
+  # a decoding sharding is free to name its axes differently.
+  decoding_sharding_config = getattr(config, 'decoding_sharding_config', None)
+  if decoding_sharding_config is None:
+    decoding_sharding_config = config.sharding_config.to_decoding_sharding()
+
   config_replace_kwargs = {}
   if mesh_shape := _MESH_SHAPE.value:
     mesh_shape = [int(i) for i in mesh_shape]
   else:
     mesh_shape = config_lib.get_default_mesh_shape(config, mode='decode')
   sharding.set_mesh(
-      mesh_shape, axis_names=config.sharding_config.mesh_axis_names
+      mesh_shape, axis_names=decoding_sharding_config.mesh_axis_names
   )
   config_replace_kwargs['mesh_shape'] = mesh_shape
 
@@ -202,10 +208,6 @@ def main(argv: Sequence[str]) -> None:
     config_replace_kwargs['init_ckpt_step'] = _CKPT_STEP.value
     if (ckpt_format := _CKPT_FORMAT.value) is not None:
       config_replace_kwargs['init_ckpt_format'] = ckpt_format
-
-  decoding_sharding_config = getattr(config, 'decoding_sharding_config', None)
-  if decoding_sharding_config is None:
-    decoding_sharding_config = config.sharding_config.to_decoding_sharding()
 
   if not (lm_format_name := _LM_FORMAT.value):
     lm_format_name = getattr(config, 'lm_format_name')
@@ -223,7 +225,7 @@ def main(argv: Sequence[str]) -> None:
     raise ValueError('Must specify --experiment_dir.')
   experiment_dir = epath.Path(experiment_dir)
 
-  model = model_lib.TransformerLM(config)
+  model, _ = model_lib.create_model(config)
   helper.save_config_info(config, config.sharding_config, model=model)
   experiment_helper.set_notes('Initializing model.')
 

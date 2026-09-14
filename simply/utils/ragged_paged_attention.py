@@ -930,9 +930,10 @@ class DecodeState:
     if mask_value is not None:
       rpa_kwargs['mask_value'] = mask_value
 
-    if jax.devices()[0].platform == 'cpu':
-      # Pallas RPA kernel is TPU-only; always use reference impl on CPU.
-      num_seqs = jnp.sum(q.lens > 0)
+    if jax.devices()[0].platform != 'tpu':
+      # The Pallas RPA kernel is TPU-only; everywhere else (CPU, GPU) run the
+      # reference implementation, with the same arguments the kernel gets
+      # below so that both paths agree on padding and output shape.
       attn_output, updated_kv_cache, _ = rpa_kernel.ref_ragged_paged_attention(
           q.data,
           k,
@@ -940,8 +941,8 @@ class DecodeState:
           decode_state.pages,
           decode_state.kv_lens,
           decode_state.page_indices,
-          jnp.cumulative_sum(q.lens, include_initial=True),
-          jnp.array([0, 0, num_seqs], dtype=jnp.int32),
+          q.row_starts_with_end,
+          jnp.array([0, 0, q.batch_size], dtype=jnp.int32),
           **rpa_kwargs,
       )
       if update_kv_cache:
@@ -1662,15 +1663,18 @@ class SamplingState:
     )
     input_lens = np.asarray(self.input_lens)
     reached_eos = np.asarray(self.reached_eos)
+    all_tokens = np.asarray(self.tokens)
+    all_logprobs = np.asarray(self.token_logprobs)
+    all_scores = np.asarray(self.token_scores)
     results = []
     for index in indices:
       results.append(
           dict(
               index=int(index),
               input_len=int(input_lens[index]),
-              tokens=np.asarray(self.tokens[index])[: lens[index]],
-              logprobs=np.asarray(self.token_logprobs[index])[: lens[index]],
-              scores=np.asarray(self.token_scores[index])[: lens[index]],
+              tokens=all_tokens[index][: lens[index]],
+              logprobs=all_logprobs[index][: lens[index]],
+              scores=all_scores[index][: lens[index]],
               truncated=not bool(reached_eos[index]),
           )
       )
@@ -2099,4 +2103,4 @@ class SamplingState:
         ),
         _StepState(step=jnp.array(0), state=self),
     )
-    return final_sampling_state.state
+    return final_sampling_state.state  # pyrefly: ignore[bad-return]

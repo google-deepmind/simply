@@ -347,5 +347,22 @@ class V2FormatQuantizedRestoreTest(absltest.TestCase):
       rel_error = np.abs(dequant - original).max() / np.abs(original).max()
       self.assertLess(rel_error, 0.25, msg=f'int4 restore blew up at {key}')
 
+  def test_save_and_load_data_state(self):
+    ckpt_dir = self.create_tempdir().full_path
+    data_payload = {'train_iter_state': {'step': 100, 'worker_id': 1}}
+    dummy_state = {'params': jnp.ones((2, 2))}
+    with ocp.CheckpointManager(ckpt_dir) as mngr:
+      ckpt_lib.save_checkpoint(
+          mngr,
+          dummy_state,
+          ckpt_step=42,
+          data=data_payload,
+      )
+      mngr.wait_until_finished()
+
+    restored_data = ckpt_lib.load_data_state_from_dir(ckpt_dir, ckpt_step=42)
+    self.assertEqual(restored_data, data_payload)
+
+
 if __name__ == '__main__':
   absltest.main()

@@ -59,7 +59,7 @@ class Batcher:
   state: dict[str, Any] = dataclasses.field(default_factory=dict)
 
   max_queue_size: int = 4096
-  max_queue_timeout: float = 1.0  # seconds
+  max_queue_timeout: float | None = 1.0  # seconds
 
   max_seq_len: int = 65537
   max_decode_steps: int = np.iinfo(np.int32).max // 2
@@ -91,6 +91,15 @@ class Batcher:
   # radix trie, so prompts that share a prefix share its KV chunks. False
   # (default) disables the prefix cache entirely.
   enable_prefix_caching: bool = False
+  # Byte budget for the prefix cache. This is the cache's OWN eviction
+  # threshold, so it is only a cap if it is BELOW the memory ceiling the
+  # process runs under -- set above it, the process dies before eviction can
+  # ever fire. It therefore defaults to a conservative fraction of that
+  # ceiling; pass an explicit value to override, or None to disable eviction
+  # entirely.
+  prefix_cache_max_bytes: int | None = dataclasses.field(
+      default_factory=prefix_cache_lib.default_max_bytes
+  )
 
   @functools.cached_property
   def model(self) -> model_lib.TransformerLM:
@@ -552,14 +561,14 @@ class Batcher:
       return None
     return prefix_cache_lib.PrefixCache(
         chunk_size=self.abstract_sampling_state.chunk_size,
-        max_bytes=300 * 1024**3,  # 300 GiB host-RAM cap.
+        max_bytes=self.prefix_cache_max_bytes,
     )
 
   def _maybe_restore_from_prefix_cache(self) -> np.ndarray:
     """Restores the deepest cached prefix into every prefilling slot.
 
     Returns:
-      Number of tokens restored from the prefix caching.
+      Per-slot tokens restored, as `int32[batch_size]`.
     """
     batch_size = self.sampling_state.batch_size
     if (cache := self.prefix_cache) is None:
@@ -606,6 +615,13 @@ class Batcher:
       return 0
     time_start = time.time()
     freed = cache.evict()
+    # Logged unconditionally: a cache that never evicts would otherwise print
+    # nothing at all, which is indistinguishable from a cache that is absent.
+    logging.info(
+        'prefix_cache: holding %d MiB of %d MiB budget',
+        cache.nbytes >> 20,
+        (cache.max_bytes or 0) >> 20,
+    )
     if freed:
       logging.info(
           'prefix_cache: freed %d MiB in %.2fs; %d MiB held',
@@ -624,7 +640,7 @@ class Batcher:
         position)`.
 
     Returns:
-      Prompt tokens newly cached per slot, as an `int64` array of length
+      Prompt tokens newly cached per slot, as an `int32` array of length
       `batch_size` -- for the response's accounting. It reports what it
       STORED rather than a position delta, because a prefill pass moves the
       position of every slot it touches, including the ones skipped here.
@@ -665,17 +681,15 @@ class Batcher:
             )
         )
         n_dispatches += 1
-      # STORE. The pass's end is the resume point; a refusal stops the run
-      # short and says so. Nothing is claimed on the cache's behalf either
-      # way, so nothing is now false: the next pass covers the same ground.
-      slot_tokens = tokens[slot_id]
-      reached = cache.store_tiles(slot_tokens, tiles)
-      written[slot_id] = reached - start
-      if reached < position:
+      # The last tile ends at `position` by construction, so the cache must
+      # come back holding exactly that.
+      reached = cache.store_tiles(tokens[slot_id], tiles)
+      if reached != position:
         raise ValueError(
-            'Prefix cache refused to store tiles for slot %d from %d to %d'
-            % (slot_id, start, position)
+            f'Prefix cache stored up to {reached} for slot {slot_id}, but the'
+            f' pass ended at {position}.'
         )
+      written[slot_id] = position - start
     logging.info(
         'Cached %d prefix chunks in %.2fs.',
         n_dispatches,

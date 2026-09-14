@@ -34,7 +34,7 @@ them.
 
 Example (concrete plugin, lives outside this module):
 
-    from simply.eval import model_backends
+    from third_party.py.simply.eval import model_backends
 
     def _my_backend_factory(uri_body, *, temperature, top_p, top_k,
                             max_decode_steps):

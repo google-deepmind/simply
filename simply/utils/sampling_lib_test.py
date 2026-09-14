@@ -49,18 +49,94 @@ class SamplingLibTest(parameterized.TestCase):
     self.assertEqual(1399, schedule.end_position)
     self.assertEqual(128, schedule.chunk_size)
 
+  def test_decode_buffer_multiple_pads_buffers_only(self):
+    params = sampling_lib.SamplingParams(
+        intermediate_decode_steps=128,
+        max_decode_steps=1000,
+        decode_buffer_multiple=128,
+    )
+    schedule = params.get_decoding_schedule(
+        min_input_length=200, max_input_length=400
+    )
+
+    # The generation budget is untouched...
+    self.assertEqual(1399, schedule.end_position)
+    # ...only the buffers are grown, to the next multiple of 128.
+    self.assertEqual(1408, schedule.padded_end_position)
+    self.assertEqual(1408, schedule.get_next_length(1300))
+
+    # ...and batches whose longest prompt differs share the buffer size (this
+    # is what keeps the compiled decode program reusable).
+    for max_input_length in range(300, 400):
+      other = params.get_decoding_schedule(
+          min_input_length=200, max_input_length=max_input_length
+      )
+      self.assertEqual(1408, other.padded_end_position)
+
+  def test_dynamic_stop_position_is_keyed_on_buffering_not_on_the_batch(self):
+    params = sampling_lib.SamplingParams(
+        intermediate_decode_steps=128,
+        max_decode_steps=1000,
+        decode_buffer_multiple=128,
+    )
+    # 1408 - 1000 + 1: a batch whose exact end_position IS on the grid.
+    on_grid = params.get_decoding_schedule(
+        min_input_length=200, max_input_length=409
+    )
+    self.assertEqual(1408, on_grid.end_position)
+    self.assertEqual(1408, on_grid.padded_end_position)
+    # Still dynamic, so it shares the compiled program with off-grid batches.
+    self.assertEqual(1408, on_grid.dynamic_stop_position)
+    self.assertIsNone(
+        sampling_lib.SamplingParams(
+            intermediate_decode_steps=128, max_decode_steps=1000
+        )
+        .get_decoding_schedule(min_input_length=200, max_input_length=409)
+        .dynamic_stop_position
+    )
+
+  def test_decode_buffer_multiple_respects_max_seq_len(self):
+    params = sampling_lib.SamplingParams(
+        intermediate_decode_steps=128,
+        max_decode_steps=1000,
+        max_seq_len=1300,
+        decode_buffer_multiple=128,
+    )
+    schedule = params.get_decoding_schedule(
+        min_input_length=200, max_input_length=400
+    )
+    self.assertEqual(1299, schedule.end_position)
+    self.assertEqual(1299, schedule.padded_end_position)
+
+  def test_decode_buffer_multiple_off_by_default(self):
+    schedule = sampling_lib.SamplingParams(
+        intermediate_decode_steps=128, max_decode_steps=1000
+    ).get_decoding_schedule(min_input_length=200, max_input_length=400)
+    self.assertIsNone(schedule.buffer_end_position)
+    self.assertEqual(schedule.end_position, schedule.padded_end_position)
+
+  def test_buffer_end_position_must_not_shrink_the_budget(self):
+    with self.assertRaises(ValueError):
+      sampling_lib.DecodingSchedule(
+          prefill_size=105,
+          begin_position=80,
+          end_position=2000,
+          chunk_size=100,
+          buffer_end_position=1999,
+      )
+
   def test_processed_input_batching(self):
     input1 = sampling_lib.ProcessedInput(
         tokens=[1, 2],
-        extra_inputs={'extra_field': np.ones((1, 3))},  # pyrefly: ignore[bad-argument-type]
+        extra_inputs={'extra_field': np.ones((1, 3))},  # pyrefly: ignore[bad-argument-type, bad-assignment]
     )
     input2 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3, 4],
-        extra_inputs={'extra_field': np.ones((2, 2))},  # pyrefly: ignore[bad-argument-type]
+        extra_inputs={'extra_field': np.ones((2, 2))},  # pyrefly: ignore[bad-argument-type, bad-assignment]
     )
     input3 = sampling_lib.ProcessedInput(
         tokens=[1, 2, 3],
-        extra_inputs={'extra_field': np.ones((3, 1))},  # pyrefly: ignore[bad-argument-type]
+        extra_inputs={'extra_field': np.ones((3, 1))},  # pyrefly: ignore[bad-argument-type, bad-assignment]
     )
 
     batch = sampling_lib.ProcessedInputBatch.from_unpadded_inputs(

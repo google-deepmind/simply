@@ -198,8 +198,7 @@ anything trustworthy, and what it says is an EXTENT rather than a yes/no.
     tokens and **union** (`rpa.merge_chunk_trees`), per leaf and per token.
     Nothing is overwritten, so the outcome does not depend on which prompt
     ran first, and a chunk that no single pass can capture whole (any
-    `window < chunk`) can still become whole by accumulation. A capture that
-    adds nothing is skipped before the extract is even issued.
+    `window < chunk`) can still become whole by accumulation.
 *   Whether a position can be resumed from is **whether the cache holds a
     resume point there**, meaning "a pass ended here", and reading it needs no
     window arithmetic: at a pass boundary the writer has captured every chunk
@@ -214,8 +213,8 @@ anything trustworthy, and what it says is an EXTENT rather than a yes/no.
 *   The batcher snapshots after **every** prefill pass. Passes are *not*
     aligned to the chunk grid: a boundary lands wherever the scheduler's
     token budget ran out.
-*   `Batcher._maybe_snapshot_prefix_cache` therefore walks FORWARD from a
-    persistent per-slot token frontier, building one `ChunkTile(tree, start,
+*   `Batcher._maybe_snapshot_prefix_cache` therefore walks forward from the
+    slot's position before the pass, building one `ChunkTile(tree, start,
     end)` per chunk the slot has newly crossed -- the last of them ending AT
     `position`, mid-chunk -- and handing the run to `PrefixCache.store_tiles`,
     which navigates, creates what is missing, fills, and marks `position` as
@@ -227,7 +226,7 @@ anything trustworthy, and what it says is an EXTENT rather than a yes/no.
 *   Reading back is `PrefixCache.restore_chunk_tiles(tokens, start, end)`,
     which returns the tiles to inject for the deepest resume point at or below
     `end`; the caller `rpa.onload_chunk_tree`s each one and issues
-    `DecodeState.inject_chunk(slot_id, payload, start, end)`. That signature
+    `SamplingState.inject_chunk(slot_id, payload, start, end)`. That signature
     is the whole contract: absolute token positions, the slot gains exactly
     `end - start` tokens, and the payload is the chunk `start` falls in.
 *   The cache indexes those positions in a path-compressed (radix) trie over

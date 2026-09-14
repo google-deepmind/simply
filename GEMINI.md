@@ -15,17 +15,21 @@ pip install -U jax              # CPU
 pip install -U "jax[cuda13]"    # GPU
 pip install -U "jax[tpu]"       # TPU
 
-# Install other dependencies
-pip install -r requirements.txt
+# Install Simply and the extras you need
+pip install ".[dev,agent,tfds,math-eval,serving,zoo,assets]"
 
-# Download models and datasets
+# Download the tokenizers (~100 MB), or everything (~10 GB)
+python setup/setup_assets.py --vocabs-only
 python setup/setup_assets.py
 ```
 
 ### Running Experiments
 ```bash
-# Local test run
+# Local test run (needs the Qwen3 tokenizer and TFDS imdb_reviews)
 python -m simply.main --experiment_config lm_test --experiment_dir /tmp/exp_1 --alsologtostderr
+
+# Same model on synthetic data: no tokenizer, no dataset download
+python -m simply.main --experiment_config lm_smoke_test --experiment_dir /tmp/exp_0 --alsologtostderr
 
 # Debug mode (disable JIT for printing arrays)
 export JAX_DISABLE_JIT=True
@@ -40,8 +44,8 @@ tensorboard --logdir /tmp/exp_1
 # Serving tests need the generated gRPC stubs (one-off, see setup/gen_protos.py)
 pip install ".[serving]" && python setup/gen_protos.py
 
-# Run all tests
-pytest simply/
+# Run all tests (`*_multi_device_test.py` files need their own process, below)
+pytest simply/ --ignore-glob='*multi_device_test.py'
 
 # Run specific test file
 pytest simply/model_lib_test.py
@@ -49,9 +53,10 @@ pytest simply/model_lib_test.py
 # Run specific test
 pytest simply/model_lib_test.py::ModelTest::test_forward_pass
 
-# Multi-device tests need their own process: they force 4 CPU devices via
-# XLA_FLAGS, which only takes effect before JAX initializes its backend.
-pytest simply/model_lib_multi_device_test.py
+# One process each: every `*_multi_device_test.py` forces its own CPU device
+# count before JAX initializes its backend, which only works in a fresh
+# process. A test that needs more than one device belongs in such a file.
+for t in $(find simply -name '*multi_device_test.py'); do pytest "$t"; done
 ```
 
 ## Architecture
@@ -62,15 +67,21 @@ pytest simply/model_lib_multi_device_test.py
 - **model_lib.py** - LLM architectures (Attention, TransformerBlock, TransformerLM, MoE)
 - **data_lib.py** - Data pipeline setup using SeqIO and Grain
 - **rl_lib.py** - RL training components (reward normalization, batching)
+- **colocate_async_rl_lib.py** - Async RL train loop that colocates training
+  and sampling on the same devices (uses the paged serving batcher; optional,
+  it needs the generated gRPC stubs)
 - **tool_lib.py** - Tool use and execution framework
 
 ### Subpackages (simply/)
 - **agent/** - Minimal agent harness (Bash tool, context management, LiteLLM)
 - **eval/** - Decode-based evaluation entry points and model backends
-- **kernels/** - Pallas kernels (ragged paged attention, grouped matmul)
+- **kernels/** - Pallas kernels (ragged paged attention, grouped matmul,
+  remote-DMA reshard)
 - **serving/** - gRPC serving stack (paged/vanilla servers, batching,
   KV prefix cache). Stubs are generated from `serving/*.proto`.
 - **tools/** - Offline utilities (checkpoint conversion, dataset serialization)
+- **zoo/** - Self-contained model plugins (`glm5`, `kimi_k3`, `qwen3p8`); each
+  registers its modules/configs on import
 
 ### Utilities (simply/utils/)
 - **module.py** - SimplyModule base class with registry pattern

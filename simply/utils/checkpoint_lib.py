@@ -18,7 +18,6 @@ from collections.abc import Mapping
 import dataclasses
 import functools
 import logging
-import os
 import pydoc
 import re
 import time
@@ -817,7 +816,7 @@ def load_data_state_from_dir(ckpt_dir: str, ckpt_step: int = -1) -> PyTree:
       )
   ) as checkpointer:
     restored = checkpointer.restore(
-        os.path.join(ckpt_dir, str(ckpt_step)),
+        get_checkpoint_path(ckpt_dir, ckpt_step),
         args=ocp.args.Composite(**{DATA_ITEM_NAME: ocp.args.JsonRestore()}),
     )
     return restored[DATA_ITEM_NAME]

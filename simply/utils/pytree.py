@@ -62,7 +62,7 @@ def tree_value(tree: PyTree, path: jax.tree_util.KeyPath | str) -> PyTree:
   value = tree
   for item in path:
     if isinstance(item, jax.tree_util.DictKey):
-      if item.key not in value:
+      if item.key not in value:  # pyrefly: ignore[not-iterable]
         raise KeyError(f'{path} does not exist in tree at {item}.')
       value = value[item.key]  # pyrefly: ignore[bad-index, unsupported-operation]
     elif isinstance(item, jax.tree_util.SequenceKey):
@@ -469,7 +469,7 @@ def trim_none(tree: PyTree) -> PyTree:
   if tree_is_sequence(tree):
     trimmed_tree = [None] * len(tree)  # pyrefly: ignore[bad-argument-type]
     should_trim = True
-    for i, v in enumerate(tree):  # pyrefly: ignore[bad-argument-type]
+    for i, v in enumerate(tree):  # pyrefly: ignore[bad-argument-type, not-iterable]
       v = trim_none(v)
       trimmed_tree[i] = v  # pyrefly: ignore[unsupported-operation]
       if v is not None:
