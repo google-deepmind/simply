@@ -1,8 +1,9 @@
-# Running Simply on Google Cloud TPUs
+# Running Simply on Google Cloud
 
 This guide walks you through running Simply experiments on Google Cloud
 TPU VMs, from initial setup through monitoring and collecting results.
-It covers both single-host and multi-host configurations.
+It covers both single-host and multi-host configurations. For NVIDIA
+GPUs, jump to [Running on GPU](#running-on-gpu).
 
 ## Prerequisites
 
@@ -121,11 +122,13 @@ gcloud storage cp /tmp/simply.tar.gz $BUCKET/code/
 
 ### Upload Model Checkpoints
 
-Model checkpoints are large (several GB). Download them locally
-first, then upload to GCS:
+Model checkpoints are large (~10 GB for the whole HuggingFace repo).
+Download them locally first, then upload to GCS:
 
 ```bash
-# Download locally
+# Download locally (models + datasets); --vocabs-only fetches just the
+# tokenizers (~100 MB) if all you need is a from-scratch training config.
+pip install ".[assets]"   # huggingface_hub, used by setup_assets.py
 python setup/setup_assets.py
 
 # Upload to GCS (example for Gemma 2B)
@@ -182,27 +185,16 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
     --worker=0
 ```
 
-### Install Python 3.11
+### Install Python 3.12
 
-TPU VMs ship with Python 3.10, but Simply requires 3.11+ (uses
-`typing.Self`):
+TPU VMs ship with an older Python, but Simply requires 3.12+
+(`requires-python` in `pyproject.toml`):
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
-```
-
-### Virtual Environment and Dependencies
-
-```bash
-python3.11 -m venv /tmp/simply_venv
-source /tmp/simply_venv/bin/activate
-pip install -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install -r requirements.txt
-pip install google-cloud-storage  # for TensorBoard gs:// support
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
 ```
 
 ### Download Code from GCS
@@ -211,6 +203,18 @@ pip install google-cloud-storage  # for TensorBoard gs:// support
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
+```
+
+### Virtual Environment and Dependencies
+
+The `tpu` extra pulls `jax[tpu]` (libtpu comes from PyPI, so no `-f`
+index is needed):
+
+```bash
+python3.12 -m venv /tmp/simply_venv
+source /tmp/simply_venv/bin/activate
+cd /tmp/simply
+pip install ".[tpu,tfds,gcloud]"
 ```
 
 ### Set Asset Paths
@@ -238,6 +242,9 @@ export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
 
+# `lm_smoke_test` is the same model on synthetic data and a byte vocab:
+# no asset or dataset download, a few seconds -- use it to check the TPU
+# is visible before starting a real run.
 python3 -m simply.main \
     --experiment_config lm_test \
     --experiment_dir /tmp/exp_1 \
@@ -277,7 +284,7 @@ export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
 python3 -m simply.main \
-    --experiment_config gemma2_2b_gsm8k_2k_rl_16 \
+    --experiment_config gemma2_2b_gsm8k_seqlen2k_bs16x16_rl \
     --experiment_dir $BUCKET/experiments/my_exp \
     --alsologtostderr
 "
@@ -310,7 +317,7 @@ For multi-host or preemptible runs, prefer a GCS experiment directory:
 
 ```bash
 python3 -m simply.main \
-    --experiment_config gemma2_2b_gsm8k_2k_rl_16 \
+    --experiment_config gemma2_2b_gsm8k_seqlen2k_bs16x16_rl \
     --experiment_dir gs://my-bucket/experiments/my_exp \
     --alsologtostderr
 ```
@@ -324,13 +331,15 @@ gcloud storage cp -r /tmp/exp_1 $BUCKET/experiments/
 ## 6. Example: Gemma 2B GSM8K RL
 
 This example trains Gemma 2B on GSM8K using RL (GRPO) on a
-v5litepod-16. The experiment config `gemma2_2b_gsm8k_2k_rl_16`
+v5litepod-16. The experiment config `gemma2_2b_gsm8k_seqlen2k_bs16x16_rl`
 (defined in `simply/config_lib.py`) sets:
 
-- 2000 training steps
+- 5000 training steps
 - `LinearWarmupConstant(value=1e-7)` learning rate
-- `grad_accum_steps=2` to avoid OOM on logprobs
-- Checkpoints every 20 steps
+- batch of 16 questions x 16 samples, `train_max_seq_len=2048`
+- Checkpoints every 40 steps
+- Gemma 2B weights from `$SIMPLY_MODELS/GEMMA-2.0-2B-PT-ORBAX` and the
+  `vb256128_gemma2` vocab (`$SIMPLY_VOCABS/gemma2_tokenizer.model`)
 
 ```bash
 TPU_NAME=simply-pod
@@ -359,16 +368,13 @@ gcloud compute tpus tpu-vm ssh $TPU_NAME \
 sudo apt-get update -qq
 sudo apt-get install -y -qq software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
-python3.11 -m venv /tmp/simply_venv
+sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev
+python3.12 -m venv /tmp/simply_venv
 source /tmp/simply_venv/bin/activate
-pip install -q -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
-pip install -q -r requirements.txt
-pip install -q google-cloud-storage
+pip install -q '.[tpu,tfds,gcloud]'
 "
 
 # Run experiment (GCS for assets and experiment dir)
@@ -383,7 +389,7 @@ export SIMPLY_MODELS=$BUCKET/models/
 export SIMPLY_DATASETS=$BUCKET/datasets/
 export SIMPLY_VOCABS=$BUCKET/vocabs/
 python3 -m simply.main \
-    --experiment_config gemma2_2b_gsm8k_2k_rl_16 \
+    --experiment_config gemma2_2b_gsm8k_seqlen2k_bs16x16_rl \
     --experiment_dir $BUCKET/experiments/gemma2b_gsm8k \
     --alsologtostderr 2>&1
 "
@@ -409,8 +415,16 @@ The RL training loop materializes full logits tensors during
 `compute_logprobs_fn`: shape `bf16[batch/chips, seq_len, vocab_size]`.
 For Gemma 2B (vocab_size=256128), this is ~4 GB per microbatch.
 
-Set `grad_accum_steps=2` (or higher) to halve the microbatch size.
-The gradient is mathematically identical.
+Set `grad_accum_steps` to 2 or higher to shrink the microbatch; the
+gradient is mathematically identical. It is not set by the RL configs,
+so pass it on the command line:
+
+```bash
+python3 -m simply.main \
+    --experiment_config gemma2_2b_gsm8k_seqlen2k_bs16x16_rl \
+    --config_overlay '{"grad_accum_steps": 2}' \
+    --experiment_dir $BUCKET/experiments/my_exp --alsologtostderr
+```
 
 ### SSH Key Warmup for Multi-Host
 
@@ -495,7 +509,7 @@ PROJECT=your-project-id
 BUCKET=gs://your-bucket-name
 ACCEL_TYPE=v5litepod-16
 MAX_ATTEMPTS=10
-EXPERIMENT_CONFIG=gemma2_2b_gsm8k_2k_rl_16
+EXPERIMENT_CONFIG=gemma2_2b_gsm8k_seqlen2k_bs16x16_rl
 EXPERIMENT_DIR=$BUCKET/experiments/my_experiment
 NUM_WORKERS=4
 
@@ -503,16 +517,13 @@ SETUP_CMD="
 sudo apt-get update -qq
 sudo apt-get install -y -qq software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev
-python3.11 -m venv /tmp/simply_venv
+sudo apt-get install -y -qq python3.12 python3.12-venv python3.12-dev
+python3.12 -m venv /tmp/simply_venv
 source /tmp/simply_venv/bin/activate
-pip install -q -U 'jax[tpu]' \
-    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 gcloud storage cp $BUCKET/code/simply.tar.gz /tmp/
 mkdir -p /tmp/simply && cd /tmp/simply
 tar xzf /tmp/simply.tar.gz
-pip install -q -r /tmp/simply/requirements.txt
-pip install -q google-cloud-storage
+pip install -q '/tmp/simply[tpu,tfds,gcloud]'
 "
 
 RUN_CMD="
@@ -614,6 +625,176 @@ gcloud compute instances delete bastion \
 The GCS bucket, VPC, NAT, and firewall rules persist across
 experiments and don't need to be recreated.
 
+## Running on GPU
+
+Simply's model, training loop and (non-paged) decoding are plain
+JAX/XLA and run unmodified on NVIDIA GPUs. The hand-written Pallas
+kernels are TPU-only, so a few config options must stay off; see
+[GPU feature support](#gpu-feature-support) below.
+
+### Install
+
+```bash
+# Simply requires Python 3.12+; the cu129 Deep Learning VM images ship it.
+python3.12 -m venv ~/simply_venv && source ~/simply_venv/bin/activate
+cd /path/to/simply
+pip install ".[gpu,tfds,math-eval,assets]"  # gpu extra = jax[cuda13]
+python -c "import jax; print(jax.devices())"
+```
+
+`jax[cuda13]` needs an NVIDIA driver at least as new as CUDA 13's
+(R580+). On an older driver install the CUDA 12 build instead
+(`pip install -U "jax[cuda12]"`); see the
+[JAX install guide](https://docs.jax.dev/en/latest/installation.html).
+
+### Creating a GPU VM
+
+GPUs come attached to the machine type for the accelerator-optimized
+families, so no `--accelerator` flag is needed: `g2-standard-24`
+(2x L4), `a2-highgpu-1g` (1x A100 40GB), `a3-highgpu-8g` (8x H100).
+Deep Learning VM images ship the driver and CUDA toolkit
+pre-installed; list the families and pick one whose driver is new
+enough for your JAX build:
+
+```bash
+gcloud compute images list --project=deeplearning-platform-release \
+    --filter="family~'common-cu'" --format="value(family)" | sort -u
+```
+
+```bash
+PROJECT=your-project-id
+ZONE=us-central1-a
+
+gcloud compute instances create simply-gpu \
+    --project=$PROJECT --zone=$ZONE \
+    --machine-type=g2-standard-24 \
+    --image-family=common-cu129-ubuntu-2204-nvidia-580 \
+    --image-project=deeplearning-platform-release \
+    --boot-disk-size=200GB \
+    --maintenance-policy=TERMINATE \
+    --metadata="install-nvidia-driver=True"
+
+gcloud compute ssh simply-gpu --zone=$ZONE --project=$PROJECT
+```
+
+GPU quota is per-region and per-GPU-type (IAM & Admin > Quotas,
+e.g. `NVIDIA_L4_GPUS`). Add `--provisioning-model=SPOT` for
+preemptible pricing.
+
+### Training smoke test
+
+```bash
+nvidia-smi
+# Synthetic data, byte vocab: no download, ~10 s.
+python -m simply.main --experiment_config lm_smoke_test \
+    --experiment_dir /tmp/exp_0 --alsologtostderr
+
+# The real thing: IMDB via TFDS + the Qwen3 tokenizer.
+python setup/setup_assets.py --vocabs-only   # Qwen3 tokenizer, ~100 MB
+python -m simply.main \
+    --experiment_config lm_test \
+    --experiment_dir /tmp/exp_1 \
+    --alsologtostderr
+```
+
+`lm_test` downloads the TFDS `imdb_reviews` dataset on first run, so
+the VM needs outbound internet (external IP or Cloud NAT). Everything
+else is identical to the TPU flow above: `SIMPLY_MODELS`,
+`SIMPLY_DATASETS` and `SIMPLY_VOCABS` may point at `gs://` paths, and
+`--experiment_dir` may be a GCS path.
+
+### GPU feature support
+
+| Feature | Config field | GPU |
+|---------|--------------|-----|
+| Transformer training + eval (dense) | -- | works (XLA) |
+| Non-paged sampling / `simply.eval.decode_eval` | -- | works (XLA) |
+| MoE grouped matmul | `gmm_impl='ragged_dot'` | works (XLA `jax.lax.ragged_dot`) |
+| Flash attention | `use_flash_attention=True` | **unsupported** (Pallas TPU splash attention) |
+| MoE megablox / quantized matmul | `gmm_impl='megablox'`, `'gmm_v2'` | **unsupported** (Pallas TPU) |
+| Weight-only quantized MoE decode | `ffn_weight_quant='int8'/'int4'` | **unsupported** (forces `gmm_v2`) |
+| Paged attention / paged serving | `page_size>0`, `simply/serving/page_server.py`, `simply.eval.page_decode_eval` | works, slowly (reference implementation, see below) |
+| KV cache quantization | `kv_cache_quant` | works, slowly (same reference path) |
+| Cross-chip resharding kernel | `simply/kernels/reshard.py` | **unsupported** (TPU remote DMA) |
+
+The unsupported rows fail loudly when the kernel is lowered (Mosaic
+errors such as `Unsupported TPU device kind`); they never degrade
+silently into a slow fallback.
+
+Paged attention is the exception: off TPU,
+`utils/ragged_paged_attention.py` calls
+`kernels.ragged_paged_attention.ref_ragged_paged_attention`, a plain
+XLA implementation that is correct but costs
+`O(max_num_seqs * max_num_tokens * pages_per_seq * page_size)` -- it
+masks whole page allocations instead of slicing each sequence's KV.
+Paged serving and paged eval therefore run on GPU (and CPU), but
+expect a large slowdown versus the TPU kernel; `vanilla_server` and
+`decode_eval` are the faster non-paged route.
+
+Registered configs that turn on TPU-only features need an override on
+GPU. All `deepseek_qwen2_*_rl`, `gemma3_12b_it_dsr40k_b2k_l10k_rl` and
+`gemma2_2b_gsm8k_seqlen2k_bs32x16_rl` set `use_flash_attention=True`:
+
+```bash
+python -m simply.main \
+    --experiment_config deepseek_qwen2_1p5b_it_dsr40k_r1_distill_cot_0shot_rl \
+    --config_overlay '{"use_flash_attention": false}' \
+    --experiment_dir /tmp/exp_2 --alsologtostderr
+```
+
+The Qwen3 MoE configs (`qwen3_30b_a3b`, `qwen3_235b_a22b`, and their
+`_thinking_2507` variants) set `gmm_impl='megablox'`; override with
+`--config_overlay '{"gmm_impl": "ragged_dot"}'`. The
+`*_colocate_async_rl` configs set `use_flash_attention=True` as well,
+so they need the same flash-attention override; their paged sampler
+then runs through the reference implementation above.
+
+Activations default to bfloat16 (`activation_dtype_name`), which needs
+Ampere or newer (A100/L4/H100). On older cards (T4/V100) run with
+`--config_overlay '{"activation_dtype_name": "float32"}'`.
+
+### Multi-GPU sharding
+
+Sharding is expressed as a `(replica, data, model)` mesh over
+`jax.devices()`, so it is accelerator-agnostic. On one host with N
+GPUs:
+
+```bash
+# FSDP-style: shard params and batch over 8 GPUs
+python -m simply.main --experiment_config lm_test \
+    --mesh_shape 1,8,1 \
+    --config_overlay '{"batch_size": 8, "model_dim": 64, "n_heads": 4, "per_head_dim": 16}' \
+    --experiment_dir /tmp/exp_3 --alsologtostderr
+
+# 2-way data x 4-way tensor parallel
+python -m simply.main --experiment_config lm_test \
+    --mesh_shape 1,2,4 \
+    --config_overlay '{"batch_size": 8, "model_dim": 64, "n_heads": 4, "per_head_dim": 16}' \
+    --experiment_dir /tmp/exp_4 --alsologtostderr
+```
+
+(`lm_test` is deliberately tiny -- `model_dim=8`, `n_heads=2` -- so the
+overlay widens it enough to be shardable. Real configs need no such
+override.)
+
+Sizing rules (`config_lib.get_default_mesh_shape` picks the mesh when
+`--mesh_shape` is omitted: `data = gcd(model_dim, num_devices)` and
+`replica = rest` for training):
+
+- `batch_size` must be divisible by `replica * data`.
+- `data` shards `model_dim` (and the batch); `model` shards `n_heads`,
+  the FFN expansion dim and the vocab (see `BaseSharding` in
+  `simply/config_lib.py`), so each must divide the axis size.
+- Prefer the `data` (FSDP) axis first; add `model` parallelism only
+  when one GPU cannot hold the parameters and optimizer state.
+
+Multi-node GPU is *not* covered by the TPU instructions:
+`simply/main.py` calls `jax.distributed.initialize()` with no
+arguments, which only works when JAX can auto-detect the cluster
+(Slurm, Open MPI, mpi4py or Kubernetes). On plain GCE VMs the call
+raises `ValueError` and Simply falls back to a single-host run, so use
+one multi-GPU VM (up to 8 GPUs) or launch the job under Slurm/MPI/GKE.
+
 ## Running on GKE with XPK
 
 As an alternative to managing TPU VMs directly, you can run Simply
@@ -668,21 +849,29 @@ itself from the source tree copied by XPK's `--script-dir` flag.
 
 ### Launching a Workload with a Registered Config
 
-The simplest way to launch is with a registered config name. The
-`lm_test_gke_training` config is designed for GKE testing -- it
-uses a small model with no checkpoint loading:
+The simplest way to launch is with a registered config name. `lm_test`
+is a tiny from-scratch transformer, so no checkpoint upload is needed;
+`--config_overlay` (everything after `--` is forwarded to
+`simply.main`) turns checkpointing off and shortens the run:
 
 ```bash
 ./scripts/launch_gke.sh \
-    --config lm_test_gke_training \
+    --config lm_test \
     --project $PROJECT \
     --cluster $CLUSTER \
     --zone $ZONE \
     --tpu-type $TPUTYPE \
-    --image gcr.io/$PROJECT/simply-jax-tpu:latest
+    --image gcr.io/$PROJECT/simply-jax-tpu:latest \
+    -- --config_overlay '{"num_train_steps": 20, "should_save_ckpt": false}'
 ```
 
+On a large slice also raise `batch_size` in the overlay: it must be
+divisible by `replica * data` of the mesh (see
+[Multi-GPU sharding](#multi-gpu-sharding) for the same rules).
+
 To preview the XPK command without submitting, add `--dry-run`.
+`--train-steps N` is a shorthand for a `num_train_steps` overlay and
+cannot be combined with your own `--config_overlay`.
 
 #### Common Options
 
@@ -692,6 +881,7 @@ To preview the XPK command without submitting, add `--dry-run`.
 | `--tpu-type TYPE` | `SIMPLY_XPK_TPU_TYPE` | `v4-8` | TPU accelerator |
 | `--num-slices N` | `SIMPLY_XPK_NUM_SLICES` | `1` | Number of slices |
 | `--priority PRI` | `SIMPLY_XPK_PRIORITY` | `medium` | Priority |
+| `--train-steps N` | | config's value | Override `num_train_steps` |
 | `--name NAME` | | auto | Custom workload name |
 | `--spot` | | (default) | Use spot instances |
 | `--on-demand` | | | Use on-demand instances |
@@ -705,7 +895,7 @@ trace storage:
 ```bash
 export SIMPLY_XPK_GCS_BUCKET=gs://my-bucket/profiles
 
-./scripts/launch_gke.sh --config lm_test_gke_training --profile \
+./scripts/launch_gke.sh --config lm_test --profile \
     --project $PROJECT --cluster $CLUSTER \
     --image gcr.io/$PROJECT/simply-jax-tpu:latest
 ```
@@ -728,12 +918,12 @@ List, monitor, and delete workloads:
 # Stream logs from a running workload
 ./scripts/launch_gke.sh \
     --project $PROJECT --cluster $CLUSTER --zone $ZONE \
-    --logs simply-lm-test-gke-training-0311
+    --logs simply-lm-test-0311
 
 # Delete a workload
 ./scripts/launch_gke.sh \
     --project $PROJECT --cluster $CLUSTER --zone $ZONE \
-    --delete simply-lm-test-gke-training-0311
+    --delete simply-lm-test-0311
 ```
 
 You can also use `kubectl` directly for lower-level diagnostics:
@@ -741,7 +931,7 @@ You can also use `kubectl` directly for lower-level diagnostics:
 ```bash
 # List pods for a workload
 kubectl get pods \
-    -l "jobset.sigs.k8s.io/jobset-name=simply-lm-test-gke-training-0311"
+    -l "jobset.sigs.k8s.io/jobset-name=simply-lm-test-0311"
 
 # Check container logs (replace POD_NAME with actual pod name)
 kubectl logs POD_NAME --all-containers 2>&1 | tail -50
@@ -772,9 +962,11 @@ accessible. Upload config files and assets to GCS and use
 #### `ModuleNotFoundError` for a Python package
 
 If a package is missing in the container, add it to
-`scripts/Dockerfile.simply`, rebuild, push, and relaunch. Common
-packages that may be needed depending on your data pipeline:
-
+`scripts/Dockerfile.simply`, rebuild, push, and relaunch. The image
+covers the `tfds`, `gcloud`, `assets`, `math-eval`, `serving` and `zoo`
+extras; anything
+else your data pipeline or reward function imports has to be added
+there.
 #### `Found incomplete checkpoint` / Orbax validation error
 
 Orbax uses `commit_success.txt` marker files to validate
@@ -794,6 +986,3 @@ If you use a different tokenizer, you may need to add a similar
 download step to `launch_gke.sh` or pre-bake the tokenizer files
 into the Docker image.
 
-## Future Work
-
-- **GPU VMs** -- A100/H100 setup

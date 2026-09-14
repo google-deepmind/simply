@@ -49,11 +49,11 @@ _EXPERIMENT_DIR = flags.DEFINE_string(
 _MAX_DECODE_STEPS = flags.DEFINE_integer(
     'max_decode_steps',
     None,
-    'Per-call output token cap, forwarded to the backend selected by'
-    ' --server_address (a backend may map it to its own field or ignore'
-    ' it; the built-in gRPC backend ignores it). Unset (default) means'
-    ' "defer to the server\'s per-model default"; set a positive value to'
-    ' override.',
+    'Per-call output token cap. On the vertex_ai backend this is forwarded'
+    ' as `GenerateContentConfig.max_output_tokens`; on the legacy gRPC'
+    ' backend it is currently a no-op (defined for forward-compat with the'
+    ' launcher). Unset (default) means "defer to the server\'s per-model'
+    ' default"; set a positive value to override.',
 )
 
 _EVALUATION = flags.DEFINE_string(
@@ -80,8 +80,8 @@ _NUM_EVAL_THREADS = flags.DEFINE_integer(
     'Across-example parallelism: maximum number of examples processed in'
     ' parallel by the dataset iterator (passed as grain.ReadOptions.num_threads'
     ' on the `map_with_index(asyncio.run(query_and_evaluate))` stage).'
-    ' Effective concurrency in production is bounded below by the number of'
-    ' sandbox replicas, since each example needs a sandbox.',
+    ' Effective concurrency in production is bounded below by'
+    ' --xbox_sidecar_replicas since each example needs a sandbox.',
 )
 
 # Backend selection is plugin-driven via `model_backends.ModelBackendRegistry`:
@@ -93,18 +93,18 @@ _NUM_EVAL_THREADS = flags.DEFINE_integer(
 
 _TEMPERATURE = flags.DEFINE_float(
     'temperature', None,
-    'Optional sampling temperature. Forwarded to the backend selected by'
-    ' --server_address; backends may ignore it.',
+    'Optional sampling temperature. Currently consumed by the vertex_ai'
+    ' backend.',
 )
 
 _TOP_P = flags.DEFINE_float(
     'top_p', None,
-    'Optional top-p. Forwarded to the selected backend; may be ignored.',
+    'Optional top-p. Currently consumed by the vertex_ai backend.',
 )
 
 _TOP_K = flags.DEFINE_integer(
     'top_k', None,
-    'Optional top-k. Forwarded to the selected backend; may be ignored.',
+    'Optional top-k. Currently consumed by the vertex_ai backend.',
 )
 
 

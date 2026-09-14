@@ -70,6 +70,12 @@ create_lr_schedule = opt_lib.create_lr_schedule
 SamplingParams = sampling_lib.SamplingParams
 EinsumLinear = module.EinsumLinear
 
+# Steps <= this are excluded from step time metrics (median_train_step_time,
+# train_step_time, avg_total_step_time). Large models take one or two
+# multi-thousand-second compiles before reaching steady state, and a single
+# warmup step can otherwise dominate the measurement by 20x.
+_STEP_TIME_WARMUP = 20
+
 # All the model parameters are wrapped into AnnotatedArray dataclass.
 # Its `array` field holds the raw array and its `metadata` field
 # holds the annotations.
@@ -224,8 +230,6 @@ def gmm(
   expert ``num_experts``) are left UNINITIALIZED. Those uninitialized rows
   often contain bit patterns that decode as inf/NaN in bf16, which then
   propagate through downstream einsums / RMSNorm / attention into the loss.
-  The prior ``nan_to_num`` workaround was insufficient: it hid the NaNs but
-  not the garbage magnitudes underneath them.
 
   Args:
     lhs: Left-hand side input of shape ``[total_tokens, in_dim]`` after
@@ -867,20 +871,27 @@ class MoEFeedForward(FeedForward):
       params[name] = sub
     return params
 
-  def apply(  # pyrefly: ignore[bad-override]
-      self,
-      params: PyTree,
-      x: Array,
-      inputs_mask: Array | None = None,
-  ) -> PyTree:
-    inputs = x
-    extra_output = {'loss': {}, 'metric': {}}
-    params = get_raw_arrays(params)
-    if inputs_mask is not None:
-      inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
-    # router_logits: [batch_size, seq_len, num_experts]
-    router_logits = self.router.apply(params['router'], inputs)  # pyrefly: ignore[bad-index, unsupported-operation]
-    router_logits = router_logits.astype(jnp.float32)
+  def _gate(
+      self, router_logits: Array, params: PyTree
+  ) -> tuple[Array, Array, Array]:
+    """Selects experts and gate weights from router logits.
+
+    The single generic extension point for MoE routing: a subclass overrides
+    this to plug in a different rule (e.g. DeepSeek-V3 / GLM sigmoid `noaux_tc`)
+    without duplicating the rest of `apply` (dispatch, load/entropy metrics,
+    lbl/z-loss). The base uses softmax routing.
+
+    Args:
+      router_logits: [batch, seq, num_experts] float32 logits.
+      params: This MoE module's (raw) params; a subclass may read extra router
+        params (e.g. a correction bias).
+
+    Returns:
+      (selected_router_probs, selected_indices, router_probs): the first two are
+      [batch, seq, num_experts_per_token]; `router_probs` is the full
+      [batch, seq, num_experts] gate distribution used for metrics.
+    """
+    del params
     # router_probs: [batch_size, seq_len, num_experts]
     router_probs = jax.nn.softmax(router_logits, axis=-1)
     if self.num_experts_per_token == 1:
@@ -899,6 +910,25 @@ class MoEFeedForward(FeedForward):
           router_logits, k=self.num_experts_per_token
       )
       selected_router_probs = jax.nn.softmax(selected_router_logits, axis=-1)
+    return selected_router_probs, selected_indices, router_probs
+
+  def apply(  # pyrefly: ignore[bad-override]
+      self,
+      params: PyTree,
+      x: Array,
+      inputs_mask: Array | None = None,
+  ) -> PyTree:
+    inputs = x
+    extra_output = {'loss': {}, 'metric': {}}
+    params = get_raw_arrays(params)
+    if inputs_mask is not None:
+      inputs = jnp.where(inputs_mask[..., None], inputs, 0.0)
+    # router_logits: [batch_size, seq_len, num_experts]
+    router_logits = self.router.apply(params['router'], inputs)  # pyrefly: ignore[bad-index, unsupported-operation]
+    router_logits = router_logits.astype(jnp.float32)
+    selected_router_probs, selected_indices, router_probs = self._gate(
+        router_logits, params
+    )
     selected_router_probs = jnp.asarray(
         selected_router_probs, self.activation_dtype
     )
@@ -2341,9 +2371,9 @@ class Attention(module.SimplyModule):
         else:
           output, attn_mat = attn(
               q,
-              k,
-              v,
-              mask,
+              k,  # pyrefly: ignore[bad-argument-type]
+              v,  # pyrefly: ignore[bad-argument-type]
+              mask,  # pyrefly: ignore[bad-argument-type]
               attn_soft_cap=self.attn_soft_cap,
               attn_mask_value=self.attn_mask_value,
               dtype=self.activation_dtype,
@@ -3100,7 +3130,7 @@ class TransformerLM(module.SimplyModule):
 
       x, extra_output_stack_list = jax.lax.scan(
           _process_per_repeat,
-          init=x,
+          init=x,  # pyrefly: ignore[bad-argument-type]
           xs=(params_stack_list, decode_state_stack_list),
           length=n_repeats,
       )
@@ -3385,24 +3415,90 @@ def compute_distill_loss(
   return loss, {'accuracy': accuracy}
 
 
-def train_one_step(
-    state,
+def compute_grads(
+    params,
     batch,
     model,
-    opt,
     teacher_model=None,
+    teacher_params=None,
+    custom_loss_fn=None,
+    distill_temperature: float = 1.0,
+    distill_alpha: float = 1.0,
+):
+  """Computes `(loss, extra_output, grad)` for one (micro-)batch.
+
+  Args:
+    params: Model params to differentiate.
+    batch: The batch to compute the loss on.
+    model: The model.
+    teacher_model: Teacher model for distillation, or None.
+    teacher_params: Params of `teacher_model`.
+    custom_loss_fn: Loss function overriding the default train/distill loss.
+    distill_temperature: Distillation temperature.
+    distill_alpha: Distillation alpha.
+
+  Returns:
+    `(loss, extra_output, grad)`; `extra_output['loss_weight']` is the weight
+    to use when averaging this micro-batch with others.
+  """
+  if teacher_model is None:
+    loss_fn = compute_train_loss if custom_loss_fn is None else custom_loss_fn
+    (loss, extra_output), grad = jax.value_and_grad(
+        loss_fn, argnums=1, has_aux=True
+    )(model, params, batch)
+  else:
+    if custom_loss_fn is None:
+      loss_fn = functools.partial(
+          compute_distill_loss,
+          temperature=distill_temperature,
+          alpha=distill_alpha,
+      )
+    else:
+      loss_fn = custom_loss_fn
+    (loss, extra_output), grad = jax.value_and_grad(
+        loss_fn, argnums=1, has_aux=True
+    )(model, params, teacher_model, teacher_params, batch)
+  return loss, extra_output, grad
+
+
+def apply_grads(
+    state,
+    grad,
+    loss,
+    model,
+    opt,
     lr=1e-4,
-    grad_accum_steps=-1,
     clip_grad_norm=-1,
     clip_update_norm=-1,
     clip_update_rms=-1,
     clip_local_update_rms=-1,
     weight_decay=-1,
-    custom_loss_fn=None,
     add_log_info=False,
-    distill_temperature: float = 1.0,
-    distill_alpha: float = 1.0,
 ):
+  """Applies an already-computed gradient to `state`.
+
+  Split out of `train_one_step` so callers that accumulate gradients over
+  micro-batches themselves (see `colocate_async_rl_lib`) reuse the same
+  clipping, optimizer and logging behaviour.
+
+  Args:
+    state: Training state (`params`, `steps`, optimizer slots, ...).
+    grad: Gradient pytree matching `state['params']`.
+    loss: Scalar loss that produced `grad`.
+    model: The model (its config selects the trainable params).
+    opt: The optimizer.
+    lr: Learning rate for this step.
+    clip_grad_norm: Global grad-norm clipping threshold, or <= 0 to disable.
+    clip_update_norm: Global update-norm clipping threshold.
+    clip_update_rms: Global update-RMS clipping threshold.
+    clip_local_update_rms: Per-leaf update-RMS clipping threshold.
+    weight_decay: Decoupled weight decay, or <= 0 to disable.
+    add_log_info: Whether to return the full log dict or an empty one; the
+      loss function's aux output is the caller's to merge in either way.
+
+  Returns:
+    `(loss, new_state, log_dict)`.
+  """
   clip_norm_fn = functools.partial(
       clip_tree_fn, fn=tree_norm, fn_name='norm')
   clip_rms_fn = functools.partial(
@@ -3417,83 +3513,8 @@ def train_one_step(
   log_dict.update(norm_info_fn(state['params'], name='weights'))
   log_dict.update(rms_info_fn(state['params'], name='weights'))
 
-  def _compute_grad(batch):
-    if teacher_model is None:
-      loss_fn = (
-          compute_train_loss
-          if custom_loss_fn is None
-          else custom_loss_fn
-      )
-      (loss, extra_output), grad = jax.value_and_grad(
-          loss_fn, argnums=1, has_aux=True)(model, state['params'], batch)
-    else:
-      if custom_loss_fn is None:
-        loss_fn = functools.partial(
-            compute_distill_loss,
-            temperature=distill_temperature,
-            alpha=distill_alpha,
-        )
-      else:
-        loss_fn = custom_loss_fn
-      (loss, extra_output), grad = jax.value_and_grad(
-          loss_fn, argnums=1, has_aux=True)(
-              model, state['params'],
-              teacher_model, state['teacher_params'], batch)
-    return loss, extra_output, grad
-
-  if grad_accum_steps > 1:
-    # Prepare the batch for grad accumulation.
-    batch = jax.tree.map(
-        lambda x: einops.rearrange(
-            x, '(g m) ... -> g m ...',
-            g=grad_accum_steps),
-        batch)
-
-    # One step of grad accumulation.
-    def grad_accum_step_fn(accum_info, minibatch):
-      accum_loss, accum_grad = accum_info
-      minibatch_loss, minibatch_extra_output, minibatch_grad = _compute_grad(
-          minibatch)
-      minibatch_loss_weight = minibatch_extra_output['loss_weight']
-      accum_grad = jax.tree.map(
-          lambda x, y: x + y * minibatch_loss_weight,
-          accum_grad, minibatch_grad)
-      accum_loss += minibatch_loss * minibatch_loss_weight
-      return (accum_loss, accum_grad), minibatch_extra_output
-
-    # Initialize the grad accumulation.
-    zero_grad = jax.tree.map(
-        lambda x: jnp.zeros_like(x, dtype=jnp.float32), state['params'])
-
-    # Run grad accumulation with `scan``.
-    (accum_loss, accum_grad), extra_output = jax.lax.scan(
-        grad_accum_step_fn, init=(
-            jnp.asarray(0.0, dtype=jnp.float32), zero_grad),
-        xs=batch)
-
-    # Calculate the final loss, grad and extra_output.
-    loss_weight = extra_output.pop('loss_weight')
-    total_loss_weight = jnp.sum(loss_weight, axis=0) + 1e-6
-    for k, v in extra_output.items():
-      if k.endswith('_max'):
-        extra_output[k] = jax.tree.map(lambda x: jnp.max(x, axis=0), v)
-      elif k.endswith('_min'):
-        extra_output[k] = jax.tree.map(lambda x: jnp.min(x, axis=0), v)
-      else:
-        extra_output[k] = jax.tree.map(
-            lambda x: jnp.sum(x * loss_weight, axis=0) / total_loss_weight, v)
-    extra_output['loss_weight'] = total_loss_weight
-    loss = accum_loss / total_loss_weight
-    grad = jax.tree.map(lambda x: x / total_loss_weight, accum_grad)
-  else:
-    loss, extra_output, grad = _compute_grad(batch)
-
   # filter grads out to avoid computing grad stats on frozen params.
   grad, _ = pytree.filter_tree(grad, model.config.trainable_params_filter)
-
-  # Log additional info computed by the loss function, for example,
-  # prediction accuracy.
-  log_dict.update(extra_output)
 
   log_dict.update(rms_info_fn(grad, name='grad'))
   if clip_grad_norm > 0:
@@ -3545,8 +3566,110 @@ def train_one_step(
   new_state['steps'] += 1
 
   if not add_log_info:
-    log_dict = extra_output
+    log_dict = {}
 
+  return loss, new_state, log_dict
+
+
+def train_one_step(
+    state,
+    batch,
+    model,
+    opt,
+    teacher_model=None,
+    lr=1e-4,
+    grad_accum_steps=-1,
+    clip_grad_norm=-1,
+    clip_update_norm=-1,
+    clip_update_rms=-1,
+    clip_local_update_rms=-1,
+    weight_decay=-1,
+    custom_loss_fn=None,
+    add_log_info=False,
+    distill_temperature: float = 1.0,
+    distill_alpha: float = 1.0,
+):
+  def _compute_grad(batch):
+    return compute_grads(
+        params=state['params'],
+        batch=batch,
+        model=model,
+        teacher_model=teacher_model,
+        teacher_params=state.get('teacher_params'),
+        custom_loss_fn=custom_loss_fn,
+        distill_temperature=distill_temperature,
+        distill_alpha=distill_alpha,
+    )
+
+  if grad_accum_steps > 1:
+    # Prepare the batch for grad accumulation.
+    batch = jax.tree.map(
+        lambda x: einops.rearrange(
+            x, '(g m) ... -> g m ...', g=grad_accum_steps
+        ),
+        batch,
+    )
+
+    # One step of grad accumulation.
+    def grad_accum_step_fn(accum_info, minibatch):
+      accum_loss, accum_grad = accum_info
+      minibatch_loss, minibatch_extra_output, minibatch_grad = _compute_grad(
+          minibatch
+      )
+      minibatch_loss_weight = minibatch_extra_output['loss_weight']
+      accum_grad = jax.tree.map(
+          lambda x, y: x + y * minibatch_loss_weight, accum_grad, minibatch_grad
+      )
+      accum_loss += minibatch_loss * minibatch_loss_weight
+      return (accum_loss, accum_grad), minibatch_extra_output
+
+    # Initialize the grad accumulation.
+    zero_grad = jax.tree.map(
+        lambda x: jnp.zeros_like(x, dtype=jnp.float32), state['params']
+    )
+
+    # Run grad accumulation with `scan``.
+    (accum_loss, accum_grad), extra_output = jax.lax.scan(
+        grad_accum_step_fn,
+        init=(jnp.asarray(0.0, dtype=jnp.float32), zero_grad),
+        xs=batch,
+    )
+
+    # Calculate the final loss, grad and extra_output.
+    loss_weight = extra_output.pop('loss_weight')
+    total_loss_weight = jnp.sum(loss_weight, axis=0) + 1e-6
+    for k, v in extra_output.items():
+      if k.endswith('_max'):
+        extra_output[k] = jax.tree.map(lambda x: jnp.max(x, axis=0), v)
+      elif k.endswith('_min'):
+        extra_output[k] = jax.tree.map(lambda x: jnp.min(x, axis=0), v)
+      else:
+        extra_output[k] = jax.tree.map(
+            lambda x: jnp.sum(x * loss_weight, axis=0) / total_loss_weight, v
+        )
+    extra_output['loss_weight'] = total_loss_weight
+    loss = accum_loss / total_loss_weight
+    grad = jax.tree.map(lambda x: x / total_loss_weight, accum_grad)
+  else:
+    loss, extra_output, grad = _compute_grad(batch)
+
+  loss, new_state, log_dict = apply_grads(
+      state=state,
+      grad=grad,
+      loss=loss,
+      model=model,
+      opt=opt,
+      lr=lr,
+      clip_grad_norm=clip_grad_norm,
+      clip_update_norm=clip_update_norm,
+      clip_update_rms=clip_update_rms,
+      clip_local_update_rms=clip_local_update_rms,
+      weight_decay=weight_decay,
+      add_log_info=add_log_info,
+  )
+  # What the loss function computed on the side, for example prediction
+  # accuracy, is logged next to the optimizer's own numbers.
+  log_dict.update(extra_output)
   return loss, new_state, log_dict
 
 
@@ -3711,10 +3834,30 @@ def run_experiment(
   train_iter = iter(train_set)
 
   train_iter_state = None
-  if helper.ckpt_mngr and helper.ckpt_mngr.latest_step() is not None:
-    data_state = ckpt_lib.load_data_state_from_dir(
-        helper.ckpt_dir, helper.ckpt_mngr.latest_step()  # pyrefly: ignore[bad-argument-type]
+  data_state = None
+  if (
+      helper.ckpt_mngr
+      and (latest_step := helper.ckpt_mngr.latest_step()) is not None
+  ):  # prioritize restoring from current ongoing interrupted run.
+    logging.info(
+        '[Simply] Restoring train_iter_state from %s/%d.',
+        helper.ckpt_dir,
+        latest_step,
     )
+    data_state = ckpt_lib.load_data_state_from_dir(
+        helper.ckpt_dir, latest_step  # pyrefly: ignore[bad-argument-type]
+    )
+  elif config.init_ckpt_restore_train_iter and config.init_ckpt_dir:
+    logging.info(
+        '[Simply] Restoring train_iter_state from %s/%d.',
+        config.init_ckpt_dir,
+        config.init_ckpt_step,
+    )
+    data_state = ckpt_lib.load_data_state_from_dir(
+        config.init_ckpt_dir, config.init_ckpt_step  # pyrefly: ignore[bad-argument-type]
+    )
+
+  if data_state is not None:
     assert isinstance(data_state, Mapping)
     train_iter_state = data_state.get('train_iter_state', None)
     if train_iter_state is not None:
@@ -3806,6 +3949,7 @@ def run_experiment(
       )
   agg_metrics = {}
   eval_result = {}
+  median_metrics = {}
   profile_session = None
   should_early_stop = False
   train_flops_per_step = None  # captured once from XLA cost_analysis below.
@@ -3829,7 +3973,7 @@ def run_experiment(
       # `<source.name>/<metric>` scalar dict logged verbatim via
       # `helper.write_scalars`. Errors in one dataset emit a single
       # `<name>/failed=1.0` sentinel and the others continue — a
-      # network blip on one data shard should not abort training.
+      # network blip on one SSTable should not abort training.
       # `eval_result` is set to the union of all per-dataset results so
       # downstream consumers (final_result, last-step eval) see them.
       if validation_dataset_fns and (
@@ -3906,10 +4050,10 @@ def run_experiment(
             _ca = _ca[0]
           # cost_analysis reports PER-PARTITION (per-device) FLOPs; multiply by
           # the device count to get the GLOBAL per-step FLOPs. Verified
-          # empirically: global is topology-invariant within a chip family
-          # at small meshes (identical across pf_1x1x1/1x2x1/2x2x1), with some
-          # drift at larger meshes (~10% at pf_2x2x2) and across accelerator
-          # generations; the raw per-partition value alone is NOT comparable.
+          # empirically: the global value is topology-invariant at small meshes
+          # within an accelerator family, with some drift at larger meshes
+          # (~10%) and across accelerator generations; the raw per-partition
+          # value alone is NOT comparable.
           # Also multiply by grad_accum_steps: with grad accumulation the step
           # is a jax.lax.scan whose body cost_analysis counts ONCE, so a raw
           # reading would undercount the true per-optimizer-step FLOPs by the
@@ -3949,35 +4093,55 @@ def run_experiment(
       if helper.should_log_additional_info(steps):
         helper.add_metric('total_step_time_with_additional_info', step_time)
         helper.add_metric(
-            'train_step_time_with_additional_info', train_step_time)
+            'train_step_time_with_additional_info', train_step_time
+        )
       else:
         helper.add_metric('total_step_time', step_time)
-        helper.add_metric('train_step_time', train_step_time)
-      helper.add_metric('avg_total_step_time', step_time)
-      logging.info('%s secs per step, log_additional_info: %s',
-                   step_time, helper.should_log_additional_info(steps))
+      # Steady-state-only aggregate: skips the compile-polluted warmup (a first
+      # step can carry a ~3400 s compile, and `train_one_step_fn` compiles
+      # TWICE -- once for the add_log_info variant, once without) and the final
+      # step. Guarded on the plain-variant steps so the compile-bearing
+      # additional-info steps never enter step time calculations.
+      if (
+          _STEP_TIME_WARMUP < steps < config.num_train_steps
+          and not helper.should_log_additional_info(steps)
+      ):
+        helper.add_metric('avg_total_step_time', step_time)
+        helper.add_metric('median_train_step_time', train_step_time)
+      logging.info(
+          '%s secs per step, log_additional_info: %s',
+          step_time,
+          helper.should_log_additional_info(steps),
+      )
       helper.add_metric('loss', train_loss)
       if 'accuracy' in log_dict:
         helper.add_metric('accuracy', float(log_dict['accuracy']))
-      helper.add_metric(
-          'data_generation_step_time', data_generation_step_time)
+      helper.add_metric('data_generation_step_time', data_generation_step_time)
 
       agg_metrics = helper.get_aggregated_metrics()
-      exp_helper.set_notes(
+      median_metrics = helper.get_aggregated_metrics(method='median')
+      notes = (
           f'{steps=}, {train_loss=},'
-          f' avg_total_step_time={agg_metrics["avg_total_step_time"]:.2f}'
+          f' train_step_time={train_step_time:.4f},'
       )
+      if 'median_train_step_time' in median_metrics:
+        notes += (
+            f' median_train_step_time={median_metrics["median_train_step_time"]:.4f},'
+        )
+      if 'avg_total_step_time' in agg_metrics:
+        notes += (
+            f' avg_total_step_time={agg_metrics["avg_total_step_time"]:.2f}'
+        )
+      exp_helper.set_notes(notes)
       should_early_stop = should_early_stop or (
-          config.early_stop and
-          config.early_stop.should_stop(
-              steps, agg_metrics))
+          config.early_stop and config.early_stop.should_stop(steps, agg_metrics)
+      )
       if helper.should_log_metrics(steps):
         t1 = time.time()
-        metrics_dict = dict(
-            lr=lr,
-            secs_per_step=agg_metrics['avg_total_step_time'],
-            steps_per_sec=1 / agg_metrics['avg_total_step_time'],
-        )
+        metrics_dict = dict(lr=lr)
+        if 'avg_total_step_time' in agg_metrics:
+          metrics_dict['secs_per_step'] = agg_metrics['avg_total_step_time']
+          metrics_dict['steps_per_sec'] = 1 / agg_metrics['avg_total_step_time']
         metrics_dict.update(agg_metrics)
         log_dict = jax.device_get(log_dict)
         flat_log = pytree.to_flat_dict(log_dict, sep='/')
@@ -4000,6 +4164,10 @@ def run_experiment(
   final_result['train_loss'] = float(agg_metrics['loss'])
   if 'accuracy' in agg_metrics:
     final_result['train_accuracy'] = float(agg_metrics['accuracy'])
+  if 'median_train_step_time' in median_metrics:
+    final_result['median_train_step_time'] = float(
+        median_metrics['median_train_step_time']
+    )
   if eval_result:
     # Forward the validation *metrics* to final_result
     # For each known metric we collect every match, where a match
@@ -4090,6 +4258,37 @@ def build_global_batch_from_sharded(
   return jax.tree_util.tree_map(_build_global_array_from_sharded, batch)
 
 
+def get_init_state_fn(config, model):
+  """Returns the program `get_init_state` builds a state from scratch with.
+
+  Exposed so a caller that wants the state's shapes, dtypes and shardings
+  before the state exists can `jax.eval_shape` it.
+
+  Args:
+    config: The experiment config.
+    model: The model to initialize, as `create_model` returns it.
+  """
+
+  def _filtered_opt_init(params):
+    """Handles initialization of optimizer state for trainable params only."""
+    trainable_params, _ = pytree.filter_tree(
+        params, config.trainable_params_filter
+    )
+    state = config.optimizer.init(trainable_params)
+    state['params'] = params
+    return state
+
+  return common.named_jit(
+      js.explicit_axes(
+          lambda: _filtered_opt_init(
+              model.init(jax.random.key(config.model_seed))
+          ),
+          in_sharding=(),
+      ),
+      name='init_state',
+  )
+
+
 def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
   model, extra_output = create_model(config, sharding_config)
   teacher_model = extra_output.get('teacher')
@@ -4103,29 +4302,17 @@ def get_init_state(config, sharding_config, ckpt_mngr, ckpt_dir):
     state['params'] = params
     return state
 
-  init_state_fn = common.named_jit(
-      js.explicit_axes(
-          lambda: _filtered_opt_init(
-              model.init(jax.random.key(config.model_seed))
-          ),
-          in_sharding=(),
-      ),
-      name='init_state',
-  )
+  init_state_fn = get_init_state_fn(config, model)
   if ckpt_mngr and (latest_step := ckpt_mngr.latest_step()) is not None:
     # Continue training from lastest ckpt.
-    # Trace-only (`jax.eval_shape`), not `common.eval_abstract_output`'s full
-    # `.lower().compile()`: compiling the no-arg `init_state_fn` buffer-assigns
-    # the whole unsharded optimizer state, which OOMs for large sharded MoE
-    # models even though the donated train step fits.
-    abstract_state = jax.eval_shape(init_state_fn)
+    abstract_state = common.eval_abstract_output(init_state_fn)
     state = ckpt_lib.load_checkpoint_from_dir(
         ckpt_dir, abstract_state, latest_step
     )
   elif config.init_ckpt_dir:
     if config.init_ckpt_opt_state:
       # Trace-only abstract state (see resume branch) to avoid the compile OOM.
-      abstract_state = jax.eval_shape(init_state_fn)
+      abstract_state = common.eval_abstract_output(init_state_fn)
     else:
       # Only initialize params from a given external ckpt.
       abstract_state = {
@@ -4833,7 +5020,16 @@ class LMInterface:
     logging.info(
         'sampling_params.max_seq_len: %d', sampling_params.max_seq_len
     )
+    # When end == padded_end, no buffer padding was applied.
+    logging.info(
+        'decode buffer: end=%d padded_end=%d (decode_buffer_multiple=%d)',
+        decoding_schedule.end_position,
+        decoding_schedule.padded_end_position,
+        sampling_params.decode_buffer_multiple,
+    )
 
+    # Pass dynamic stop_position when buffer padding is enabled; None otherwise.
+    stop_position = decoding_schedule.dynamic_stop_position
     while position < decoding_schedule.end_position:
       sampling_state = self.pad_state_to_fn(
           sampling_state, length=decoding_schedule.get_next_length(position)
@@ -4848,6 +5044,7 @@ class LMInterface:
           scoring_temperature=scoring_params.temperature,
           scoring_top_k=scoring_params.top_k,
           scoring_top_p=scoring_params.top_p,
+          stop_position=stop_position,
       )
       position = jax.device_get(sampling_state.position)
       if jax.device_get(sampling_state.all_has_ended):
@@ -5063,12 +5260,43 @@ def pad_to_along_axis(
   return pad_along_axis(x, (0, pad_widths), axis=axis, **kwargs)
 
 
+@functools.singledispatch
+def pad_block_decode_state(state: Any, length_to_pad: int) -> Any:
+  """Grows one block's non-mapping decode state to hold `length_to_pad` tokens.
+
+  Extension point for models whose per-block decode state is a registered
+  dataclass rather than the `{'k': ..., 'v': ...}` mapping `TransformerLM`
+  uses (e.g. Kimi K3's latent / recurrent states). Register with
+  `@pad_block_decode_state.register`.
+
+  The contract for an implementation: return the same type, holding at least
+  `length_to_pad` tokens per sequence and the same content for the tokens it
+  already held; never shrink; return `state` unchanged if the state is
+  constant in the sequence length (a recurrent state, say). It runs under
+  `jit`, so it must be traceable.
+
+  Args:
+    state: The block's decode state.
+    length_to_pad: Number of tokens the state must hold after this call.
+
+  Returns:
+    The grown state.
+  """
+  raise TypeError(
+      f'No pad_block_decode_state implementation for {type(state)}; register'
+      ' one, or use a mapping decode state.'
+  )
+
+
 def pad_decode_state_to(d: PyTree, length_to_pad: int) -> PyTree:
   """Pads the given decode state to the given length."""
   assert pytree.tree_is_mapping(d)
   d = cast(MutableMapping[str, Any], d)
   for k, v in d.items():
     if k.startswith('block_'):
+      if not pytree.tree_is_mapping(v):
+        d[k] = pad_block_decode_state(v, length_to_pad)
+        continue
       window_sizes = []
       for k2 in v.keys():
         if k2.startswith('window_size='):
@@ -5101,7 +5329,28 @@ def continue_decode(
     scoring_temperature: float = 1.0,
     scoring_top_k: int = -1,
     scoring_top_p: float = 1.0,
+    stop_position: Array | int | None = None,
 ) -> SamplingState:
+  """Decodes until `stop_position`, the end of the buffers, or all-ended.
+
+  Args:
+    apply_fn: the model's apply function.
+    params: the model params.
+    init_sampling_state: the state to continue decoding from.
+    extra_inputs: extra model inputs.
+    temperature: sampling temperature.
+    top_k: sampling top-k.
+    top_p: sampling top-p.
+    scoring_temperature: scoring temperature.
+    scoring_top_k: scoring top-k.
+    scoring_top_p: scoring top-p.
+    stop_position: Last position to decode at (exclusive), or `None` to decode
+      until `decode_state_length`. Traced so changing the stopping position
+      does not trigger JIT recompilation when buffer shapes are identical.
+
+  Returns:
+    The sampling state after decoding.
+  """
 
   def body_fn(sampling_state: SamplingState) -> SamplingState:
     # logits: [batch_size, 1, vocab_size]
@@ -5179,9 +5428,10 @@ def continue_decode(
     )
 
   def cond_fn(sampling_state: SamplingState) -> jax.typing.ArrayLike:
-    return (
-        sampling_state.position < sampling_state.decode_state_length
-    ) & ~sampling_state.all_has_ended  # pyrefly: ignore[unsupported-operation]
+    not_at_end = sampling_state.position < sampling_state.decode_state_length
+    if stop_position is not None:
+      not_at_end &= sampling_state.position < stop_position
+    return not_at_end & ~sampling_state.all_has_ended  # pyrefly: ignore[unsupported-operation]
 
   final_sampling_state = jax.lax.while_loop(
       cond_fn, body_fn, init_sampling_state

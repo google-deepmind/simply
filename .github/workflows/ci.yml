@@ -18,15 +18,24 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev,tfds,math-eval,agent,serving]"
+        run: pip install -e ".[dev,tfds,math-eval,agent,serving,zoo]"
 
       - name: Generate serving protos
         run: python setup/gen_protos.py
 
       - name: Run tests
-        run: pytest simply/ -v --tb=short
+        run: pytest simply/ -v --tb=short --ignore-glob='*multi_device_test.py'
 
-      # Needs its own process: it forces 4 CPU devices via XLA_FLAGS, which
-      # must be set before JAX initializes its backend.
+      # One process each: every such test forces its own CPU device count
+      # before JAX initializes its backend, which only works in a fresh process.
       - name: Run multi-device tests
-        run: pytest simply/model_lib_multi_device_test.py -v --tb=short
+        run: |
+          for t in $(find simply -name '*multi_device_test.py' | sort); do
+            pytest "$t" -v --tb=short
+          done
+
+      # Synthetic data, no tokenizer or dataset download.
+      - name: End-to-end training smoke test
+        run: |
+          python -m simply.main --experiment_config lm_smoke_test \
+              --experiment_dir /tmp/exp_smoke --alsologtostderr

@@ -18,6 +18,7 @@ import dataclasses
 import math
 import typing
 from typing import Any
+from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -3256,6 +3257,135 @@ class EvictionTest(absltest.TestCase):
         [a for a in kept if _owner(a) is batch],
         'the cache is holding a view into the buffer it was handed',
     )
+
+
+class MemoryBudgetTest(parameterized.TestCase):
+  """The budget the cache sizes itself against.
+
+  Every layer here exists because some deployment has only that one: a
+  container-enforced limit, cgroup v2, cgroup v1, or nothing but the machine.
+  The one thing none of them may do is report MORE than the process has --
+  a budget above the real ceiling means the process dies before eviction can
+  ever fire, which is the failure this whole path guards against.
+  """
+
+  def test_container_limit_is_scaled_down(self):
+    limit = 400 * 1024**3
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=limit
+    ):
+      self.assertEqual(prefix_cache_lib.default_max_bytes(), int(limit * 0.2))
+
+  def test_first_readable_limit_wins(self):
+    # Most specific first: the container's own limit outranks the cgroup files.
+    reads = {
+        '/proc/container/memory/limit': 100 * 1024**3,
+        '/sys/fs/cgroup/memory.max': 900 * 1024**3,
+    }
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', side_effect=reads.get
+    ):
+      self.assertEqual(prefix_cache_lib.memory_budget_bytes(), 100 * 1024**3)
+
+  @parameterized.named_parameters(
+      ('unbounded_sentinel', 2**63 - 1),
+      ('at_threshold', 2**62),
+      ('unparseable', None),
+  )
+  def test_an_unbounded_limit_falls_through_to_the_next_source(self, first):
+    # "max" does not parse and the sentinel is not a real ceiling; either way
+    # the answer must come from the next source down, not from that file.
+    reads = {
+        '/proc/container/memory/limit': first,
+        '/sys/fs/cgroup/memory.max': 64 * 1024**3,
+    }
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', side_effect=reads.get
+    ):
+      self.assertEqual(prefix_cache_lib.memory_budget_bytes(), 64 * 1024**3)
+
+  def test_machine_memory_is_the_last_source(self):
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=None
+    ), mock.patch.object(
+        prefix_cache_lib, '_read_mem_total_bytes', return_value=32 * 1024**3
+    ):
+      self.assertEqual(prefix_cache_lib.memory_budget_bytes(), 32 * 1024**3)
+      self.assertEqual(
+          prefix_cache_lib.default_max_bytes(), int(32 * 1024**3 * 0.2)
+      )
+
+  def test_nothing_readable_falls_back_to_a_conservative_constant(self):
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=None
+    ), mock.patch.object(
+        prefix_cache_lib, '_read_mem_total_bytes', return_value=None
+    ):
+      self.assertIsNone(prefix_cache_lib.memory_budget_bytes())
+      self.assertEqual(prefix_cache_lib.default_max_bytes(), 16 * 1024**3)
+
+  @parameterized.named_parameters(
+      ('tiny', 2 * 1024**3),
+      ('small', 8 * 1024**3),
+      ('large', 1024 * 1024**3),
+  )
+  def test_the_budget_never_exceeds_the_detected_ceiling(self, ceiling):
+    # THE regression guard: no floor is ever applied, so a small container
+    # gets a small budget rather than one it cannot physically hold.
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=ceiling
+    ):
+      budget = prefix_cache_lib.default_max_bytes()
+    self.assertGreater(budget, 0)
+    self.assertLess(budget, ceiling)
+
+  def test_read_int_file_rejects_what_it_cannot_use(self):
+    self.assertIsNone(prefix_cache_lib._read_int_file('/no/such/file'))  # pylint: disable=protected-access
+    path = self.create_tempfile(content='max\n').full_path
+    self.assertIsNone(prefix_cache_lib._read_int_file(path))  # pylint: disable=protected-access
+    path = self.create_tempfile(content='0\n').full_path
+    self.assertIsNone(prefix_cache_lib._read_int_file(path))  # pylint: disable=protected-access
+    path = self.create_tempfile(content=' 12345 \n').full_path
+    self.assertEqual(prefix_cache_lib._read_int_file(path), 12345)  # pylint: disable=protected-access
+
+  def test_machine_memory_is_unknown_when_meminfo_is_unreadable(self):
+    # A platform without /proc/meminfo must degrade to "unknown", not raise:
+    # the caller reads None as "fall back to the conservative constant".
+    with mock.patch('builtins.open', side_effect=OSError):
+      self.assertIsNone(prefix_cache_lib._read_mem_total_bytes())  # pylint: disable=protected-access
+
+  def test_machine_memory_is_unknown_when_meminfo_omits_mem_total(self):
+    # Readable but without the one line we need is still "unknown".
+    with mock.patch(
+        'builtins.open', mock.mock_open(read_data='SwapTotal:  0 kB\n')
+    ):
+      self.assertIsNone(prefix_cache_lib._read_mem_total_bytes())  # pylint: disable=protected-access
+
+
+class DefaultMaxBytesFieldTest(absltest.TestCase):
+  """What a cache built without an explicit budget actually gets."""
+
+  def test_a_cache_gets_a_budget_it_did_not_ask_for(self):
+    cache = prefix_cache_lib.PrefixCache(chunk_size=CHUNK_SIZE)
+    self.assertIsNotNone(cache.max_bytes)
+    assert cache.max_bytes is not None
+    self.assertGreater(cache.max_bytes, 0)
+
+  def test_the_default_is_derived_not_constant(self):
+    # `default_factory` captures the FUNCTION OBJECT when the class is
+    # created, so patching `default_max_bytes` on the module would not reach
+    # the field. The probe underneath it is looked up per call, and is
+    # therefore the seam that actually moves the default.
+    with mock.patch.object(
+        prefix_cache_lib, '_read_int_file', return_value=35 * 1024**3
+    ):
+      cache = prefix_cache_lib.PrefixCache(chunk_size=CHUNK_SIZE)
+    self.assertEqual(cache.max_bytes, 7 * 1024**3)
+
+  def test_an_explicit_none_still_disables_eviction(self):
+    cache = prefix_cache_lib.PrefixCache(chunk_size=CHUNK_SIZE, max_bytes=None)
+    self.assertIsNone(cache.max_bytes)
+    self.assertEqual(cache.evict(), 0)
 
 
 if __name__ == '__main__':

@@ -12,11 +12,10 @@ original data:
   * the two per-instance run-script files, verbatim, under their ORIGINAL
     names: `run_script.sh` and `parser.py` (nested under `run_scripts`).
 
-No derived / internal-env fields are written (no sandbox image id, no wrapped
+No derived / internal-env fields are written (no xbox_image_id, no wrapped
 prompt, no test_cmd, ...). Those are derived on the fly by
 `simply.data_lib.SweBenchProSource` at load time. Consolidating into one JSON
-avoids the ~1.5k per-file remote reads that make direct-from-source loading
-slow.
+avoids the ~1.5k per-file reads that make direct-from-source loading slow.
 
 Run:
   python -m simply.tools.serialize_swe_bench_pro \
@@ -52,7 +51,7 @@ _RUN_SCRIPT_FILES = ('run_script.sh', 'parser.py')
 
 
 def _read_text(path: str | epath.PathLike) -> str:
-  """Reads a remote/local text file; returns '' (logged) on failure."""
+  """Reads a CNS/local text file; returns '' (logged) on failure."""
   try:
     return epath.Path(path).read_text(encoding='utf-8')
   except Exception as e:  # pylint: disable=broad-except
@@ -81,7 +80,7 @@ def main(argv):
   run_scripts_dir = src_dir / 'SWE-bench_Pro-os/run_scripts'
 
   # Read the parquet (fast) into a list of row dicts. pyarrow can't open a
-  # remote path directly, so read bytes via epath and wrap in a BufferReader.
+  # /cns path directly, so read bytes via epath and wrap in a BufferReader.
   with parquet_path.open('rb') as f:
     table = pq.read_table(pa.BufferReader(f.read()))
   rows = table.to_pylist()
@@ -96,7 +95,7 @@ def main(argv):
   instance_ids = [p['instance_id'] for p in rows]
 
   # Read all per-instance run scripts in parallel (the slow part when done
-  # one-by-one at load time: ~1.5k remote reads).
+  # one-by-one at load time: ~1.5k CNS reads).
   logging.info(
       'reading run scripts for %d instances with %d workers...',
       len(instance_ids),

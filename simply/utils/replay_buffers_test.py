@@ -64,7 +64,7 @@ class ReplayBuffersTest(absltest.TestCase):
 
       def _test_sample(replace: bool, atol: float) -> None:
         buffer = replay_buffers.ReplayBuffer(capacity)
-        buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type]
+        buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type, bad-assignment]
 
         num_samples = 20000
         batch_size = 4
@@ -83,7 +83,7 @@ class ReplayBuffersTest(absltest.TestCase):
 
     with self.subTest("Iterator"):
       buffer = replay_buffers.ReplayBuffer(capacity)
-      buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type]
+      buffer.extend({"x": np.expand_dims(np.arange(capacity), -1)})  # pyrefly: ignore[bad-argument-type, bad-assignment]
 
       # batch_size = 1
       for i, batch in enumerate(buffer):
@@ -177,7 +177,7 @@ class ReplayBuffersTest(absltest.TestCase):
             capacity, alpha=1.0, beta=1.0
         )
         buffer.extend(
-            {"x": np.expand_dims(np.arange(capacity), axis=-1)},  # pyrefly: ignore[bad-argument-type]
+            {"x": np.expand_dims(np.arange(capacity), axis=-1)},  # pyrefly: ignore[bad-argument-type, bad-assignment]
             priorities=priorities[:capacity],
         )
 
@@ -211,7 +211,7 @@ class ReplayBuffersTest(absltest.TestCase):
       buffer = replay_buffers.PrioritizedReplayBuffer(
           capacity, alpha=1.0, beta=1.0
       )
-      buffer.extend({"x": np.arange(capacity)})  # pyrefly: ignore[bad-argument-type]
+      buffer.extend({"x": np.arange(capacity)})  # pyrefly: ignore[bad-argument-type, bad-assignment]
       self.assertEqual(buffer.max_priority, 1.0)
 
       buffer.update_priorities(np.arange(capacity), priorities[:capacity])

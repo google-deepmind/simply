@@ -14,6 +14,7 @@
 
 #### Local test for debug
 ```shell
+pip install ".[tfds]" && python setup/setup_assets.py --vocabs-only  # one-off: Qwen3 tokenizer + TFDS
 EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 Or if you want to debug by printing arrays like normal python code, you can disable `jit` and `use_scan` using the command below.
@@ -22,11 +23,27 @@ Or if you want to debug by printing arrays like normal python code, you can disa
 export JAX_DISABLE_JIT=True; EXP=simply_local_test_1; rm -rf /tmp/${EXP}; python -m simply.main --experiment_config lm_no_scan_test --experiment_dir /tmp/${EXP} --alsologtostderr
 ```
 
+`lm_smoke_test` trains the same tiny model on synthetic data, so it needs neither the tokenizer nor a dataset download:
+
+```shell
+python -m simply.main --experiment_config lm_smoke_test --experiment_dir /tmp/smoke --alsologtostderr
+```
+
 #### Running on Google Cloud TPUs
 See the [GCloud Quickstart](gcloud_quickstart.md) to run your first experiment on a Cloud TPU, or the [full GCloud guide](docs/gcloud.md) for multi-host training, preemption handling, and monitoring.
 
 #### Running on GKE with XPK
 Google Kubernetes Engine (GKE) is supported. See [GKE quick start](gcloud_quickstart.md#optional-running-on-gke-with-xpk) to run your first experiment on GKE, and [GKE section in the full GCloud guide](docs/gcloud.md#running-on-gke-with-xpk) for details.
+
+#### Evaluation and serving
+See the [eval and serving guide](docs/eval_and_serving.md) for decode-based evaluation (`simply/eval/`) and the gRPC serving stack (`simply/serving/`).
+
+#### Model zoo
+[`simply/zoo/`](simply/zoo/) holds self-contained model plugins that register themselves on import, each with its own README: [GLM-5](simply/zoo/glm5/README.md), [Kimi K3](simply/zoo/kimi_k3/README.md) and [Qwen3.8](simply/zoo/qwen3p8/README.md). They need the `zoo` extra (`pip install ".[zoo]"`), and run through the same entry points, e.g.
+
+```shell
+python -m simply.zoo.glm5.main --experiment_config glm5p2 --experiment_dir /tmp/glm5 --alsologtostderr
+```
 
 #### Automated AI research with agents
 
@@ -90,7 +107,8 @@ pip install .
 # With optional dependencies:
 pip install ".[tfds]"       # for TensorFlow Datasets
 pip install ".[math-eval]"  # for simply/utils/math_eval.py
-pip install ".[dev]"        # for testing (pytest)
+pip install ".[zoo]"        # for the simply/zoo/ model plugins
+pip install ".[dev,agent]"  # for testing (pytest; the agent tests need litellm)
 ```
 
 ### Serving protos
@@ -110,17 +128,18 @@ Download datasets and model checkpoints in format supported by Simply from Huggi
 
 ```bash
 # Install huggingface_hub
-pip install huggingface_hub
+pip install ".[assets]"
 
-# Download both models and datasets
+# Download both models and datasets (~10 GB)
 python setup/setup_assets.py
 
-# Or download only models/datasets
+# Or download only models/datasets/vocabs (the tokenizers are ~100 MB)
 python setup/setup_assets.py --models-only
 python setup/setup_assets.py --datasets-only
+python setup/setup_assets.py --vocabs-only
 ```
 
-This will download models to `~/.cache/simply/models/` and datasets to `~/.cache/simply/datasets/`. You can customize locations with `--models-dir` and `--datasets-dir` flags, or set environment variables `SIMPLY_MODELS` and `SIMPLY_DATASETS`. (Currently we only included a few datasets and models for testing, and will add more soon.)
+This will download models to `~/.cache/simply/models/`, datasets to `~/.cache/simply/datasets/` and tokenizers to `~/.cache/simply/vocabs/`. You can customize locations with `--models-dir`, `--datasets-dir` and `--vocabs-dir` flags, or set environment variables `SIMPLY_MODELS`, `SIMPLY_DATASETS` and `SIMPLY_VOCABS`. (Currently we only included a few datasets and models for testing, and will add more soon.)
 
 ### Quick setup with uv
 

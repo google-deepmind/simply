@@ -4,12 +4,13 @@ FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Install JAX with TPU support
-RUN uv pip install --system --no-cache \
-    "jax[tpu]>=0.8.2" \
-    "jaxlib>=0.8.1" \
-    "libtpu>=0.0.30"
+RUN uv pip install --system --no-cache "jax[tpu]>=0.10"
 
-# Simply dependencies (from pyproject.toml)
+# Simply dependencies, spelled out because the source tree (and therefore
+# `pip install '.[extra]'`) only arrives at launch time via XPK's
+# --script-dir; keep in sync with the base deps and the tfds / gcloud /
+# assets / math-eval / serving / zoo extras in pyproject.toml. Own layer so
+# that rebuilds after a source change stay fast.
 RUN uv pip install --system --no-cache \
     "absl-py>=2.3.1" \
     datasets \
@@ -27,7 +28,16 @@ RUN uv pip install --system --no-cache \
     etils \
     huggingface_hub \
     importlib_resources \
+    tiktoken \
+    jinja2 \
     tensorflow-cpu \
-    tensorflow-datasets
+    "tensorflow-datasets>=4.9.9" \
+    sympy \
+    pylatexenc \
+    grpcio \
+    grpcio-health-checking \
+    grpcio-reflection \
+    grpcio-tools \
+    "protobuf>=6.33"
 
 WORKDIR /app

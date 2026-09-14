@@ -35,18 +35,11 @@ separately by the splash library).
 import functools
 import math
 import os
-import sys
 import unittest
 
-# Must be set BEFORE `import jax`: JAX initializes its backend on first use and
-# the device count cannot be changed afterwards. If jax is already imported
-# (e.g. a whole-directory `pytest simply/` run imported another test module
-# first) setting it would reshape every other test's default mesh instead, so
-# leave it alone and let the tests below skip.
-if 'jax' not in sys.modules:
-  os.environ.setdefault(
-      'XLA_FLAGS', '--xla_force_host_platform_device_count=4'
-  )
+# Must be set BEFORE `import jax`. JAX initializes its backend on first use
+# and the device count cannot be changed afterwards.
+os.environ.setdefault('XLA_FLAGS', '--xla_force_host_platform_device_count=4')
 
 # pylint: disable=g-import-not-at-top
 # Imports below jax-affecting env vars are intentional; do not reorder.

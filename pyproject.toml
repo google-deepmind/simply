@@ -1,6 +1,6 @@
 [project]
 name = "simply"
-version = "0.3.9"
+version = "0.4.0"
 description = "Simply: Minimal Code for Frontier LLM Research in JAX"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,9 +32,15 @@ tfds = [
     "tensorflow-cpu; sys_platform != 'darwin'",
     "tensorflow; sys_platform == 'darwin'",
     "tensorflow-datasets>=4.9.9",
+    # TFDS imports it lazily the first time it prepares a dataset.
+    "importlib_resources",
 ]
 gcloud = [
     "gcsfs",
+]
+assets = [
+    # setup/setup_assets.py downloads models, datasets and vocabs.
+    "huggingface_hub",
 ]
 math-eval = [
     "sympy",
@@ -54,9 +60,28 @@ agent = [
     "rich",
     "jinja2",
 ]
+zoo = [
+    # simply/zoo/kimi_k3 tokenizes with the vendored tiktoken model.
+    "tiktoken",
+    # simply/zoo/qwen3p8 renders the released chat template.
+    "jinja2",
+]
 dev = [
     "pytest",
+    # `simply/tools/hf_to_orbax.py` parses safetensors itself; its test writes
+    # the fixtures with the reference implementation.
+    "safetensors",
 ]
+
+[tool.pytest.ini_options]
+# `simply/zoo/` has same-named test modules (e.g. several `mla_test.py`) in
+# directories without `__init__.py`; importlib mode keeps them apart.
+addopts = "--import-mode=importlib"
 
 [tool.setuptools.packages.find]
 include = ["simply", "simply.*"]
+
+[tool.setuptools.package-data]
+# Protos (the source for the generated gRPC stubs), golden fixtures, and the
+# tokenizers the zoo vendors together with their upstream licences.
+"*" = ["*.proto", "*.json", "*.jinja", "*.npz", "*.model", "*_LICENSE"]

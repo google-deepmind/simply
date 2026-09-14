@@ -55,19 +55,50 @@ class DecodingSchedule:
     begin_position: The minimum position to decode (inclusive).
     end_position: The maximum position to decode (exclusive).
     chunk_size: The number of tokens to decode in each chunk.
+    buffer_end_position: Padded buffer length for decode state and token
+      buffers; `None` defaults to `end_position`. Decoding still stops at
+      `end_position`. See `SamplingParams.decode_buffer_multiple`.
   """
 
   prefill_size: int
   begin_position: int
   end_position: int
   chunk_size: int
+  buffer_end_position: int | None = None
+
+  def __post_init__(self):
+    if (
+        self.buffer_end_position is not None
+        and self.buffer_end_position < self.end_position
+    ):
+      raise ValueError(
+          f'buffer_end_position={self.buffer_end_position} must be at least'
+          f' end_position={self.end_position}.'
+      )
+
+  @property
+  def padded_end_position(self) -> int:
+    """The bound the decode buffers are grown to (>= `end_position`)."""
+    if self.buffer_end_position is None:
+      return self.end_position
+    return self.buffer_end_position
+
+  @property
+  def dynamic_stop_position(self) -> int | None:
+    """Returns `end_position` if buffer padding is enabled, else `None`.
+
+    Always returns `end_position` when buffer padding is active so batches
+    that land on grid boundaries still share the same compiled program.
+    """
+    return None if self.buffer_end_position is None else self.end_position
 
   def get_next_length(self, cur_position: int) -> int:
+    """Returns the buffer length to decode up to, starting at `cur_position`."""
     if cur_position < self.begin_position:
       return self.begin_position
     step_multiple = ((cur_position - self.prefill_size) // self.chunk_size) + 1
     pos = self.prefill_size + self.chunk_size * step_multiple
-    return min(pos, self.end_position)
+    return min(pos, self.padded_end_position)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,6 +130,19 @@ class SamplingParams:
   intermediate_decode_steps: int | None = None  # Recommended to set.
   sort_by: str | None = None
 
+  # Rounds the decode buffer size up to a multiple of this value so batches
+  # with different prompt lengths can share compiled decode programs.
+  # The actual decode budget (`end_position`) is unchanged and remains the
+  # dynamic stopping condition.
+  #
+  # Note: Has no effect if prefill_size >= max_input_len + max_decode_steps - 1,
+  # as initial buffers will already cover the full sequence length.
+  #
+  # Changing buffer padding may introduce slight numerical differences in
+  # attention reductions on some hardware backends. Set to 0 or 1 to disable
+  # (exact-sized buffers). A value like 128 is recommended for TPU.
+  decode_buffer_multiple: int = 0
+
   def get_decoding_schedule(
       self, min_input_length: int, max_input_length: int
   ) -> DecodingSchedule:
@@ -126,11 +170,19 @@ class SamplingParams:
     chunk_size = self.intermediate_decode_steps
     if chunk_size is None or chunk_size <= 0:
       chunk_size = self.max_decode_steps
+    buffer_end_position = None
+    if self.decode_buffer_multiple > 1:
+      multiple = self.decode_buffer_multiple
+      buffer_end_position = min(
+          self.max_seq_len - 1,
+          -(-end_position_exclusive // multiple) * multiple,
+      )
     return DecodingSchedule(
         prefill_size=prefill_size,
         begin_position=begin_position,
         end_position=end_position_exclusive,
         chunk_size=chunk_size,
+        buffer_end_position=buffer_end_position,
     )
 
 

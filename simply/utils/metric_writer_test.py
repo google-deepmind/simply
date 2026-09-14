@@ -53,6 +53,20 @@ class MetricWriterTest(absltest.TestCase):
 
     self.assertIsInstance(writer, metric_writer.BaseMetricWriter)
 
+  def test_write_to_datatable_is_passed_through_and_defaults_to_none(self):
+    if not metric_writer._HAS_CLU:  # pylint: disable=protected-access
+      self.skipTest('no CLU backend in this environment')
+    with mock.patch.object(
+        metric_writer.metric_writers, 'create_default_writer'
+    ) as mock_create:
+      metric_writer.create_metric_writer('/tmp/logdir')
+      # None is CLU's own default, so existing callers are unaffected.
+      self.assertIsNone(mock_create.call_args.kwargs['write_to_datatable'])
+
+      metric_writer.create_metric_writer('/tmp/logdir',
+                                         write_to_datatable=False)
+      self.assertFalse(mock_create.call_args.kwargs['write_to_datatable'])
+
 
 if __name__ == '__main__':
   absltest.main()

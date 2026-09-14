@@ -455,6 +455,7 @@ class BaseExperimentConfig(ExperimentConfig):
   init_ckpt_opt_state: bool = False
   init_ckpt_format: str = ''
   reset_steps: bool = False
+  init_ckpt_restore_train_iter: bool = False
 
   # (registered name of) filter function for trainable params.
   # Maps a param path (block_0/ffn_0/kernel, block_1/attn_0/query, ...)
@@ -501,9 +502,10 @@ class BaseExperimentConfig(ExperimentConfig):
   dcn_mesh_shape: Mapping[str, int] | None = None
   sharding_config: SimplyConfig = gspmd_sharding()
 
-  # Programmatic profiler capture configs.
+  # Programmatic xprof capture configs.
   profile_steps: tuple[int, int] | None = (2, 6)  # end not inclusive
   profile_path: str = ''
+  profile_type: Literal['jax'] = 'jax'
 
 
 @ExperimentConfigRegistry.register
@@ -1169,6 +1171,42 @@ def gemma2_2b_gsm8k_cot_0shot_rl():
 
 
 @ExperimentConfigRegistry.register
+def gemma2_2b_gsm8k_0shot_colocate_async_rl():
+  """Colocate Async RL version of gemma2_2b_gsm8k_0shot_rl."""
+  config = gemma2_2b_gsm8k_0shot_rl()
+  micro_train_batch_size = 16
+  train_batch_size = 1024
+  return dataclasses.replace(
+      config,
+      train_loop_name='colocate_async_rl',
+      batch_mode=data_lib.BATCH_NONE,
+      batch_size=512,
+      page_size=128,
+      train_max_seq_len=2048,
+      use_flash_attention=True,
+      tb_log_interval=1,
+      num_samples_per_example=16,
+      sampling_temperature=1.0,
+      num_train_steps_per_batch=1,
+      kl_coeff=0.0,
+      ppo_clip_eps_low=0.2,
+      lr=opt_lib.LinearWarmupConstant(value=1e-6, warmup_steps=1),
+      train_batch_size=train_batch_size,
+      grad_accum_steps=train_batch_size // micro_train_batch_size,
+      filter_truncated=False,
+      validation_eval_interval=50,
+      validation_num_eval_steps=-1,
+      validation_eval_batch_size=-1,
+      num_train_steps=1000,
+      sampling_intermediate_decode_steps=128,
+      ckpt_interval=50,
+      ckpt_max_to_keep=3,
+      sharding_config=gspmd_sharding(),
+      decoding_sharding_config=gspmd_sharding().to_decoding_sharding(),
+  )
+
+
+@ExperimentConfigRegistry.register
 def gemma2_2b_dsr40k_0shot_rl():
   config = gemma2_2b_gsm8k_0shot_rl()
   return dataclasses.replace(
@@ -1176,6 +1214,26 @@ def gemma2_2b_dsr40k_0shot_rl():
       dataset=data_lib.DatasetConfig(
           source='simply:dsr40k_train', packing=data_lib.PACKING_NONE,
           lm_format_name=None),
+  )
+
+
+@ExperimentConfigRegistry.register
+def gemma2_2b_dsr40k_0shot_colocate_async_rl():
+  config = gemma2_2b_gsm8k_0shot_colocate_async_rl()
+  micro_train_batch_size = 4
+  train_batch_size = 1024
+  return dataclasses.replace(
+      config,
+      remat_policy='dots_with_no_batch_dims_saveable',
+      dataset=data_lib.DatasetConfig(
+          source='simply:dsr40k_train',
+          packing=data_lib.PACKING_NONE,
+          lm_format_name=None,
+      ),
+      train_max_seq_len=4 * 1024,
+      batch_size=128,
+      train_batch_size=train_batch_size,
+      grad_accum_steps=train_batch_size // micro_train_batch_size,
   )
 
 
@@ -2102,6 +2160,24 @@ def lm_test():
       ckpt_interval=10,
       ckpt_max_to_keep=3,
       tb_log_interval=2,
+  )
+
+
+@ExperimentConfigRegistry.register
+def lm_smoke_test():
+  """`lm_test` on synthetic data: no dataset download, no tokenizer files."""
+  config = lm_test()
+  return dataclasses.replace(
+      config,
+      dataset=dataclasses.replace(
+          config.dataset,
+          source=data_lib.MockTFDSSource(name='mock', length=256),
+          data_key='context',
+      ),
+      vocab_name='byte256',
+      vocab_size=259,
+      num_train_steps=3,
+      should_save_ckpt=False,
   )
 
 

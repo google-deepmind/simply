@@ -190,7 +190,8 @@ class ExperimentHelper:
     metric_logdir = epath.Path(self.metric_logdir)
     metric_logdir.mkdir(parents=True, exist_ok=True)
     return metric_writer_lib.create_metric_writer(
-        logdir=str(metric_logdir), just_logging=not self.should_save_data
+        logdir=str(metric_logdir),
+        just_logging=not self.should_save_data,
     )
 
   @functools.cached_property
@@ -250,8 +251,8 @@ class ExperimentHelper:
   def add_metric(self, metric_name: str, metric_value: np.typing.ArrayLike):
     self.metrics_aggregator.add(metric_name, metric_value)
 
-  def get_aggregated_metrics(self):
-    return self.metrics_aggregator.get_aggregated_metrics()
+  def get_aggregated_metrics(self, method: str = 'mean'):
+    return self.metrics_aggregator.get_aggregated_metrics(method=method)
 
   def should_log_metrics(self, step):
     return step % self.metric_log_interval == 0 or step == (
@@ -398,10 +399,21 @@ class MetricsAggregator(object):
   def reset(self) -> None:
     self.metrics = collections.defaultdict(collections.deque)
 
-  def get_aggregated_metrics(self) -> Mapping[str, np.ndarray]:
+  def get_aggregated_metrics(
+      self, method: str = 'mean'
+  ) -> Mapping[str, np.ndarray]:
+    """Returns aggregated metrics dictionary using specified method."""
+    if method == 'mean':
+      reduce_fn = np.mean
+    elif method == 'median':
+      reduce_fn = np.median
+    else:
+      raise ValueError(
+          f'Unsupported aggregation {method=}, expected "mean" or "median".'
+      )
     agg_metrics = {}
     for k, vlist in self.metrics.items():
-      agg_metrics[k] = np.mean(vlist)  # pyrefly: ignore[no-matching-overload]
+      agg_metrics[k] = reduce_fn(vlist)  # pyrefly: ignore[no-matching-overload]
     return agg_metrics
 
 

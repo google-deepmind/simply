@@ -1,0 +1,140 @@
+{
+ "config_kwargs": {
+  "attention_bias": false,
+  "attn_output_gate": true,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "full_attention_interval": 4,
+  "head_dim": 64,
+  "hidden_act": "silu",
+  "hidden_size": 128,
+  "intermediate_size": 64,
+  "layer_types": [
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "linear_conv_kernel_dim": 4,
+  "linear_key_head_dim": 32,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 6,
+  "linear_value_head_dim": 32,
+  "mamba_ssm_dtype": "float32",
+  "max_position_embeddings": 1024,
+  "model_type": "qwen3_5_text",
+  "mtp_num_hidden_layers": 0,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 8,
+  "num_key_value_heads": 2,
+  "output_gate_type": "swish",
+  "pad_token_id": 0,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+   "mrope_interleaved": true,
+   "mrope_section": [
+    3,
+    3,
+    2
+   ],
+   "partial_rotary_factor": 0.25,
+   "rope_theta": 10000000,
+   "rope_type": "default"
+  },
+  "tie_word_embeddings": false,
+  "use_cache": true,
+  "vocab_size": 256
+ },
+ "hf_config": {
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attn_output_gate": true,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "full_attention_interval": 4,
+  "head_dim": 64,
+  "hidden_act": "silu",
+  "hidden_size": 128,
+  "initializer_range": 0.02,
+  "intermediate_size": 64,
+  "layer_types": [
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "linear_conv_kernel_dim": 4,
+  "linear_key_head_dim": 32,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 6,
+  "linear_value_head_dim": 32,
+  "mamba_ssm_dtype": "float32",
+  "max_position_embeddings": 1024,
+  "model_type": "qwen3_5_text",
+  "mtp_num_hidden_layers": 0,
+  "num_attention_heads": 4,
+  "num_hidden_layers": 8,
+  "num_key_value_heads": 2,
+  "output_gate_type": "swish",
+  "pad_token_id": 0,
+  "partial_rotary_factor": 0.25,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+   "mrope_interleaved": true,
+   "mrope_section": [
+    3,
+    3,
+    2
+   ],
+   "partial_rotary_factor": 0.25,
+   "rope_theta": 10000000,
+   "rope_type": "default"
+  },
+  "tie_word_embeddings": false,
+  "transformers_version": "5.16.1",
+  "use_cache": true,
+  "vocab_size": 256
+ },
+ "meta": {
+  "attn_implementation": "eager",
+  "batch_size": 2,
+  "decode_steps": 2,
+  "dtype": "float32",
+  "full_attention_layers_0indexed": [
+   3,
+   7
+  ],
+  "generated_by": "simply/zoo/qwen3p8/testdata/gen_golden.py (run it directly; see its docstring)",
+  "hf_config_class": "transformers.models.qwen3_5.configuration_qwen3_5.Qwen3_5TextConfig",
+  "hf_model_class": "transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5ForCausalLM",
+  "linear_attention_layers_0indexed": [
+   0,
+   1,
+   2,
+   4,
+   5,
+   6
+  ],
+  "notes": [
+   "Text tower only: the released checkpoint also carries a vision tower and an MTP head, which this port drops at restore.",
+   "The prefill is 20 tokens so that a test loading the config with linear_attention_chunk_size=8 crosses two chunk boundaries and ends with a 4-token remainder.",
+   "attn_output_gate, output_gate_type and mamba_ssm_dtype are read by config_lib.config_from_hf but not by the release code, which hardcodes the sigmoid attention gate, the silu GatedDeltaNet norm gate and float32 delta-rule math.",
+   "mtp_num_hidden_layers=0 is accepted by the release config and builds no MTP head.",
+   "Qwen3_5RMSNorm applies (1 + weight); the GatedDeltaNet output norm Qwen3_5RMSNormGated applies weight. init_params fills the two around 0 and around 1 respectively.",
+   "No attention_mask and no position_ids are passed to the model: nothing is padded and the positions are arange(prefill_len) then one position per decode step. The release expands them to the three mRoPE rows itself, so all three carry the same text position (there is no vision input) and apply_interleaved_mrope is an identity for any mrope_section: the split is NOT pinned by act/ or by the caches.",
+   "mrope/* is a side oracle, not part of the model run: the release rotary module applied to three DIFFERENT position rows, with the query/key pair before and after apply_rotary_pos_emb. It is what utils/rope_test can pin the mrope_section split against; generation fails if permuting the split leaves mrope/cos unchanged.",
+   "cache_*/layer{i}/conv_state is the conv INPUT window -- the last linear_conv_kernel_dim columns of in_proj_qkv(x), before the depthwise convolution -- and the release keeps all of them, not kernel - 1.",
+   "Deliberately not covered: the deployed numerics. This is float32, and utils/test_utils loads it unscanned, unsharded and with linear_attention_chunk_size=8, while the release is bfloat16, scanned, sharded and 32. Nothing here would see a bf16-only or sharding-only defect; compare_to_hf_reference.py on the released weights is what covers that shape."
+  ],
+  "prefill_len": 20,
+  "seed": 20260906
+ }
+}

@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+build/
+dist/
+.pytest_cache/
 wandb/
 
 # Generated gRPC stubs (see setup/gen_protos.py)

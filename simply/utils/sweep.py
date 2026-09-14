@@ -235,7 +235,7 @@ def eval_sweep(
   # Python doesn't like using these as args to dict()
   allowed_symbols |= {"True": True, "False": False, "None": None}
 
-  # semiliteral_eval lacks support for *args and binops, so we use
+  # Restricted literal evaluators lack support for *args and binops, so we use
   # raw eval(). we pass in globals explicitly to control what's available.
   sweep = eval(s, allowed_symbols)  # pylint: disable=eval-used
   if isinstance(sweep, tuple):
