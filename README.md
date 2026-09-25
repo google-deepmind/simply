@@ -56,7 +56,7 @@ python -m simply.agent.main \
 
 See the [agent README](simply/agent/README.md) for setup and configuration details.
 
-#### Long-horizon runs with Amplio
+#### Long-horizon automated research with the Amplio harness
 
 [**Amplio**](amplio/README.md), vendored under [`amplio/`](amplio/), is a fully featured Go agent harness for long-horizon runs: generic tools (shell, file edit, sub-agent spawn, inter-agent messaging), DB-first persistence so a run resumes after a crash, and a web UI.
 
