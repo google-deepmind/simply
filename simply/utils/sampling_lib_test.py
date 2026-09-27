@@ -126,6 +126,7 @@ class SamplingLibTest(parameterized.TestCase):
     mask = sampling_lib.top_p_mask(logits, top_p=top_p)
     self.assertEqual(mask.shape, logits.shape)
     self.assertEqual(mask.dtype, jnp.bool)
+    self.assertTrue(jnp.all(jnp.sum(mask, axis=-1) >= 1))
     np.testing.assert_array_less(
         top_p, jnp.sum(probs, axis=-1, initial=0, where=mask) + 1e-6
     )
@@ -134,6 +135,47 @@ class SamplingLibTest(parameterized.TestCase):
         jnp.max(logits, axis=-1, initial=jnp.finfo(dtype).min, where=~mask),
         jnp.min(logits, axis=-1, initial=jnp.finfo(dtype).max, where=mask),
     )
+
+  def test_top_p_zero_masks_only_argmax(self):
+    logits = jnp.array([
+        [-20.0, -10.0, 10.0, 0.0],
+        [1.0, 3.0, -1.0, 2.0],
+    ])
+    expected = jax.nn.one_hot(
+        jnp.argmax(logits, axis=-1), logits.shape[-1], dtype=jnp.bool_
+    )
+
+    np.testing.assert_array_equal(
+        sampling_lib.top_p_mask(logits, top_p=0.0), expected
+    )
+    np.testing.assert_array_equal(
+        sampling_lib._fused_top_k_top_p_mask(
+            logits, top_k=2, top_p=0.0
+        ),
+        expected,
+    )
+
+  @parameterized.named_parameters(
+      ('top_p_only', -1),
+      ('fused_top_k_top_p', 2),
+  )
+  def test_top_p_zero_samples_and_scores_argmax(self, top_k: int):
+    logits = jnp.array([
+        [-20.0, -10.0, 10.0, 0.0],
+        [1.0, 3.0, -1.0, 2.0],
+    ])
+    expected_tokens = jnp.argmax(logits, axis=-1)
+
+    tokens, logprobs = sampling_lib.sample_from_logits(
+        jax.random.key(0), logits, top_k=top_k, top_p=0.0
+    )
+    scores = sampling_lib.compute_log_likelihood(
+        logits, tokens, top_k=top_k, top_p=0.0
+    )
+
+    np.testing.assert_array_equal(tokens, expected_tokens)
+    np.testing.assert_array_equal(logprobs, jnp.zeros_like(logprobs))
+    np.testing.assert_array_equal(scores, logprobs)
 
   def test_sample_from_logits(self):
     logits = jax.random.normal(jax.random.key(0), (5, 3, 10))
