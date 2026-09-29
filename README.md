@@ -73,6 +73,15 @@ python -m simply.agent.main \
 
 See the [agent README](simply/agent/README.md) for setup and configuration details.
 
+#### Benchmarking a research agent
+
+[`tasks/research_bench/`](tasks/research_bench/README.md) is a suite of
+11 scored research tasks — pretraining under a FLOP cap, optimizer design, RL
+post-training on math and tool use, porting a published architecture from a
+spec, and test-time decoding — each with a fixed evaluation, a Cloud TPU
+launcher for the required multi-seed run, and a validator that turns the result
+into a normalized score.
+
 #### Long-horizon automated research with the Amplio harness
 
 [**Amplio**](amplio/README.md), vendored under [`amplio/`](amplio/), is a fully featured Go agent harness for long-horizon runs: generic tools (shell, file edit, sub-agent spawn, inter-agent messaging), DB-first persistence so a run resumes after a crash, and a web UI.

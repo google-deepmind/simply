@@ -41,6 +41,9 @@ gcloud = [
 assets = [
     # setup/setup_assets.py downloads models, datasets and vocabs.
     "huggingface_hub",
+    # tasks/research_bench/setup/prepare_assets.py checksums a staged
+    # cache with crc32c, the digest GCS keeps in object metadata.
+    "google-crc32c",
 ]
 math-eval = [
     "sympy",

@@ -1,0 +1,44 @@
+{
+  "steps": 20,
+  "train_loss": 9.473057746887207,
+  "train_accuracy": 0.015625,
+  "validation_loss": 9.22817611694336,
+  "validation_accuracy": 0.0546875,
+  "validation_bpb": 3.097684001057232,
+  "num_tokens_seen": 5376,
+  "train_flops_per_step_xla": 10238638080.0,
+  "training_flops_xla": 215011399680.0,
+  "early_stop": null,
+  "compute_integrity": {
+    "checks": {
+      "config_flags": "ok",
+      "no_pallas_custom_call": "ok"
+    },
+    "cap_flops": 1.811e+16,
+    "training_flops_xla": 215011399680.0,
+    "within_cap": true,
+    "train_loop_name": "research_bench_pretrain",
+    "use_scan": false,
+    "use_flash_attention": false
+  },
+  "eval_protocol": {
+    "validation_sources": [
+      "C4FileSource(split='validation', num_shards=0)"
+    ],
+    "vocab_name": "nanodo_c4",
+    "vocab_size": 32101,
+    "seq_len": 128,
+    "batch_size": 2,
+    "validation_num_eval_steps": 2,
+    "validation_eval_interval": 10
+  },
+  "run_provenance": {
+    "experiment_config": "pretrain_bpb_v32k",
+    "model_seed": 44,
+    "dataset_seed": 44,
+    "train_loop_name": "research_bench_pretrain",
+    "train_loop_is_research_bench": true,
+    "eval_protocol_present": true,
+    "compute_integrity_present": true
+  }
+}

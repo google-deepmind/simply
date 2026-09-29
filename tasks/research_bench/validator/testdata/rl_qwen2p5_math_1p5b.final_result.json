@@ -1,0 +1,44 @@
+{
+  "eval_accuracy": 0.0,
+  "eval_accuracy_history": [
+    [
+      0,
+      0.0
+    ]
+  ],
+  "eval_protocol": {
+    "evaluation": "ZeroShotBoxedInQuestionEvaluation",
+    "evaluation_args": {
+      "system_message": "",
+      "question_start": "Question: ",
+      "question_end": " Put your answer number as the format: \\boxed{<Your Answer>}.\n",
+      "answer_start": "Answer: "
+    },
+    "eval_source": "simply:math500_test_l45",
+    "n_scored": 262,
+    "lm_format_name": "Pretrain",
+    "extra_eos_tokens": [
+      "\n\n\n",
+      "\n\n\n\n",
+      "\n\n\n\n\n"
+    ],
+    "vocab_name": "Qwen2.5",
+    "eval_temperature": 0.6,
+    "eval_num_samples": 8,
+    "eval_max_decode_steps": 3072,
+    "eval_max_input_len": 1024,
+    "eval_prefill_size": 1024,
+    "validation_eval_batch_size": 16,
+    "activation_dtype_name": "float32",
+    "decoding_quant_scheme": "float32"
+  },
+  "run_provenance": {
+    "experiment_config": "rl_qwen2p5_math_1p5b",
+    "model_seed": 42,
+    "dataset_seed": 42,
+    "train_loop_name": "research_bench_rl",
+    "train_loop_is_research_bench": true,
+    "eval_protocol_present": true,
+    "compute_integrity_present": null
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "steps": 20,
+  "train_loss": 8.637517929077148,
+  "train_accuracy": 0.03515625,
+  "validation_loss": 8.642988204956055,
+  "validation_accuracy": 0.04296875,
+  "validation_bpb": 2.7805873107739436,
+  "num_tokens_seen": 5376,
+  "train_flops_per_step_xla": 47018258432.0,
+  "training_flops_xla": 987383427072.0,
+  "early_stop": null,
+  "validation_loss_curve": [
+    [
+      0,
+      11.958738327026367
+    ],
+    [
+      5,
+      9.90070915222168
+    ],
+    [
+      10,
+      10.63976001739502
+    ],
+    [
+      15,
+      9.314714431762695
+    ],
+    [
+      20,
+      8.642988204956055
+    ]
+  ],
+  "eval_protocol": {
+    "validation_sources": [
+      "C4FileSource(split='validation', num_shards=0)"
+    ],
+    "vocab_name": "nanodo_c4",
+    "vocab_size": 100864,
+    "seq_len": 128,
+    "batch_size": 2,
+    "validation_num_eval_steps": 1,
+    "validation_eval_interval": 5
+  },
+  "run_provenance": {
+    "experiment_config": "pretrain_optimizer_ttt",
+    "model_seed": 43,
+    "dataset_seed": 43,
+    "train_loop_name": "research_bench_ttt",
+    "train_loop_is_research_bench": true,
+    "eval_protocol_present": true,
+    "compute_integrity_present": null
+  }
+}
