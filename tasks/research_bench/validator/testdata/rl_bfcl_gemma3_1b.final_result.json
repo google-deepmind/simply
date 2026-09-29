@@ -1,0 +1,44 @@
+{
+  "eval_accuracy": 0.0,
+  "eval_accuracy_history": [
+    [
+      0,
+      0.0
+    ]
+  ],
+  "eval_protocol": {
+    "evaluation": "BFCLFunctionCallEvaluation",
+    "evaluation_args": {
+      "system_message": "You are a function-calling assistant. You are given a set of tools. Decide which tool(s) to call to answer the user, and output ONLY the call(s) as a Python list on a single line, e.g. [func_name(arg1=val1, arg2=val2)]. Call multiple tools by listing them: [f(a=1), g(b=2)]. If NO tool applies, output exactly [].",
+      "partial_credit": false,
+      "format_bonus": 0.0,
+      "few_shot": "Tools:\n- get_weather(city: string (required), unit: string (optional)): Get the current weather for a city.\n\nUser: What is the weather in Paris in celsius?\nCalls: [get_weather(city=\"Paris\", unit=\"celsius\")]\n\nTools:\n- add_numbers(a: integer (required), b: integer (required)): Add two integers.\n\nUser: Book me a flight to Tokyo.\nCalls: []\n\n"
+    },
+    "eval_source": "simply:bfcl_live_eval",
+    "n_scored": 1351,
+    "lm_format_name": "Pretrain",
+    "extra_eos_tokens": [
+      "\n\n",
+      "\n\n\n",
+      "\n\n\n\n"
+    ],
+    "vocab_name": "vb262144_gemma3",
+    "eval_temperature": 0.0,
+    "eval_num_samples": 1,
+    "eval_max_decode_steps": 160,
+    "eval_max_input_len": 3072,
+    "eval_prefill_size": 3072,
+    "validation_eval_batch_size": 256,
+    "activation_dtype_name": "bfloat16",
+    "decoding_quant_scheme": "bfloat16"
+  },
+  "run_provenance": {
+    "experiment_config": "rl_bfcl_gemma3_1b",
+    "model_seed": 42,
+    "dataset_seed": 42,
+    "train_loop_name": "research_bench_rl",
+    "train_loop_is_research_bench": true,
+    "eval_protocol_present": true,
+    "compute_integrity_present": null
+  }
+}

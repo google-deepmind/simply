@@ -1,0 +1,48 @@
+{
+  "eval_accuracy": 0.0,
+  "eval_accuracy_history": [
+    [
+      0,
+      0.0
+    ]
+  ],
+  "eval_protocol": {
+    "evaluation": "FewShot5StrictGSM8KEvaluation",
+    "evaluation_args": {
+      "n_shots": 5,
+      "input_marker": "Question: ",
+      "output_marker": "Answer: ",
+      "input_end": "\n",
+      "output_end": "\n\n",
+      "system_marker": "",
+      "system_message": "As an expert problem solver solve step by step the following mathematical questions.\n\n"
+    },
+    "eval_source": "simply:gsm8k_test",
+    "n_scored": 1319,
+    "lm_format_name": "RecurrentGemmaGSM8K",
+    "extra_eos_tokens": [
+      "\n\n",
+      "\n\n\n",
+      "\n\n\n\n",
+      "\n\n\n\n\n"
+    ],
+    "vocab_name": "RecurrentGemma",
+    "eval_temperature": 0.4,
+    "eval_num_samples": 1,
+    "eval_max_decode_steps": 512,
+    "eval_max_input_len": 1024,
+    "eval_prefill_size": 256,
+    "validation_eval_batch_size": 8,
+    "activation_dtype_name": "bfloat16",
+    "decoding_quant_scheme": "bfloat16"
+  },
+  "run_provenance": {
+    "experiment_config": "port_recurrentgemma_2b",
+    "model_seed": 42,
+    "dataset_seed": 42,
+    "train_loop_name": "research_bench_rl",
+    "train_loop_is_research_bench": true,
+    "eval_protocol_present": true,
+    "compute_integrity_present": null
+  }
+}

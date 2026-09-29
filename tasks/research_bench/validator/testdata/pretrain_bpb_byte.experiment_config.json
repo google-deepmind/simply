@@ -1,0 +1,281 @@
+{
+  "__dataclass__": "Experiment:BaseExperimentConfig",
+  "_variant": "",
+  "seq_len": 128,
+  "vocab_size": 259,
+  "model_dim": 128,
+  "per_head_dim": 16,
+  "n_heads": 8,
+  "n_layers": 4,
+  "expand_factor": 8,
+  "use_scan": false,
+  "use_remat": true,
+  "remat_policy": "nothing_saveable",
+  "model_seed": 42,
+  "use_rmsnorm": true,
+  "use_pre_ln": true,
+  "use_post_ln": true,
+  "use_post_skip_ln": false,
+  "use_qk_norm": false,
+  "use_per_dim_scale": true,
+  "use_gated_activation_in_ffn": true,
+  "activation_dtype_name": "bfloat16",
+  "use_flash_attention": false,
+  "flash_attention_block_size": 512,
+  "flash_residual_checkpoint_name": null,
+  "flash_block_q": null,
+  "flash_block_kv": null,
+  "flash_block_kv_compute": null,
+  "flash_block_q_dkv": null,
+  "flash_block_kv_dkv": null,
+  "flash_block_kv_dkv_compute": null,
+  "flash_block_q_dq": null,
+  "flash_block_kv_dq": null,
+  "flash_use_fused_bwd_kernel": false,
+  "window_size": 0,
+  "use_window_chunk": false,
+  "qkv_use_bias": false,
+  "n_kv_heads": 0,
+  "block_attn_pattern": [
+    "global"
+  ],
+  "output_layer_use_bias": true,
+  "use_tied_embedding": true,
+  "ffn_use_bias": false,
+  "ffn_expand_dim": null,
+  "ffn_activation": "gelu",
+  "ffn_weight_init": {
+    "__dataclass__": "Initializer:XavierUniformInit",
+    "scale": 2.449489742783178
+  },
+  "attn_weight_init": {
+    "__dataclass__": "Initializer:XavierUniformInit",
+    "scale": 2.449489742783178
+  },
+  "embedding_lookup_scale": 1.0,
+  "norm_scale_plus_one": true,
+  "attn_soft_cap": 50.0,
+  "attn_mask_value": -1.7014117331926443e+38,
+  "output_logits_soft_cap": 30.0,
+  "rms_norm_epsilon": 1e-06,
+  "position_encoding": {
+    "__dataclass__": "position_encoding:RoPE",
+    "min_timescale": 1,
+    "max_timescale": 10000,
+    "scale_factor": 1.0
+  },
+  "query_scale": -1.0,
+  "use_moe": false,
+  "num_experts": 32,
+  "num_experts_per_token": 2,
+  "ep_capacity_factor": null,
+  "lbl_loss_weight": 0.01,
+  "router_z_loss_weight": 0.0,
+  "tile_batch_seq": 1024,
+  "tile_model_dim": 1024,
+  "tile_expand_dim": 1024,
+  "gmm_impl": "ragged_dot",
+  "global_total_num_pages": 0,
+  "local_total_num_pages": 0,
+  "page_size": 0,
+  "rpa_block_q": null,
+  "ffn_weight_quant": "",
+  "kv_cache_quant": "",
+  "batch_size": 2,
+  "dataset": {
+    "__dataclass__": "DatasetConfig:DatasetConfig",
+    "source": {
+      "__dataclass__": "DataSource:C4FileSource",
+      "split": "train",
+      "num_shards": 0,
+      "root": "/usr/local/google/home/crazydonkey/.amplio/artifacts/6kxkc06g/data/c4_bin"
+    },
+    "lm_format_name": "Pretrain",
+    "packing": "concat_split",
+    "data_key": "text",
+    "tokenizer_name": null,
+    "add_eos": true,
+    "add_bos": true,
+    "trainable_roles": null
+  },
+  "shard_data_method": "NO_SHARDING",
+  "batch_mode": "stacked",
+  "dataset_seed": 42,
+  "validation_num_eval_steps": 2,
+  "validation_eval_interval": 2,
+  "validation_datasets": [
+    {
+      "__dataclass__": "DatasetConfig:DatasetConfig",
+      "source": {
+        "__dataclass__": "DataSource:C4FileSource",
+        "split": "validation",
+        "num_shards": 0,
+        "root": "/usr/local/google/home/crazydonkey/.amplio/artifacts/6kxkc06g/data/c4_bin"
+      },
+      "lm_format_name": "Pretrain",
+      "packing": "concat_split",
+      "data_key": "text",
+      "tokenizer_name": null,
+      "add_eos": true,
+      "add_bos": true,
+      "trainable_roles": null
+    }
+  ],
+  "validation_eval_batch_size": 2,
+  "validation_eval_epochs": 1,
+  "prefetch_num_workers": 8,
+  "prefetch_per_worker_buffer_size": 2,
+  "dataset_name": "",
+  "use_packing": true,
+  "use_validation_set": false,
+  "validation_dataset_name": null,
+  "feature_converter_name": "LMFeatureConverter",
+  "train_loop_name": "research_bench_pretrain",
+  "optimizer": {
+    "__dataclass__": "Optimizer:Adam",
+    "skip_updates_grad_nans": false,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "epsilon": 1e-06,
+    "state_dtype": "float32"
+  },
+  "weight_decay": 0.1,
+  "num_train_steps": 4,
+  "lr": {
+    "__dataclass__": "Schedule:LinearWarmupCosineDecay",
+    "value": 0.01,
+    "start_value": 0.0,
+    "end_decay": 0.1,
+    "decay_start": null,
+    "decay_steps": null,
+    "steps_after_decay": 0,
+    "decay_start_fraction": null,
+    "decay_fraction": null,
+    "fraction_after_decay": null,
+    "warmup_steps": 171,
+    "warmup_fraction": null
+  },
+  "lr_schedule_name": "",
+  "lr_schedule_config": [],
+  "clip_grad_norm": 1.0,
+  "clip_update_norm": -1.0,
+  "clip_local_update_rms": 1.0,
+  "grad_accum_steps": -1,
+  "should_save_ckpt": false,
+  "ckpt_interval": 1000,
+  "ckpt_max_to_keep": 1,
+  "ckpt_keep_period": null,
+  "tb_log_interval": 1,
+  "log_additional_info": true,
+  "init_ckpt_dir": "",
+  "init_ckpt_step": -1,
+  "init_ckpt_opt_state": false,
+  "init_ckpt_format": "",
+  "reset_steps": false,
+  "init_ckpt_restore_train_iter": false,
+  "trainable_params_filter": null,
+  "add_chat_loss_mask": false,
+  "mask_start_token": "",
+  "mask_end_token": "",
+  "vocab_path": "",
+  "vocab_name": "byte256",
+  "model_name": "TransformerLM",
+  "input_encoders": [],
+  "input_processor_name": null,
+  "code_patch": [],
+  "early_stop": null,
+  "teacher": null,
+  "teacher_ckpt_dir": "",
+  "teacher_ckpt_step": -1,
+  "teacher_ckpt_format": "",
+  "distill_temperature": 1.0,
+  "distill_alpha": 1.0,
+  "mesh_shape": {
+    "replica": 1,
+    "data": 1,
+    "model": 1
+  },
+  "decoding_mesh_shape": {
+    "replica": 1,
+    "data": 1,
+    "model": 1
+  },
+  "dcn_mesh_shape": null,
+  "sharding_config": {
+    "__dataclass__": "Sharding:BaseSharding",
+    "ffn0_partition": [
+      "data",
+      "model"
+    ],
+    "ffn1_partition": [
+      "model",
+      "data"
+    ],
+    "attn_qkv_partition": [
+      "data",
+      "model",
+      null
+    ],
+    "attn_o_partition": [
+      "data",
+      "model",
+      null
+    ],
+    "embed_partition": [
+      "model",
+      "data"
+    ],
+    "attn_activation_partition": [
+      [
+        "replica",
+        "data"
+      ],
+      null,
+      "model",
+      null
+    ],
+    "activation_partition": [
+      [
+        "replica",
+        "data"
+      ],
+      null,
+      "model"
+    ],
+    "ffn0_activation_partition": [
+      [
+        "replica",
+        "data"
+      ],
+      null,
+      "model"
+    ],
+    "logits_partition": [
+      [
+        "replica",
+        "data"
+      ],
+      null,
+      "model"
+    ],
+    "data_partition": [
+      [
+        "replica",
+        "data"
+      ],
+      null
+    ],
+    "mesh_axis_names": [
+      "replica",
+      "data",
+      "model"
+    ]
+  },
+  "profile_steps": [
+    2,
+    6
+  ],
+  "profile_path": "",
+  "profile_type": "jax",
+  "fixed_compute_cap_flops": 9180000000000000.0
+}
