@@ -723,11 +723,11 @@ wheels = [
 
 [[package]]
 name = "fsspec"
-version = "2025.10.0"
+version = "2026.6.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/24/7f/2747c0d332b9acfa75dc84447a066fdf812b5a6b8d30472b74d309bfe8cb/fsspec-2025.10.0.tar.gz", hash = "sha256:b6789427626f068f9a83ca4e8a3cc050850b6c0f71f99ddb4f542b8266a26a59", size = 309285, upload-time = "2025-10-30T14:58:44.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/a1/ae4e3e5003468d6391d2c77b6fa1cd73bd5d13511d81c642d7b28ac90ed4/fsspec-2026.6.0.tar.gz", hash = "sha256:f5bac145310fe30e16e1471bd6840b2d990d609e872251d7e674241822abf01a", size = 313646, upload-time = "2026-06-16T01:57:28.105Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/02/a6b21098b1d5d6249b7c5ab69dde30108a71e4e819d4a9778f1de1d5b70d/fsspec-2025.10.0-py3-none-any.whl", hash = "sha256:7c7712353ae7d875407f97715f0e1ffcc21e33d5b24556cb1e090ae9409ec61d", size = 200966, upload-time = "2025-10-30T14:58:42.53Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/22/4222d7ddf3da30f363edaa98e329c2bce6c65497c9cb2810931c8b2c0fbc/fsspec-2026.6.0-py3-none-any.whl", hash = "sha256:02e0b71817df9b2169dc30a16832045764def1191b43dcff5bb85bdee212d2a1", size = 203949, upload-time = "2026-06-16T01:57:26.358Z" },
 ]
 
 [package.optional-dependencies]
@@ -746,7 +746,7 @@ wheels = [
 
 [[package]]
 name = "gcsfs"
-version = "2025.10.0"
+version = "2026.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -755,11 +755,12 @@ dependencies = [
     { name = "google-auth" },
     { name = "google-auth-oauthlib" },
     { name = "google-cloud-storage" },
+    { name = "google-cloud-storage-control" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/27/62/e3131f4cb0e0a9b8d5a0586ba2cbef3a5ec05b5352d9bad50e1eb1417fed/gcsfs-2025.10.0.tar.gz", hash = "sha256:7ac9b16a145bcb1a69fa9cf770ccd3cee7b9a09236911dd586c1d9911b71583d", size = 85595, upload-time = "2025-10-30T15:16:30.08Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/33/58e23c6f492e091c2f01ae1bffe331aa97e18a0b3d24ff90ef648335ddc8/gcsfs-2026.7.0.tar.gz", hash = "sha256:2df36ce1e9010e76dc4295774030495a97496838483c619e9f63bc0ab7bdc770", size = 1265874, upload-time = "2026-07-06T15:02:30.683Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7d/f3/393d486f33bf78ce8af4ced1814e936d0e71c630e8d98c1257a06e511c9a/gcsfs-2025.10.0-py2.py3-none-any.whl", hash = "sha256:654457af3a524e03d86658c5d8c6f3887689d6aa0c2c6b1c3b2d8e1fe2b77c09", size = 36911, upload-time = "2025-10-30T15:16:29.044Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/eb/a5c4b39903928e6be7735cc7aa31b6c3bbf3d887419e1e7ac751dba02233/gcsfs-2026.7.0-py3-none-any.whl", hash = "sha256:8ce6c08ea64302d8fd4bc23a615ccd9e7752541cde1a88ec8362109bd79cde78", size = 91131, upload-time = "2026-07-06T15:02:29.208Z" },
 ]
 
 [[package]]
@@ -800,6 +801,12 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0d/10/05572d33273292bac49c2d1785925f7bc3ff2fe50e3044cf1062c1dde32e/google_api_core-2.29.0.tar.gz", hash = "sha256:84181be0f8e6b04006df75ddfe728f24489f0af57c96a529ff7cf45bc28797f7", size = 177828, upload-time = "2026-01-08T22:21:39.269Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/77/b6/85c4d21067220b9a78cfb81f516f9725ea6befc1544ec9bd2c1acd97c324/google_api_core-2.29.0-py3-none-any.whl", hash = "sha256:d30bc60980daa36e314b5d5a3e5958b0200cb44ca8fa1be2b614e932b75a3ea9", size = 173906, upload-time = "2026-01-08T22:21:36.093Z" },
+]
+
+[package.optional-dependencies]
+grpc = [
+    { name = "grpcio" },
+    { name = "grpcio-status" },
 ]
 
 [[package]]
@@ -844,7 +851,7 @@ wheels = [
 
 [[package]]
 name = "google-cloud-storage"
-version = "3.9.0"
+version = "3.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-api-core" },
@@ -854,9 +861,26 @@ dependencies = [
     { name = "google-resumable-media" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/b1/4f0798e88285b50dfc60ed3a7de071def538b358db2da468c2e0deecbb40/google_cloud_storage-3.9.0.tar.gz", hash = "sha256:f2d8ca7db2f652be757e92573b2196e10fbc09649b5c016f8b422ad593c641cc", size = 17298544, upload-time = "2026-02-02T13:36:34.119Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/55/e1/7460613a818ed8d38ee888e672ddb89966f8f92f751ba127c1bf57f4bec2/google_cloud_storage-3.17.0.tar.gz", hash = "sha256:4373aa6328e070c31c97aa236f1600a239dfd3c85e5870cdf3dc2a928dfe0bca", size = 17355535, upload-time = "2026-10-08T18:12:54.643Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/0b/816a6ae3c9fd096937d2e5f9670558908811d57d59ddf69dd4b83b326fd1/google_cloud_storage-3.9.0-py3-none-any.whl", hash = "sha256:2dce75a9e8b3387078cbbdad44757d410ecdb916101f8ba308abf202b6968066", size = 321324, upload-time = "2026-02-02T13:36:32.271Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/21/c6869b66d723d93d4e63fba0dc4b539debeaf03e8b9af53de906a9910ec7/google_cloud_storage-3.17.0-py3-none-any.whl", hash = "sha256:0b89283fccf84745bae75bbefdbda8393e5323471071a2ba24ab437407141171", size = 345704, upload-time = "2026-10-08T18:12:26.717Z" },
+]
+
+[[package]]
+name = "google-cloud-storage-control"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpc-google-iam-v1" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fa/8b/71e457c5442faf669fb23c3b400952d2f2de4d7a5cd576e52275b25365b1/google_cloud_storage_control-1.16.0.tar.gz", hash = "sha256:52af754aa24bee34bc58287f67a1a849b07c33a010d58d2c1f7c91fa1be0f119", size = 160170, upload-time = "2026-10-01T18:18:16.704Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/6c/c779f90e89a381ba38c3bd4173f1560e0765dd4d2b31ca686f7c90484a64/google_cloud_storage_control-1.16.0-py3-none-any.whl", hash = "sha256:b3b20047d09743fc143db70ac2738f1df7c482af381335bb0dbb86ee4732215d", size = 115201, upload-time = "2026-10-01T18:12:30.057Z" },
 ]
 
 [[package]]
@@ -918,6 +942,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/ab/09169d5a4612a5f92490806649ac8d41e3ec9129c636754575b3553f4ea4/googleapis_common_protos-1.72.0-py3-none-any.whl", hash = "sha256:4299c5a82d5ae1a9702ada957347726b167f9f8d1fc352477702a1e851ff4038", size = 297515, upload-time = "2025-11-06T18:29:13.14Z" },
 ]
 
+[package.optional-dependencies]
+grpc = [
+    { name = "grpcio" },
+]
+
 [[package]]
 name = "grain"
 version = "0.2.15"
@@ -943,6 +972,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1c/e1/f9b2b6a2fd9094a43a8b4a10092a464c18eef949c20b23fd31f266443aaf/grain-0.2.15-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fedbb410486890c6e410c8d78934097b2755aa2363fbd6137b920ea5be104530", size = 503572, upload-time = "2025-11-25T20:17:35.413Z" },
     { url = "https://files.pythonhosted.org/packages/62/c9/2708bddbd4ee834c1da87211dce06b47133ca222e2b3355104f1e22d755f/grain-0.2.15-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e1a5e20ffc29391c48b5d8f818742f4ecce957fe59ccff971c139721d31a0bf4", size = 504505, upload-time = "2025-11-25T20:17:36.753Z" },
     { url = "https://files.pythonhosted.org/packages/01/9f/79da919a231f525145c6038d4e8a9200caef0f6c93e0e0239626f00759ae/grain-0.2.15-cp314-cp314-win_amd64.whl", hash = "sha256:d57493fa4361316755cb0564f87e62d1da1dedae4eed53acf179ec029668dee5", size = 451279, upload-time = "2025-11-25T20:17:37.834Z" },
+]
+
+[[package]]
+name = "grpc-google-iam-v1"
+version = "0.14.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos", extra = ["grpc"] },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d2/d0/fa5bdd5f3f421bb68dc6dc162e9caaf942897ca41ce7255b524723c80f0b/grpc_google_iam_v1-0.14.5.tar.gz", hash = "sha256:07fd3a9fafb586588e771831fbfc8f6597050181d0c3b45e039d18b8fdc1aab5", size = 23736, upload-time = "2026-08-06T06:24:54.489Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/ab/be3ad0d46cffe35fd1e7cc3f9947edd6cb3c552229de3be2742f15f7ea47/grpc_google_iam_v1-0.14.5-py3-none-any.whl", hash = "sha256:0f5e680b20aa0a9441e68c769da04d94d70fca4e43751a82d8abb8aa6a7181ca", size = 32674, upload-time = "2026-08-06T06:23:49.467Z" },
 ]
 
 [[package]]
@@ -1010,6 +1053,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/53/7bd579cb35ea5895cb1ef38066e2336324432b3d3eaa21f52f6b94457c2d/grpcio_reflection-1.81.1.tar.gz", hash = "sha256:3d7160000f5fdd0e241f9b1a3d402f15ebcd5f281be105b374a025f38c6434a8", size = 19203, upload-time = "2026-06-11T12:58:47.865Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3b/10/5152fbc98f6b5b4f54cdf97c585d19fe962c265774692e446ad6b4f4950c/grpcio_reflection-1.81.1-py3-none-any.whl", hash = "sha256:d82fc4ac39dd5dcfd63e577075f6a68eac4a765e66a453914bbf57caf35665d0", size = 22906, upload-time = "2026-06-11T12:58:03.183Z" },
+]
+
+[[package]]
+name = "grpcio-status"
+version = "1.83.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/52/fd/848dd7e009de85f8ca59999d1cc618ff8ebf7ea5636d083a47455d212d24/grpcio_status-1.83.0.tar.gz", hash = "sha256:837219c6de9afdccb6f6f72b34bc71e151a2011ef04040e3faaca746a57e54ae", size = 13965, upload-time = "2026-07-23T15:24:26.98Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/00/73204406228cf989bea6b0fd9fe4702fab49a8a152a0c6f90856dadb6ac7/grpcio_status-1.83.0-py3-none-any.whl", hash = "sha256:f6a838a7c5fb84ae98833ec0ef81ed438c26e11e54b2ddb8e92ad328c861de69", size = 14636, upload-time = "2026-07-23T15:23:49.044Z" },
 ]
 
 [[package]]
