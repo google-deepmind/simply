@@ -90,7 +90,7 @@ class Categorical(Distribution):
 
   @functools.cached_property
   def _entropy(self) -> Array:
-    return -jnp.sum(jnp.exp(self.log_probs) * self.log_probs, axis=-1)
+    return _entropy_from_log_probs(self.log_probs)
 
 
 @DistributionRegistry.register
@@ -122,9 +122,13 @@ class MaskedCategorical(Categorical):
 
   @functools.cached_property
   def _entropy(self) -> Array:
-    return -jnp.sum(
-        jnp.exp(self.masked_log_probs) * self.masked_log_probs, axis=-1
-    )
+    return _entropy_from_log_probs(self.masked_log_probs)
+
+
+def _entropy_from_log_probs(log_probs: Array) -> Array:
+  # Zero-probability categories contribute zero, including in the backward pass.
+  safe_log_probs = jnp.where(jnp.isneginf(log_probs), 0., log_probs)
+  return -jnp.sum(jnp.exp(log_probs) * safe_log_probs, axis=-1)
 
 
 def _gather(x: Array, indices: Array) -> Array:
@@ -143,5 +147,5 @@ def _gather(x: Array, indices: Array) -> Array:
   # cannot fuse jnp.take_along_axis with computation of `x` (typically computed
   # by log-softmax), so that `x` would have to be stored in HBM. In contrast,
   # computation of `x` is done on the fly in VMEM and does not go through HBM.
-  one_hot = jax.nn.one_hot(indices, num_classes=x.shape[-1], dtype=x.dtype)
-  return jnp.sum(one_hot * x, axis=-1)
+  one_hot = jax.nn.one_hot(indices, num_classes=x.shape[-1], dtype=jnp.bool_)
+  return jnp.sum(jnp.where(one_hot, x, 0.), axis=-1)
