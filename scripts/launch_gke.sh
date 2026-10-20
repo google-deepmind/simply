@@ -268,7 +268,7 @@ fi
 
 if [ "${PROFILE}" = true ] && [ -n "${GCS_BUCKET}" ]; then
     PROFILE_DIR="${GCS_BUCKET}/${WORKLOAD_NAME}"
-    LOG_SAVE="gsutil cp /tmp/simply_output.log"
+    LOG_SAVE="gcloud storage cp /tmp/simply_output.log"
     LOG_SAVE="${LOG_SAVE} ${PROFILE_DIR}/worker-\$(hostname).log"
     LOG_SAVE="${LOG_SAVE} 2>/dev/null || true"
     PROFILE_ENV="JAX_PROFILER_LOG_DIR=${PROFILE_DIR}"
